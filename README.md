@@ -1,3 +1,9 @@
+> **Research fork:** the `official` branch mirrors the upstream implementation. Our
+> portable training infrastructure and validated research changes live on `main`
+> after review through `exp/*` branches. See
+> [docs/EXPERIMENT_WORKFLOW.md](docs/EXPERIMENT_WORKFLOW.md) before running an
+> experiment or preparing a server.
+
 🆕 [2026-03-25] :fire: MM-DINO has been published.
 
 🆕 [2026-03-11] :fire: MM-DINO is now available.

@@ -1,0 +1,19 @@
+# Install a CUDA-compatible torch + torchvision build separately for the target GPU.
+# This file contains the remaining dependencies used by MM-DINO segmentation.
+ftfy
+iopath
+matplotlib
+numpy
+omegaconf
+opencv-python-headless
+pandas
+pillow
+pyyaml
+regex
+scikit-image
+scikit-learn
+submitit
+termcolor
+torchmetrics
+tqdm
+transformers

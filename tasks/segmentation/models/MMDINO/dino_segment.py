@@ -218,6 +218,7 @@ class DINOSegmentModule(nn.Module):
             # 将处理后的所有模态特征传递给解码器
             logits = self.decoder(*processed_outputs_modalities)
 
+        pred = logits
         _H, _W = logits.shape[2:]
         if _H != H or _W != W:
             # 确保输出大小与输入一致
@@ -336,6 +337,7 @@ class ResNetSegmentModule(nn.Module):
             # 将处理后的所有模态特征传递给解码器
             logits = self.decoder(*outputs_modalities)
 
+        pred = logits
         _H, _W = logits.shape[2:]
         if _H != H or _W != W:
             # 确保输出大小与输入一致
@@ -503,5 +505,7 @@ def build_model(
                                     r=r,
                                     num_modalities=num_modalities,
                                     decoder_type="Decoder")
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
 
     return model

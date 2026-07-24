@@ -191,71 +191,63 @@ def confusion_matrix_gpu(y_true, y_pred, labels=None, sample_weight=None):
     return cm
 
 
+def update_confusion_matrix(cm, predictions, targets):
+    """Accumulate a confusion matrix without retaining full-resolution masks."""
+    predictions = np.asarray(predictions).reshape(-1)
+    targets = np.asarray(targets).reshape(-1)
+    num_classes = cm.shape[0]
+    valid = (targets >= 0) & (targets < num_classes)
+    encoded = num_classes * targets[valid].astype(np.int64) + predictions[
+        valid
+    ].astype(np.int64)
+    cm += np.bincount(encoded, minlength=num_classes**2).reshape(
+        num_classes, num_classes
+    )
+    return cm
+
+
+def metrics_from_confusion_matrix(cm, label_values, logger=None):
+    """Compute the official metrics from a pre-aggregated confusion matrix."""
+    logger = logger or logging.getLogger("dinov3seg")
+    cm = np.asarray(cm, dtype=np.float64)
+    total = cm.sum()
+    if total <= 0:
+        raise ValueError("Cannot compute metrics from an empty confusion matrix")
+
+    logger.info("Confusion matrix:\n%s", cm.astype(np.int64))
+    accuracy = np.trace(cm) * 100.0 / total
+    logger.info("%d pixels processed", int(total))
+    logger.info("Total accuracy: %.2f", accuracy)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        class_accuracy = np.diag(cm) / cm.sum(axis=1)
+        f1_scores = 2.0 * np.diag(cm) / (cm.sum(axis=1) + cm.sum(axis=0))
+        iou_scores = np.diag(cm) / (
+            cm.sum(axis=1) + cm.sum(axis=0) - np.diag(cm)
+        )
+
+    for label, score in zip(label_values, class_accuracy):
+        logger.info("%s accuracy: %.4f", label, score)
+    for label, f1_score, iou_score in zip(label_values, f1_scores, iou_scores):
+        logger.info("%s F1/IoU: %.4f / %.4f", label, f1_score, iou_score)
+
+    normalized_labels = {label.lower() for label in label_values}
+    metric_slice = slice(None, -1) if {"undefined", "clutter"} & normalized_labels else slice(None)
+    mean_f1 = float(np.nanmean(f1_scores[metric_slice]))
+    mean_iou = float(np.nanmean(iou_scores[metric_slice]))
+
+    pa = np.trace(cm) / total
+    pe = np.sum(cm.sum(axis=0) * cm.sum(axis=1)) / (total * total)
+    kappa = float((pa - pe) / (1 - pe)) if pe != 1 else 0.0
+    logger.info("mean F1Score: %.4f", mean_f1)
+    logger.info("mean IoU: %.4f", mean_iou)
+    logger.info("Kappa: %.4f", kappa)
+    return mean_iou, mean_f1, kappa, float(accuracy)
+
+
 def metrics(predictions, gts, label_values):
-    logger = logging.getLogger("dinov3seg")
-
     cm = confusion_matrix(gts, predictions, labels=range(len(label_values)))
-    # 使用GPU计算混淆矩阵
-    # cm_tensor = confusion_matrix_gpu(gts,
-    #                                  predictions,
-    #                                  labels=range(len(label_values)))
-    # cm = cm_tensor.cpu().numpy()  # 转回numpy用于后续计算
-
-    logger.info("Confusion matrix :")
-    print(cm)
-
-    # Compute global accuracy
-    total = sum(sum(cm))
-    accuracy = sum([cm[x][x] for x in range(len(cm))])
-    accuracy *= 100 / float(total)
-    logger.info("%d pixels processed" % (total))
-    logger.info("Total accuracy : %.2f" % (accuracy))
-
-    Acc = np.diag(cm) / cm.sum(axis=1)
-    for l_id, score in enumerate(Acc):
-        logger.info("%s: %.4f" % (label_values[l_id], score))
-    logger.info("---")
-
-    # Compute F1 score
-    F1Score = np.zeros(len(label_values))
-    for i in range(len(label_values)):
-        try:
-            F1Score[i] = 2. * cm[i, i] / (np.sum(cm[i, :]) + np.sum(cm[:, i]))
-        except:
-            # Ignore exception if there is no element in class i for test set
-            pass
-    logger.info("F1Score :")
-    for l_id, score in enumerate(F1Score):
-        logger.info("%s: %.4f" % (label_values[l_id], score))
-    if "undefined" in label_values or "clutter" in label_values:
-        F1Score = np.nanmean(F1Score[:(len(label_values) - 1)])
-    else:
-        F1Score = np.nanmean(F1Score[:(len(label_values))])
-    logger.info('mean F1Score: %.4f' % (F1Score))
-    logger.info("---")
-
-    # Compute kappa coefficient
-    total = np.sum(cm)
-    pa = np.trace(cm) / float(total)
-    pe = np.sum(np.sum(cm, axis=0) * np.sum(cm, axis=1)) / float(total * total)
-    kappa = (pa - pe) / (1 - pe)
-    logger.info("Kappa: %.4f" % (kappa))
-
-    # Compute MIoU coefficient
-    MIoU = np.diag(cm) / (np.sum(cm, axis=1) + np.sum(cm, axis=0) -
-                          np.diag(cm))
-    print(MIoU)
-    logger.info("MIoU: ")
-    for l_id, score in enumerate(MIoU):
-        logger.info("%s: %.4f" % (label_values[l_id], score))
-    if "undefined" in label_values or "clutter" in label_values:
-        MIoU = np.nanmean(MIoU[:(len(label_values) - 1)])
-    else:
-        MIoU = np.nanmean(MIoU[:(len(label_values))])
-    logger.info('mean MIoU: %.4f' % (MIoU))
-    logger.info("---")
-
-    return MIoU, F1Score, kappa, accuracy
+    return metrics_from_confusion_matrix(cm, label_values)
 
 
 def metrics_print_version(predictions, gts, label_values):

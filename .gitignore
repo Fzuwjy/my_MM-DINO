@@ -1,16 +1,23 @@
 build/
 dist/
 logs/
+outputs/
+data/
+weights/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.log
+.env
 *.egg-info/
 **/__pycache__/
+*.py[cod]
 
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**
 
 **/notebooks
-
-# Ignore shell scripts
-*.sh
 
 # Ignore swap files
 *.swp

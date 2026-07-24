@@ -1,92 +1,133 @@
+"""Configuration factory for MM-DINO segmentation experiments."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
 import torch.optim as optim
 
-from losses import *
-from .common_cfg import *
+import dinov3.distributed as distributed
+from losses import DiceLoss, JointLoss, SoftCrossEntropyLoss
 from models.MMDINO.dino_segment import build_model
 
-# 导入分布式训练相关模块
-import dinov3.distributed as distributed
+from .common_cfg import BACKBONE_WEIGHT_FILES, WEIGHTS_ROOT, get_labels
+
+
+def resolve_backbone_weights(
+    backbone_type: str,
+    backbone_weights: str | Path | None = None,
+    weights_root: str | Path | None = None,
+) -> Path:
+    try:
+        filename = BACKBONE_WEIGHT_FILES[backbone_type]
+    except KeyError as exc:
+        supported = ", ".join(BACKBONE_WEIGHT_FILES)
+        raise ValueError(
+            f"Unsupported backbone '{backbone_type}'. Supported backbones: {supported}"
+        ) from exc
+
+    if backbone_weights is not None:
+        path = Path(backbone_weights).expanduser().resolve()
+    else:
+        root = Path(weights_root).expanduser().resolve() if weights_root else WEIGHTS_ROOT
+        path = root / filename
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"DINOv3 backbone weights not found: {path}. "
+            "Pass --backbone-weights, set MM_DINO_WEIGHTS_ROOT, or place the "
+            f"file at {WEIGHTS_ROOT / filename}."
+        )
+    return path
 
 
 def get_cfg(model_name=None, dataset_name=None, **kwargs):
+    if model_name is None:
+        raise ValueError("Model name must be specified")
     if dataset_name is None:
         raise ValueError("Dataset name must be specified")
 
-    base_lr = 1e-4
-    batch_size = 8
-    epochs = 50
-    window_size = (512, 512)
+    base_lr = float(kwargs.get("base_lr", 1e-4))
+    batch_size = int(kwargs.get("batch_size", 8))
+    epochs = int(kwargs.get("epochs", 50))
+    window_size_arg = kwargs.get("window_size", 512)
+    window_size = (
+        (int(window_size_arg), int(window_size_arg))
+        if isinstance(window_size_arg, (int, str))
+        else tuple(window_size_arg)
+    )
+    if len(window_size) != 2 or min(window_size) <= 0:
+        raise ValueError(f"Invalid window size: {window_size}")
+
     labels = get_labels(dataset_name)
     ignore_index = len(labels)
     loss_fn = JointLoss(
         SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=ignore_index),
-        DiceLoss(smooth=0.05, ignore_index=ignore_index), 1.0, 1.0)
+        DiceLoss(smooth=0.05, ignore_index=ignore_index),
+        1.0,
+        1.0,
+    )
 
-    backbone_type = kwargs.get('backbone_type', "dinov3_vits16")
-    backbone_weights_dict = {
-        "dinov3_vits16": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
-        "dinov3_vits16plus":
-        "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
-        "dinov3_vitb16": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-        "dinov3_vitl16": "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
-        "dinov3_vit7b16": "dinov3_vit7b16_pretrain_sat493m-a6675841.pth",
-    }
-    backbone_weights = f"{MS_ROOT_DIR}/Checkpoints/facebook/" + backbone_weights_dict[
-        backbone_type]
-    if model_name is not None:
-        model = build_model(model_name=model_name,
-                            backbone_weights=backbone_weights,
-                            backbone_type=backbone_type,
-                            freeze_backbone=True,
-                            n_classes=len(labels),
-                            use_lora=kwargs.get('use_lora'),
-                            r=kwargs.get('r'),
-                            num_modalities=kwargs.get('num_modalities', 1))
+    backbone_type = kwargs.get("backbone_type", "dinov3_vits16")
+    if model_name == "DINOv3_ResNet50":
+        backbone_weights = None
     else:
-        raise ValueError("Model name not recognized")
+        backbone_weights = resolve_backbone_weights(
+            backbone_type,
+            backbone_weights=kwargs.get("backbone_weights"),
+            weights_root=kwargs.get("weights_root"),
+        )
 
-    # 根据GPU数量调整学习率
-    if distributed.is_enabled():
-        base_lr = base_lr * distributed.get_world_size()
+    model = build_model(
+        model_name=model_name,
+        backbone_weights=str(backbone_weights) if backbone_weights else None,
+        backbone_type=backbone_type,
+        freeze_backbone=kwargs.get("freeze_backbone", True),
+        n_classes=len(labels),
+        use_lora=kwargs.get("use_lora", False),
+        r=kwargs.get("r", 3),
+        num_modalities=kwargs.get("num_modalities", 1),
+    )
 
-    # 分别为backbone和其他部分设置不同的学习率
+    # Preserve the official linear scaling rule. Batch size is per GPU.
+    if kwargs.get("scale_lr", True) and distributed.is_enabled():
+        base_lr *= distributed.get_world_size()
+
     backbone_params = []
-    other_params = []
+    if hasattr(model, "backbone"):
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
 
-    # 如果backbone中有需要训练的参数（如LoRA参数）
-    if hasattr(model, 'backbone'):
-        backbone_params = [
-            p for p in model.backbone.parameters() if p.requires_grad
-        ]
-
-    # 其他所有需要训练的参数
-    other_params = []
-    for name, param in model.named_parameters():
-        # 排除backbone中的参数，剩下的都是其他参数
-        if not name.startswith('backbone') and param.requires_grad:
-            other_params.append(param)
-
-    # 为不同部分设置不同的学习率
-    param_groups = [
-        {
-            'params': backbone_params,
-            'lr': base_lr
-        },
-        {
-            'params': other_params,
-            'lr': base_lr
-        }  # 其他部分使用正常学习率
+    other_params = [
+        param
+        for name, param in model.named_parameters()
+        if not name.startswith("backbone") and param.requires_grad
     ]
-    optimizer = optim.AdamW(param_groups, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                     T_max=epochs,
-                                                     eta_min=1e-7)
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": base_lr})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": base_lr})
+    if not param_groups:
+        raise ValueError("The model has no trainable parameters")
 
-    return dict(batch_size=batch_size,
-                epochs=epochs,
-                window_size=window_size,
-                labels=labels,
-                loss_fn=loss_fn,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler)
+    weight_decay = float(kwargs.get("weight_decay", 0.01))
+    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=float(kwargs.get("eta_min", 1e-7)),
+    )
+
+    return {
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "window_size": window_size,
+        "labels": labels,
+        "loss_fn": loss_fn,
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "learning_rate": base_lr,
+        "weight_decay": weight_decay,
+        "backbone_weights": str(backbone_weights) if backbone_weights else None,
+    }
