@@ -15,6 +15,40 @@ from torch.utils.data import Sampler
 import dinov3.distributed as distributed
 
 
+def initialize_distributed(operation: str) -> bool:
+    """Enable NCCL only for an explicitly launched multi-process job."""
+    raw_world_size = os.environ.get(
+        "WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")
+    )
+    try:
+        world_size = int(raw_world_size)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid distributed world size: {raw_world_size!r}"
+        ) from exc
+    if world_size < 1:
+        raise RuntimeError(
+            f"Distributed world size must be positive, got {world_size}"
+        )
+    if world_size == 1:
+        return False
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"Multi-process {operation} requires CUDA/NCCL")
+
+    os.environ.setdefault("NCCL_TIMEOUT", "1200")
+    try:
+        distributed.enable(
+            overwrite=False,
+            nccl_async_error_handling=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to initialize distributed {operation}. Launch with plain "
+            "Python for one GPU or torchrun for multiple GPUs."
+        ) from exc
+    return True
+
+
 class DistributedEvalSampler(Sampler[int]):
     """Partition evaluation samples across ranks without padding duplicates."""
 

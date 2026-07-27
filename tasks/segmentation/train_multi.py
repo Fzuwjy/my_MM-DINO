@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from contextlib import nullcontext
 from datetime import datetime
@@ -37,6 +36,7 @@ from utils.runtime import (
     forward_batch,
     get_device,
     git_metadata,
+    initialize_distributed,
     load_training_checkpoint,
     reduce_confusion_matrix,
     write_json,
@@ -45,24 +45,6 @@ from utils.utils import set_seed
 
 
 LOGGER_NAME = "dinov3seg"
-
-
-def initialize_distributed():
-    if not torch.cuda.is_available():
-        if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-            raise RuntimeError("Multi-process training requires CUDA/NCCL")
-        return
-    os.environ.setdefault("NCCL_TIMEOUT", "1200")
-    try:
-        distributed.enable(
-            overwrite=False,
-            nccl_async_error_handling=True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to initialize distributed training. Launch with plain Python "
-            "for one GPU or torchrun for multiple GPUs."
-        ) from exc
 
 
 def build_loaders(args, cfg):
@@ -232,7 +214,7 @@ def resolve_run_dir(args):
 
 
 def run(args):
-    initialize_distributed()
+    initialize_distributed("training")
     device = get_device()
     rank = distributed.get_rank() if distributed.is_enabled() else 0
     set_seed(args.seed + rank, deterministic=args.deterministic)

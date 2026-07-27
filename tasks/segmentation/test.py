@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -32,24 +31,16 @@ from utils.runtime import (
     DistributedEvalSampler,
     autocast_context,
     get_device,
+    initialize_distributed,
     reduce_confusion_matrix,
     write_json,
 )
 from utils.utils import set_seed
 
 
-def initialize_distributed():
-    if not torch.cuda.is_available():
-        if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-            raise RuntimeError("Multi-process evaluation requires CUDA/NCCL")
-        return
-    os.environ.setdefault("NCCL_TIMEOUT", "1200")
-    distributed.enable(overwrite=False, nccl_async_error_handling=True)
-
-
 @torch.no_grad()
 def run(args):
-    initialize_distributed()
+    initialize_distributed("evaluation")
     device = get_device()
     rank = distributed.get_rank() if distributed.is_enabled() else 0
     set_seed(args.seed + rank, deterministic=True)

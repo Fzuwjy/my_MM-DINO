@@ -27,6 +27,7 @@ from utils.runtime import (
     checkpoint_payload,
     create_grad_scaler,
     forward_batch,
+    initialize_distributed,
     load_training_checkpoint,
 )
 from scripts.make_grouped_split import choose_validation_groups
@@ -64,6 +65,36 @@ class InfrastructureTests(unittest.TestCase):
         )
         self.assertEqual(tuple(logits.shape), (1, 1, 4, 4))
         self.assertEqual(labels.dtype, torch.long)
+
+    def test_single_process_runtime_skips_nccl_initialization(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("utils.runtime.torch.cuda.is_available", return_value=True),
+            patch("utils.runtime.distributed.enable") as enable,
+        ):
+            self.assertFalse(initialize_distributed("evaluation"))
+        enable.assert_not_called()
+
+    def test_multi_process_runtime_enables_nccl_initialization(self):
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "2"}, clear=True),
+            patch("utils.runtime.torch.cuda.is_available", return_value=True),
+            patch("utils.runtime.distributed.enable") as enable,
+        ):
+            self.assertTrue(initialize_distributed("training"))
+            self.assertEqual(os.environ["NCCL_TIMEOUT"], "1200")
+        enable.assert_called_once_with(
+            overwrite=False,
+            nccl_async_error_handling=True,
+        )
+
+    def test_multi_process_runtime_requires_cuda(self):
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "2"}, clear=True),
+            patch("utils.runtime.torch.cuda.is_available", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires CUDA/NCCL"):
+                initialize_distributed("evaluation")
 
     def test_preflight_uses_runtime_root_environment_variables(self):
         with patch.dict(
