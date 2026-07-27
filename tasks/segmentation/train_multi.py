@@ -34,6 +34,7 @@ from utils.runtime import (
     autocast_context,
     checkpoint_payload,
     create_grad_scaler,
+    forward_batch,
     get_device,
     git_metadata,
     load_training_checkpoint,
@@ -122,21 +123,6 @@ def build_loaders(args, cfg):
         **loader_kwargs,
     )
     return train_loader, eval_loader
-
-
-def forward_batch(model, batch, device, num_modalities):
-    if num_modalities > 1:
-        image, auxiliary, label = batch
-        image = image.to(device, non_blocking=True)
-        auxiliary = auxiliary.to(device, non_blocking=True)
-        label = label.to(device, non_blocking=True)
-        logits = model(image, auxiliary)
-    else:
-        image, label = batch
-        image = image.to(device, non_blocking=True)
-        label = label.to(device, non_blocking=True)
-        logits = model(image)
-    return logits, label
 
 
 def train_one_epoch(model, loader, optimizer, scaler, loss_fn, epoch, args, device):

@@ -40,6 +40,22 @@ def get_device() -> torch.device:
     return torch.device("cuda", local_rank)
 
 
+def forward_batch(model, batch, device, num_modalities):
+    """Move a segmentation batch to the device and normalize label dtype."""
+    if num_modalities > 1:
+        image, auxiliary, label = batch
+        image = image.to(device, non_blocking=True)
+        auxiliary = auxiliary.to(device, non_blocking=True)
+        label = label.to(device, dtype=torch.long, non_blocking=True)
+        logits = model(image, auxiliary)
+    else:
+        image, label = batch
+        image = image.to(device, non_blocking=True)
+        label = label.to(device, dtype=torch.long, non_blocking=True)
+        logits = model(image)
+    return logits, label
+
+
 def autocast_context(device: torch.device, amp_dtype: str):
     if device.type != "cuda" or amp_dtype == "none":
         return nullcontext()

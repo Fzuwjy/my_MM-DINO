@@ -22,6 +22,7 @@ from utils.runtime import (
     atomic_torch_save,
     checkpoint_payload,
     create_grad_scaler,
+    forward_batch,
     load_training_checkpoint,
 )
 from scripts.make_grouped_split import choose_validation_groups
@@ -35,6 +36,22 @@ from datasets import build_dataset
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_forward_batch_casts_integer_labels_to_long(self):
+        class TwoInputModel(torch.nn.Module):
+            def forward(self, image, auxiliary):
+                return image[:, :1] + auxiliary[:, :1]
+
+        batch = (
+            torch.ones(1, 3, 4, 4),
+            torch.ones(1, 1, 4, 4),
+            torch.zeros(1, 4, 4, dtype=torch.int32),
+        )
+        logits, labels = forward_batch(
+            TwoInputModel(), batch, torch.device("cpu"), num_modalities=2
+        )
+        self.assertEqual(tuple(logits.shape), (1, 1, 4, 4))
+        self.assertEqual(labels.dtype, torch.long)
+
     def test_preflight_uses_runtime_root_environment_variables(self):
         with patch.dict(
             os.environ,

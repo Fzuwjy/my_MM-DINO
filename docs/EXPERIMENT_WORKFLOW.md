@@ -133,6 +133,18 @@ missing dependencies, weights, dataset directories or split files. On an RTX
 5090 it also requires CUDA 12.8 and verifies that the installed wheel contains
 `sm_120` (or equivalent PTX) support.
 
+Before a full run, execute one real-data dual-modality optimizer step. This reads
+an official WHU training tile, loads the configured backbone weights, computes
+the complete MM-DINO loss and verifies finite gradients without writing a run:
+
+```bash
+python scripts/smoke_segmentation.py \
+  --num-modalities 2 \
+  --batch-size 1 \
+  --window-size 512 \
+  --amp-dtype bf16
+```
+
 ## Training commands
 
 Single 32 GB RTX 5090 conservative smoke-test starting point (increase the two
