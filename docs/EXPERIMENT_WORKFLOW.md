@@ -21,6 +21,10 @@ export MM_DINO_WEIGHTS_ROOT=/path/to/weights
 export MM_DINO_OUTPUT_ROOT=/path/to/outputs
 ```
 
+If the cloud image defines `OMP_NUM_THREADS` or `MKL_NUM_THREADS`, each value
+must be a positive integer. For a single-GPU smoke test, `OMP_NUM_THREADS=4` is
+a conservative starting point.
+
 Expected dataset layout keeps the official structure:
 
 ```text

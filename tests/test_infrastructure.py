@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -24,11 +25,35 @@ from utils.runtime import (
     load_training_checkpoint,
 )
 from scripts.make_grouped_split import choose_validation_groups
-from scripts.preflight import architecture_is_supported, numeric_version
+from scripts.preflight import (
+    architecture_is_supported,
+    numeric_version,
+    parse_args as parse_preflight_args,
+    sanitize_thread_environment,
+)
 from datasets import build_dataset
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_preflight_uses_runtime_root_environment_variables(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MM_DINO_DATASETS_ROOT": "/runtime/datasets",
+                "MM_DINO_WEIGHTS_ROOT": "/runtime/weights",
+            },
+        ):
+            args = parse_preflight_args([])
+        self.assertEqual(args.datasets_root, "/runtime/datasets")
+        self.assertEqual(args.weights_root, "/runtime/weights")
+
+    def test_preflight_sanitizes_invalid_thread_count(self):
+        warnings = []
+        with patch.dict(os.environ, {"OMP_NUM_THREADS": ""}):
+            sanitize_thread_environment(warnings)
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "1")
+        self.assertEqual(len(warnings), 1)
+
     def test_preflight_parses_pytorch_local_version(self):
         self.assertEqual(numeric_version("2.7.1+cu128"), (2, 7, 1))
         self.assertEqual(numeric_version("12.8"), (12, 8, 0))

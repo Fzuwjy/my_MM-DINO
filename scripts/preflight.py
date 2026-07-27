@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -48,6 +49,24 @@ def architecture_is_supported(arch_list, capability):
     major, minor = capability
     suffix = f"{major}{minor}"
     return f"sm_{suffix}" in arch_list or f"compute_{suffix}" in arch_list
+
+
+def sanitize_thread_environment(warnings):
+    """Prevent invalid cloud-image thread variables from breaking native libs."""
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            valid = int(value) > 0
+        except ValueError:
+            valid = False
+        if not valid:
+            warnings.append(
+                f"{name}={value!r} is invalid; preflight temporarily uses 1. "
+                "Set it to a positive integer before training"
+            )
+            os.environ[name] = "1"
 
 
 def check_dependencies(errors, warnings):
@@ -176,8 +195,12 @@ def check_assets(args, errors):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MM-DINO machine preflight")
     parser.add_argument("--dataset-name", choices=["WHU", "Potsdam", "Vaihingen", "EarthMiss", "YYYJ"], default="WHU")
-    parser.add_argument("--datasets-root", default="data")
-    parser.add_argument("--weights-root", default="weights")
+    parser.add_argument(
+        "--datasets-root", default=os.environ.get("MM_DINO_DATASETS_ROOT", "data")
+    )
+    parser.add_argument(
+        "--weights-root", default=os.environ.get("MM_DINO_WEIGHTS_ROOT", "weights")
+    )
     parser.add_argument("--backbone-type", default="dinov3_vits16")
     parser.add_argument("--backbone-weights")
     parser.add_argument("--num-modalities", type=int, choices=[1, 2], default=2)
@@ -193,6 +216,7 @@ def main(argv=None):
     args = parse_args(argv)
     errors = []
     warnings = []
+    sanitize_thread_environment(warnings)
     check_dependencies(errors, warnings)
     check_cuda(errors, warnings, args.require_cuda)
     if args.skip_assets:
