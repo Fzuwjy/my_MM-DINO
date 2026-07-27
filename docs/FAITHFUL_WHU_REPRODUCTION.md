@@ -144,6 +144,41 @@ measures a possible compatibility fallback; a formal accumulated run requires
 a separate external launcher and must remain distinguishable from the exact
 batch-8 reproduction.
 
+The RTX 5090 probes established the following Table III ViT-L memory envelope:
+
+- no LoRA, released training batch 8: 11.270 GiB allocated / 12.299 GiB reserved;
+- LoRA rank 3, released training batch 8: CUDA out of memory;
+- LoRA rank 3, microbatch 4 with two accumulation steps: 16.311 / 18.090 GiB;
+- LoRA rank 3, released evaluation microbatch 32: 14.437 / 16.768 GiB.
+
+Therefore only the LoRA training DataLoader and optimizer cadence need a
+compatibility adaptation.  Evaluation stays at the released microbatch 32.
+
+## Table III ViT-L LoRA compatibility run
+
+The external launcher fixes the scientific target to WHU, two modalities,
+ViT-L SAT-493M, LoRA rank 3, FP32, seed 42, and the released 50-epoch trainer.
+It uses training microbatch 4 with two gradient-accumulation steps while keeping
+the config batch at 8 so evaluation remains at 32.  It also writes
+`compatibility_protocol.json` into the run directory and disables the released
+cleanup helper so earlier reproduction artifacts cannot be deleted.
+
+This run is not an exact released batch-8 reproduction: BatchNorm statistics
+and the loss computation see microbatches of four.  The author training source
+remains unchanged.
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 \
+  scripts/run_whu_vitl_lora_accumulated.py \
+  --micro-batch-size 4 \
+  --grad-accum-steps 2
+```
+
 ## Formal foreground run
 
 Do not start this command until both probes pass and their output is recorded:

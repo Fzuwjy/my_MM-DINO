@@ -30,6 +30,10 @@ from configs import get_cfg  # noqa: E402
 from datasets import build_dataset  # noqa: E402
 from scripts.whu_cache_compat import CACHE_CAPACITY, install_whu_cache_compat  # noqa: E402
 from scripts.whu_label_dtype_compat import install_whu_label_dtype_compat  # noqa: E402
+from scripts.run_whu_vitl_lora_accumulated import (  # noqa: E402
+    GradientAccumulationController,
+    GradientScaledLoss,
+)
 from utils.inference import slide_inference  # noqa: E402
 from utils.utils import set_seed  # noqa: E402
 
@@ -122,15 +126,16 @@ def probe_train(cfg, device, args: argparse.Namespace) -> None:
     model = wrap_model(cfg, device)
     model.train()
     optimizer = cfg["optimizer"]
-    loss_fn = cfg["loss_fn"]
+    controller = GradientAccumulationController(optimizer, args.grad_accum_steps)
+    loss_fn = GradientScaledLoss(cfg["loss_fn"], args.grad_accum_steps)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    optimizer.zero_grad()
 
     loader_iterator = iter(loader)
     losses = []
     for accumulation_index in range(args.grad_accum_steps):
+        optimizer.zero_grad()
         image, sar, label = next(loader_iterator)
         if accumulation_index == 0:
             print(
@@ -141,11 +146,15 @@ def probe_train(cfg, device, args: argparse.Namespace) -> None:
         image, sar, label = image.to(device), sar.to(device), label.to(device)
         logits = model(image, sar)
         loss = loss_fn(logits, label)
-        (loss / args.grad_accum_steps).backward()
+        loss.backward()
+        optimizer.step()
         losses.append(float(loss.detach()))
         del image, sar, label, logits, loss
 
-    optimizer.step()
+    if controller.optimizer_steps != 1:
+        raise RuntimeError(
+            f"Expected one optimizer step, observed {controller.optimizer_steps}"
+        )
     print(f"train_micro_batch_size={args.batch_size}")
     print(f"train_grad_accum_steps={args.grad_accum_steps}")
     print(

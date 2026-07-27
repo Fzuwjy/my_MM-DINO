@@ -4,10 +4,16 @@ from pathlib import Path
 import unittest
 
 import numpy as np
+import torch
 
 from scripts.whu_cache_compat import CACHE_CAPACITY, set_dataset_cache_capacity
 from scripts.whu_label_dtype_compat import label_to_int64
 from scripts.prepare_faithful_whu import BACKBONE_FILENAMES
+from scripts.run_whu_vitl_lora_accumulated import (
+    GradientAccumulationController,
+    GradientScaledLoss,
+    validate_effective_batch,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +52,7 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn('batch_size=cfg.get("batch_size", 4) * 4', trainer)
         self.assertNotIn("autocast", trainer)
         self.assertNotIn("GradScaler", trainer)
+        self.assertNotIn("grad_accum", trainer)
 
     def test_probe_backbones_match_released_config(self):
         self.assertEqual(
@@ -56,6 +63,59 @@ class FaithfulWhuContractTest(unittest.TestCase):
             BACKBONE_FILENAMES["dinov3_vitl16"],
             "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
         )
+
+    def test_accumulation_keeps_released_effective_batch(self):
+        validate_effective_batch(4, 2)
+        with self.assertRaises(ValueError):
+            validate_effective_batch(4, 1)
+
+    def test_accumulation_gates_optimizer_calls(self):
+        class Optimizer:
+            def __init__(self):
+                self.zero_grad_calls = 0
+                self.step_calls = 0
+
+            def zero_grad(self):
+                self.zero_grad_calls += 1
+
+            def step(self):
+                self.step_calls += 1
+
+        optimizer = Optimizer()
+        controller = GradientAccumulationController(optimizer, 2)
+        for _ in range(4):
+            optimizer.zero_grad()
+            optimizer.step()
+
+        self.assertEqual(optimizer.zero_grad_calls, 2)
+        self.assertEqual(optimizer.step_calls, 2)
+        self.assertEqual(controller.micro_steps, 4)
+        self.assertEqual(controller.optimizer_steps, 2)
+
+    def test_accumulation_scales_gradient_not_reported_loss(self):
+        value = torch.tensor(2.0, requires_grad=True)
+        loss_fn = GradientScaledLoss(lambda item: item.square(), 2)
+        loss = loss_fn(value)
+        self.assertEqual(float(loss.detach()), 4.0)
+        loss.backward()
+        self.assertEqual(float(value.grad), 2.0)
+
+    def test_accumulation_preserves_one_adamw_step_per_effective_batch(self):
+        value = torch.nn.Parameter(torch.tensor(2.0))
+        optimizer = torch.optim.AdamW([value], lr=0.1, weight_decay=0.0)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+        controller = GradientAccumulationController(optimizer, 2)
+        loss_fn = GradientScaledLoss(lambda item: item.square(), 2)
+
+        for _ in range(2):
+            optimizer.zero_grad()
+            loss_fn(value).backward()
+            optimizer.step()
+        scheduler.step()
+
+        self.assertEqual(controller.micro_steps, 2)
+        self.assertEqual(controller.optimizer_steps, 1)
+        self.assertEqual(int(optimizer.state[value]["step"]), 1)
 
     def test_whu_dtype_compat_changes_dtype_not_values(self):
         label = np.array([[0, 1, 6, 7]], dtype=np.int32)
