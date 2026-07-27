@@ -92,6 +92,28 @@ needed for normal training. The host still needs an NVIDIA driver new enough for
 the RTX 5090 and CUDA 12.8. Prefer a cloud image advertised for CUDA 12.8, then
 verify the actual environment instead of relying on the image label.
 
+### Official Hugging Face DINOv3 fallback
+
+If Meta's download form is unavailable in the user's region, use Meta's gated
+official Hugging Face repository after accepting the DINOv3 license. Never commit
+the Hugging Face token or downloaded weights. Download the official safetensors
+file and convert its parameter names/layout for the bundled reference DINOv3
+implementation:
+
+```bash
+hf auth login
+hf download facebook/dinov3-vits16-pretrain-lvd1689m model.safetensors \
+  --local-dir /path/to/downloads/dinov3-vits16
+
+python scripts/convert_hf_dinov3_vits16.py \
+  --input /path/to/downloads/dinov3-vits16/model.safetensors \
+  --output /path/to/weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+```
+
+The converter maps every source tensor, validates every target shape, performs a
+strict load into the reference ViT-S backbone and writes a JSON manifest with
+both file hashes. Its test compares Hugging Face and reference-backbone outputs.
+
 After the environment, data and weights are ready, run:
 
 ```bash
