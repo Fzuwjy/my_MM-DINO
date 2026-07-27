@@ -1,6 +1,7 @@
 build/
 dist/
 logs/
+tasks/segmentation/logs
 *.egg-info/
 **/__pycache__/
 

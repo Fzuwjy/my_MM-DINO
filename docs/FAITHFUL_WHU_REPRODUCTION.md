@@ -4,6 +4,13 @@ This branch starts directly from the public MM-DINO commit and does not modify
 the authors' model, adapter, decoder, dataset, augmentation, loss, optimizer,
 scheduler, training loop, evaluation loop, checkpoint selection, or metrics.
 
+The released WHU dataset returns training labels as `int32`, but its released
+soft cross-entropy implementation calls `torch.gather`, which requires `int64`
+class indices.  The first exact batch probe reproduced this runtime failure.
+Both launchers therefore install an external compatibility shim that converts
+only the training-label storage dtype from `int32` to `int64`; all class values
+remain unchanged, and the authors' source files remain untouched.
+
 The intended run is the released implementation protocol:
 
 - all 80 names in `train_list.txt` are used for training;

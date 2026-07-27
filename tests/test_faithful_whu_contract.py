@@ -3,6 +3,10 @@
 from pathlib import Path
 import unittest
 
+import numpy as np
+
+from scripts.whu_label_dtype_compat import label_to_int64
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,6 +44,17 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn('batch_size=cfg.get("batch_size", 4) * 4', trainer)
         self.assertNotIn("autocast", trainer)
         self.assertNotIn("GradScaler", trainer)
+
+    def test_whu_dtype_compat_changes_dtype_not_values(self):
+        label = np.array([[0, 1, 6, 7]], dtype=np.int32)
+        converted = label_to_int64(label)
+        self.assertEqual(converted.dtype, np.int64)
+        np.testing.assert_array_equal(converted, label)
+
+        dataset_source = (
+            REPO_ROOT / "tasks" / "segmentation" / "datasets" / "WHU_dataset.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("label = label.astype(np.int32)", dataset_source)
 
 
 if __name__ == "__main__":

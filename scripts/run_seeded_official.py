@@ -45,6 +45,9 @@ def main() -> None:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
+    from scripts.whu_label_dtype_compat import install_whu_label_dtype_compat
+
+    install_whu_label_dtype_compat()
     sys.argv = [str(OFFICIAL_TRAINER), *sys.argv[1:]]
     runpy.run_path(str(OFFICIAL_TRAINER), run_name="__main__")
 
