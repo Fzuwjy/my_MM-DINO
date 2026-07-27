@@ -31,6 +31,7 @@ from scripts.preflight import (
     architecture_is_supported,
     numeric_version,
     parse_args as parse_preflight_args,
+    resolve_whu_split_path,
     sanitize_thread_environment,
 )
 from datasets import build_dataset
@@ -71,6 +72,27 @@ class InfrastructureTests(unittest.TestCase):
             args = parse_preflight_args([])
         self.assertEqual(args.datasets_root, "/runtime/datasets")
         self.assertEqual(args.weights_root, "/runtime/weights")
+
+    def test_preflight_defaults_to_committed_whu_training_split(self):
+        args = parse_preflight_args([])
+        self.assertEqual(args.split, "train")
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            split_path = resolve_whu_split_path(
+                Path(temporary_dir) / "whu-opt-sar", "train"
+            )
+        self.assertEqual(
+            split_path,
+            REPO_ROOT / "splits" / "whu" / "official_train.txt",
+        )
+
+    def test_preflight_prefers_dataset_local_whu_split(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            dataset_root = Path(temporary_dir) / "whu-opt-sar"
+            dataset_root.mkdir()
+            local_split = dataset_root / "train_list.txt"
+            local_split.write_text("sample.tif\n", encoding="utf-8")
+            split_path = resolve_whu_split_path(dataset_root, "train")
+        self.assertEqual(split_path, local_split)
 
     def test_preflight_sanitizes_invalid_thread_count(self):
         warnings = []

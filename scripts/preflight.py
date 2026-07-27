@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 REQUIRED_MODULES = {
     "ftfy": "ftfy",
     "imagecodecs": "imagecodecs",
@@ -146,6 +148,22 @@ def check_cuda(errors, warnings, require_cuda):
         warnings.append("No CUDA GPU detected; only static checks can run efficiently")
 
 
+def resolve_whu_split_path(dataset_root, split, split_file=None):
+    """Resolve an explicit, dataset-local, or committed official WHU split."""
+    if split_file:
+        return Path(split_file).expanduser().resolve()
+
+    dataset_split = dataset_root / f"{split}_list.txt"
+    if dataset_split.is_file():
+        return dataset_split
+
+    official_split = PROJECT_ROOT / "splits" / "whu" / f"official_{split}.txt"
+    if official_split.is_file():
+        return official_split
+
+    return dataset_split
+
+
 def check_assets(args, errors):
     datasets_root = Path(args.datasets_root).expanduser().resolve()
     weights_root = Path(args.weights_root).expanduser().resolve()
@@ -184,10 +202,10 @@ def check_assets(args, errors):
         for directory in required_dirs:
             if not directory.is_dir():
                 errors.append(f"Required WHU directory not found: {directory}")
-        split_path = (
-            Path(args.split_file).expanduser().resolve()
-            if args.split_file
-            else dataset_root / f"{args.split}_list.txt"
+        split_path = resolve_whu_split_path(
+            dataset_root,
+            args.split,
+            args.split_file,
         )
         if not split_path.is_file():
             errors.append(f"Split file not found: {split_path}")
@@ -205,7 +223,7 @@ def parse_args(argv=None):
     parser.add_argument("--backbone-type", default="dinov3_vits16")
     parser.add_argument("--backbone-weights")
     parser.add_argument("--num-modalities", type=int, choices=[1, 2], default=2)
-    parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--split-file")
     parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument("--allow-missing-deps", action="store_true")

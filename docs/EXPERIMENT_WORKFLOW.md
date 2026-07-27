@@ -46,10 +46,16 @@ with `--backbone-weights`.
 
 Datasets, weights, checkpoints and outputs are ignored by Git. Do not commit them.
 
+The downloaded WHU archive may omit the three list files. For `train` and `test`,
+the preflight check falls back to the immutable official lists committed under
+`splits/whu/`. Research validation lists remain explicit project inputs and should
+be passed with `--split-file` or `--eval-split-file`; they do not belong inside the
+downloaded dataset directory.
+
 ## Validation protocol
 
-Training defaults to `--eval-split val`. WHU uses `val_list.txt`; datasets without
-an official validation split require `--eval-split-file` containing one image/tile
+Training defaults to `--eval-split val`. The official WHU release has no validation
+list, so formal WHU training requires `--eval-split-file` containing one image/tile
 identifier per line.
 
 Use `--eval-split test` only when reproducing the official training protocol. It
@@ -124,7 +130,7 @@ After the environment, data and weights are ready, run:
 python scripts/preflight.py \
   --dataset-name WHU \
   --num-modalities 2 \
-  --split val \
+  --split train \
   --require-cuda
 ```
 
@@ -132,6 +138,9 @@ The check reports Python/PyTorch/torchvision/CUDA/GPU information and fails on
 missing dependencies, weights, dataset directories or split files. On an RTX
 5090 it also requires CUDA 12.8 and verifies that the installed wheel contains
 `sm_120` (or equivalent PTX) support.
+
+The default WHU preflight split is `train`. To validate a research split instead,
+pass `--split val --split-file /path/to/whu_research_val.txt` explicitly.
 
 Before a full run, execute one real-data dual-modality optimizer step. This reads
 an official WHU training tile, loads the configured backbone weights, computes
