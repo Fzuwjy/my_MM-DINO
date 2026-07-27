@@ -13,7 +13,7 @@ from __future__ import annotations
 from functools import wraps
 
 
-CACHE_CAPACITY = 2
+CACHE_CAPACITY = 64
 PATCH_MARKER = "_mm_dino_whu_cache_compat"
 
 

@@ -16,7 +16,10 @@ inferences, then received `SIGKILL` while materializing the official metrics.
 The 90 GiB container had crossed its 86 GiB `memory.high` threshold 348,095
 times cumulatively by inspection.  Four persistent workers had each populated the released capacity-100
 optical/SAR/label caches.  A second external shim now caps each worker cache at
-2.  This changes only image re-read frequency; the released evaluation and
+64.  The 80-image training set made the released capacity 100 effectively hold
+80 images per worker; retaining 64 preserves roughly 80% of that working set
+while releasing an estimated 11-12 GiB across four workers.  This changes only
+image re-read frequency; the released evaluation and
 metric implementation remain unchanged for the next verification run.
 
 The intended run is the released implementation protocol:

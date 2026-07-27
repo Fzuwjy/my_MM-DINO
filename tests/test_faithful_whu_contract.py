@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from scripts.whu_cache_compat import set_dataset_cache_capacity
+from scripts.whu_cache_compat import CACHE_CAPACITY, set_dataset_cache_capacity
 from scripts.whu_label_dtype_compat import label_to_int64
 
 
@@ -74,12 +74,12 @@ class FaithfulWhuContractTest(unittest.TestCase):
             cache.cache["sentinel"]
             for cache in (dataset.rgb_cache, dataset.label_cache, dataset.sar_cache)
         )
-        set_dataset_cache_capacity(dataset, 2)
+        set_dataset_cache_capacity(dataset, CACHE_CAPACITY)
 
-        self.assertEqual(dataset.cache_size, 2)
-        self.assertEqual(dataset.rgb_cache.capacity, 2)
-        self.assertEqual(dataset.label_cache.capacity, 2)
-        self.assertEqual(dataset.sar_cache.capacity, 2)
+        self.assertEqual(dataset.cache_size, CACHE_CAPACITY)
+        self.assertEqual(dataset.rgb_cache.capacity, CACHE_CAPACITY)
+        self.assertEqual(dataset.label_cache.capacity, CACHE_CAPACITY)
+        self.assertEqual(dataset.sar_cache.capacity, CACHE_CAPACITY)
         self.assertEqual(
             sentinel_objects,
             tuple(
