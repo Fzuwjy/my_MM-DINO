@@ -206,6 +206,42 @@ def update_confusion_matrix(cm, predictions, targets):
     return cm
 
 
+def per_class_metrics_from_confusion_matrix(cm, label_values):
+    """Return JSON-friendly per-class metrics and pixel support."""
+    cm = np.asarray(cm, dtype=np.float64)
+    if cm.shape != (len(label_values), len(label_values)):
+        raise ValueError(
+            f"Confusion matrix shape {cm.shape} does not match "
+            f"{len(label_values)} labels"
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        accuracy = np.diag(cm) / cm.sum(axis=1)
+        f1_scores = 2.0 * np.diag(cm) / (cm.sum(axis=1) + cm.sum(axis=0))
+        iou_scores = np.diag(cm) / (
+            cm.sum(axis=1) + cm.sum(axis=0) - np.diag(cm)
+        )
+
+    def finite_or_none(value):
+        return float(value) if np.isfinite(value) else None
+
+    return {
+        label: {
+            "F1": finite_or_none(f1_score),
+            "IoU": finite_or_none(iou_score),
+            "Acc": finite_or_none(class_accuracy),
+            "support_pixels": int(support),
+        }
+        for label, f1_score, iou_score, class_accuracy, support in zip(
+            label_values,
+            f1_scores,
+            iou_scores,
+            accuracy,
+            cm.sum(axis=1),
+        )
+    }
+
+
 def metrics_from_confusion_matrix(cm, label_values, logger=None):
     """Compute the official metrics from a pre-aggregated confusion matrix."""
     logger = logger or logging.getLogger("dinov3seg")

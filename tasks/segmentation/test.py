@@ -23,7 +23,11 @@ from configs.common_cfg import DATASETS_ROOT, OUTPUT_ROOT, WEIGHTS_ROOT
 from datasets import build_dataset
 from utils import plot_confusion_matrix, save_prediction_as_image
 from utils.inference import slide_inference
-from utils.metrics import metrics_from_confusion_matrix, update_confusion_matrix
+from utils.metrics import (
+    metrics_from_confusion_matrix,
+    per_class_metrics_from_confusion_matrix,
+    update_confusion_matrix,
+)
 from utils.runtime import (
     DistributedEvalSampler,
     autocast_context,
@@ -68,7 +72,7 @@ def run(args):
     checkpoint = torch.load(
         Path(args.checkpoint_path).expanduser().resolve(),
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -148,6 +152,8 @@ def run(args):
         "F1": float(f1),
         "Kappa": float(kappa),
         "Acc": float(accuracy),
+        "per_class": per_class_metrics_from_confusion_matrix(confusion, labels),
+        "confusion_matrix": confusion.tolist(),
     }
     if distributed.is_main_process():
         write_json(output_dir / "metrics.json", result)

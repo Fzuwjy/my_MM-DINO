@@ -16,7 +16,11 @@ SEGMENTATION_ROOT = REPO_ROOT / "tasks" / "segmentation"
 sys.path.insert(0, str(SEGMENTATION_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
-from utils.metrics import metrics_from_confusion_matrix, update_confusion_matrix
+from utils.metrics import (
+    metrics_from_confusion_matrix,
+    per_class_metrics_from_confusion_matrix,
+    update_confusion_matrix,
+)
 from utils.runtime import (
     DistributedEvalSampler,
     atomic_torch_save,
@@ -130,6 +134,14 @@ class InfrastructureTests(unittest.TestCase):
         np.testing.assert_array_equal(confusion, expected)
         metrics = metrics_from_confusion_matrix(confusion, ["a", "b", "c"])
         self.assertTrue(all(np.isfinite(value) for value in metrics))
+
+    def test_per_class_metrics_are_json_friendly(self):
+        confusion = np.array([[3, 1], [2, 4]], dtype=np.int64)
+        details = per_class_metrics_from_confusion_matrix(confusion, ["a", "b"])
+        self.assertEqual(details["a"]["support_pixels"], 4)
+        self.assertAlmostEqual(details["a"]["F1"], 2 * 3 / (4 + 5))
+        self.assertAlmostEqual(details["b"]["IoU"], 4 / (6 + 5 - 4))
+        self.assertIsInstance(details["a"]["IoU"], float)
 
     def test_atomic_torch_save_produces_loadable_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
