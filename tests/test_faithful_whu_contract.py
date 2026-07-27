@@ -7,6 +7,7 @@ import numpy as np
 
 from scripts.whu_cache_compat import CACHE_CAPACITY, set_dataset_cache_capacity
 from scripts.whu_label_dtype_compat import label_to_int64
+from scripts.prepare_faithful_whu import BACKBONE_FILENAMES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,16 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn('batch_size=cfg.get("batch_size", 4) * 4', trainer)
         self.assertNotIn("autocast", trainer)
         self.assertNotIn("GradScaler", trainer)
+
+    def test_probe_backbones_match_released_config(self):
+        self.assertEqual(
+            BACKBONE_FILENAMES["dinov3_vits16"],
+            "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        )
+        self.assertEqual(
+            BACKBONE_FILENAMES["dinov3_vitl16"],
+            "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
+        )
 
     def test_whu_dtype_compat_changes_dtype_not_values(self):
         label = np.array([[0, 1, 6, 7]], dtype=np.int32)

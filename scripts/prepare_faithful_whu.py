@@ -13,7 +13,10 @@ import os
 from pathlib import Path
 
 
-BACKBONE_FILENAME = "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+BACKBONE_FILENAMES = {
+    "dinov3_vits16": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "dinov3_vitl16": "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
+}
 AUTHOR_ROOT = Path("/home/yyyjvm")
 
 
@@ -65,6 +68,11 @@ def validate_dataset(dataset_root: Path, names: list[str]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="Create missing links after validation")
+    parser.add_argument(
+        "--backbone-type",
+        choices=tuple(BACKBONE_FILENAMES),
+        default="dinov3_vits16",
+    )
     parser.add_argument("--dataset-root", default="/root/autodl-tmp/mm-dino/datasets/whu-opt-sar")
     parser.add_argument("--weights-root", default="/root/autodl-tmp/mm-dino/weights")
     parser.add_argument(
@@ -82,7 +90,8 @@ def main() -> None:
     output_root = Path(args.output_root).expanduser().resolve()
     train_split = repo_root / "splits" / "whu" / "official_train.txt"
     test_split = repo_root / "splits" / "whu" / "official_test.txt"
-    backbone = weights_root / BACKBONE_FILENAME
+    backbone_filename = BACKBONE_FILENAMES[args.backbone_type]
+    backbone = weights_root / backbone_filename
 
     for required in (dataset_root, train_split, test_split, backbone):
         if not required.exists():
@@ -107,7 +116,7 @@ def main() -> None:
         is_dir=True,
     )
     ensure_symlink(
-        AUTHOR_ROOT / "Checkpoints" / "facebook" / BACKBONE_FILENAME,
+        AUTHOR_ROOT / "Checkpoints" / "facebook" / backbone_filename,
         backbone,
         apply=args.apply,
         is_dir=False,

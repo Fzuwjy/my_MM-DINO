@@ -50,6 +50,14 @@ python scripts/prepare_faithful_whu.py --apply
 ```
 
 The preparation script refuses to replace any existing non-matching path.
+For the Table III ViT-L rows, also create the exact SAT-493M backbone link:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+python scripts/prepare_faithful_whu.py --backbone-type dinov3_vitl16 --apply
+```
 
 ## Memory probes
 
@@ -77,6 +85,64 @@ torchrun --standalone --nproc_per_node=1 scripts/probe_official_whu_memory.py --
 
 If only the evaluation probe runs out of memory, retry 16, 8, and finally 4.
 This changes sliding-window microbatching but not training batch size.
+
+### Table III ViT-L memory probes
+
+First probe the released multi-modal ViT-L construction without LoRA at the
+author's FP32 batch size 8:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 scripts/probe_official_whu_memory.py \
+  --phase train \
+  --backbone-type dinov3_vitl16 \
+  --batch-size 8
+```
+
+If that fits, probe the paper's LoRA rank 3 row:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 scripts/probe_official_whu_memory.py \
+  --phase train \
+  --backbone-type dinov3_vitl16 \
+  --use-lora \
+  --lora-rank 3 \
+  --batch-size 8
+```
+
+An out-of-memory result at batch 8 is evidence that the released training
+batch does not fit this 31.4 GiB GPU.  Retry microbatch 4 with two accumulation
+steps, then 2/4 and 1/8 if needed.  Each keeps a single-GPU effective batch of
+8 for the diagnostic step:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 scripts/probe_official_whu_memory.py \
+  --phase train \
+  --backbone-type dinov3_vitl16 \
+  --use-lora \
+  --lora-rank 3 \
+  --batch-size 4 \
+  --grad-accum-steps 2
+```
+
+Gradient accumulation is not part of the released trainer.  This probe only
+measures a possible compatibility fallback; a formal accumulated run requires
+a separate external launcher and must remain distinguishable from the exact
+batch-8 reproduction.
 
 ## Formal foreground run
 
