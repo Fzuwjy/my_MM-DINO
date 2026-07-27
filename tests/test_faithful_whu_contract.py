@@ -5,6 +5,7 @@ import unittest
 
 import numpy as np
 
+from scripts.whu_cache_compat import set_dataset_cache_capacity
 from scripts.whu_label_dtype_compat import label_to_int64
 
 
@@ -55,6 +56,37 @@ class FaithfulWhuContractTest(unittest.TestCase):
             REPO_ROOT / "tasks" / "segmentation" / "datasets" / "WHU_dataset.py"
         ).read_text(encoding="utf-8")
         self.assertIn("label = label.astype(np.int32)", dataset_source)
+
+    def test_whu_cache_compat_changes_only_capacities(self):
+        class Cache:
+            def __init__(self):
+                self.capacity = 100
+                self.cache = {"sentinel": object()}
+
+        class Dataset:
+            cache_size = 100
+            rgb_cache = Cache()
+            label_cache = Cache()
+            sar_cache = Cache()
+
+        dataset = Dataset()
+        sentinel_objects = tuple(
+            cache.cache["sentinel"]
+            for cache in (dataset.rgb_cache, dataset.label_cache, dataset.sar_cache)
+        )
+        set_dataset_cache_capacity(dataset, 2)
+
+        self.assertEqual(dataset.cache_size, 2)
+        self.assertEqual(dataset.rgb_cache.capacity, 2)
+        self.assertEqual(dataset.label_cache.capacity, 2)
+        self.assertEqual(dataset.sar_cache.capacity, 2)
+        self.assertEqual(
+            sentinel_objects,
+            tuple(
+                cache.cache["sentinel"]
+                for cache in (dataset.rgb_cache, dataset.label_cache, dataset.sar_cache)
+            ),
+        )
 
 
 if __name__ == "__main__":

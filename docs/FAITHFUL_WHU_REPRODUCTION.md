@@ -11,6 +11,14 @@ Both launchers therefore install an external compatibility shim that converts
 only the training-label storage dtype from `int32` to `int64`; all class values
 remain unchanged, and the authors' source files remain untouched.
 
+The first formal run completed five training epochs and all 20 test-image
+inferences, then received `SIGKILL` while materializing the official metrics.
+The 90 GiB container had crossed its 86 GiB `memory.high` threshold 348,095
+times cumulatively by inspection.  Four persistent workers had each populated the released capacity-100
+optical/SAR/label caches.  A second external shim now caps each worker cache at
+2.  This changes only image re-read frequency; the released evaluation and
+metric implementation remain unchanged for the next verification run.
+
 The intended run is the released implementation protocol:
 
 - all 80 names in `train_list.txt` are used for training;

@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import dinov3.distributed as distributed  # noqa: E402
 from configs import get_cfg  # noqa: E402
 from datasets import build_dataset  # noqa: E402
+from scripts.whu_cache_compat import CACHE_CAPACITY, install_whu_cache_compat  # noqa: E402
 from scripts.whu_label_dtype_compat import install_whu_label_dtype_compat  # noqa: E402
 from utils.inference import slide_inference  # noqa: E402
 from utils.utils import set_seed  # noqa: E402
@@ -89,6 +90,11 @@ def probe_train(cfg, device) -> None:
         model_name="DINOv3",
         modality="multi",
         backbone_type="dinov3_vits16",
+    )
+    print(
+        "train_cache_capacities="
+        f"{dataset.rgb_cache.capacity},{dataset.label_cache.capacity},"
+        f"{dataset.sar_cache.capacity}"
     )
     sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     loader = torch.utils.data.DataLoader(
@@ -179,6 +185,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required for the faithful WHU memory probe")
     preseed_model()
     install_whu_label_dtype_compat()
+    install_whu_cache_compat(CACHE_CAPACITY)
     cfg, device = build_official_components()
     print(f"torch={torch.__version__}, cuda={torch.version.cuda}, gpu={torch.cuda.get_device_name(device)}")
     if args.phase == "train":

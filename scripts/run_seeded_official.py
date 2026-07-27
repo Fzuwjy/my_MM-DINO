@@ -46,8 +46,14 @@ def main() -> None:
         sys.path.insert(0, repo_root)
 
     from scripts.whu_label_dtype_compat import install_whu_label_dtype_compat
+    from scripts.whu_cache_compat import CACHE_CAPACITY, install_whu_cache_compat
 
     install_whu_label_dtype_compat()
+    install_whu_cache_compat(CACHE_CAPACITY)
+    print(
+        "WHU compatibility: training labels=int64, "
+        f"per-worker full-image cache capacity={CACHE_CAPACITY}"
+    )
     sys.argv = [str(OFFICIAL_TRAINER), *sys.argv[1:]]
     runpy.run_path(str(OFFICIAL_TRAINER), run_name="__main__")
 
