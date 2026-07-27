@@ -2,6 +2,7 @@
 # This file contains the remaining dependencies used by MM-DINO segmentation.
 ftfy
 huggingface-hub
+imagecodecs==2025.11.11
 iopath
 matplotlib
 numpy

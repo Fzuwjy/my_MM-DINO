@@ -27,6 +27,7 @@ from utils.runtime import (
 )
 from scripts.make_grouped_split import choose_validation_groups
 from scripts.preflight import (
+    REQUIRED_MODULES,
     architecture_is_supported,
     numeric_version,
     parse_args as parse_preflight_args,
@@ -36,6 +37,13 @@ from datasets import build_dataset
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_lzw_tiff_decoder_is_pinned_and_preflighted(self):
+        requirements = (REPO_ROOT / "requirements-segmentation.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("imagecodecs==2025.11.11", requirements.splitlines())
+        self.assertEqual(REQUIRED_MODULES["imagecodecs"], "imagecodecs")
+
     def test_forward_batch_casts_integer_labels_to_long(self):
         class TwoInputModel(torch.nn.Module):
             def forward(self, image, auxiliary):

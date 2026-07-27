@@ -12,6 +12,7 @@ from pathlib import Path
 
 REQUIRED_MODULES = {
     "ftfy": "ftfy",
+    "imagecodecs": "imagecodecs",
     "iopath": "iopath",
     "matplotlib": "matplotlib",
     "numpy": "numpy",
