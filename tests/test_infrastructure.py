@@ -24,10 +24,21 @@ from utils.runtime import (
     load_training_checkpoint,
 )
 from scripts.make_grouped_split import choose_validation_groups
+from scripts.preflight import architecture_is_supported, numeric_version
 from datasets import build_dataset
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_preflight_parses_pytorch_local_version(self):
+        self.assertEqual(numeric_version("2.7.1+cu128"), (2, 7, 1))
+        self.assertEqual(numeric_version("12.8"), (12, 8, 0))
+        self.assertEqual(numeric_version("unknown"), ())
+
+    def test_preflight_accepts_native_or_ptx_gpu_architecture(self):
+        self.assertTrue(architecture_is_supported({"sm_120"}, (12, 0)))
+        self.assertTrue(architecture_is_supported({"compute_120"}, (12, 0)))
+        self.assertFalse(architecture_is_supported({"sm_90"}, (12, 0)))
+
     def test_distributed_eval_sampler_has_no_duplicates(self):
         dataset = list(range(11))
         partitions = [

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -29,6 +30,25 @@ REQUIRED_MODULES = {
     "transformers": "transformers",
 }
 
+MINIMUM_TORCH_VERSION = (2, 7, 1)
+RECOMMENDED_TORCH_VERSION = (2, 7, 1)
+RECOMMENDED_TORCHVISION_VERSION = (0, 22, 1)
+RECOMMENDED_CUDA_VERSION = (12, 8)
+
+
+def numeric_version(version):
+    """Return a comparable numeric prefix for versions such as 2.7.1+cu128."""
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
+    if match is None:
+        return ()
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def architecture_is_supported(arch_list, capability):
+    major, minor = capability
+    suffix = f"{major}{minor}"
+    return f"sm_{suffix}" in arch_list or f"compute_{suffix}" in arch_list
+
 
 def check_dependencies(errors, warnings):
     missing = [name for name, module in REQUIRED_MODULES.items() if importlib.util.find_spec(module) is None]
@@ -46,16 +66,62 @@ def check_cuda(errors, warnings, require_cuda):
     import torch
 
     print(f"torch={torch.__version__}")
+    torch_version = numeric_version(torch.__version__)
+    if not torch_version or torch_version < MINIMUM_TORCH_VERSION:
+        errors.append(
+            "MM-DINO requires torch>=2.7.1; for RTX 5090 install "
+            "torch==2.7.1 from the cu128 index"
+        )
+
+    if importlib.util.find_spec("torchvision") is not None:
+        try:
+            import torchvision
+        except Exception as error:  # Binary mismatches often fail during import.
+            errors.append(
+                f"torchvision cannot be imported ({error}); reinstall the "
+                "recommended torch/torchvision pair together"
+            )
+        else:
+            print(f"torchvision={torchvision.__version__}")
+            torchvision_version = numeric_version(torchvision.__version__)
+            if (
+                torch_version == RECOMMENDED_TORCH_VERSION
+                and torchvision_version != RECOMMENDED_TORCHVISION_VERSION
+            ):
+                errors.append(
+                    "torch 2.7.1 must be paired with torchvision 0.22.1 for "
+                    "the recommended server environment"
+                )
+
     print(f"cuda_available={torch.cuda.is_available()}")
     if require_cuda and not torch.cuda.is_available():
         errors.append("CUDA is required but torch.cuda.is_available() is False")
     if torch.cuda.is_available():
         print(f"cuda_runtime={torch.version.cuda}")
+        arch_list = set(torch.cuda.get_arch_list())
+        print(f"cuda_arch_list={','.join(sorted(arch_list))}")
         print(f"gpu_count={torch.cuda.device_count()}")
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)
+            capability = torch.cuda.get_device_capability(index)
             memory_gib = props.total_memory / 1024**3
-            print(f"gpu[{index}]={props.name}, memory={memory_gib:.1f} GiB")
+            print(
+                f"gpu[{index}]={props.name}, memory={memory_gib:.1f} GiB, "
+                f"capability={capability[0]}.{capability[1]}"
+            )
+            if not architecture_is_supported(arch_list, capability):
+                errors.append(
+                    f"The installed PyTorch build does not contain kernels for "
+                    f"{props.name} (sm_{capability[0]}{capability[1]}); install "
+                    "the recommended cu128 build"
+                )
+            if "5090" in props.name and (
+                numeric_version(torch.version.cuda) < RECOMMENDED_CUDA_VERSION
+            ):
+                errors.append(
+                    "RTX 5090 requires the validated CUDA 12.8 PyTorch build; "
+                    f"detected CUDA runtime {torch.version.cuda}"
+                )
     elif not require_cuda:
         warnings.append("No CUDA GPU detected; only static checks can run efficiently")
 

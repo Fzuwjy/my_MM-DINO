@@ -210,11 +210,17 @@ ViT models pretrained on satellite dataset (SAT-493M):
 
 The training and evaluation code requires PyTorch version >= 2.7.1 as well as a few other 3rd party packages. Note that the code has only been tested with the specified versions and also expects a Linux environment. To setup all the required dependencies for training and evaluation, please follow the instructions below:
 
-*[micromamba](https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html)* **(Recommended)** - Clone the repository and then create and activate a `dinov3` conda environment using the provided environment definition:
+Create and activate the lightweight project environment, then install the
+CUDA-specific PyTorch build before the remaining segmentation dependencies. The
+recommended RTX 5090 baseline is PyTorch 2.7.1, torchvision 0.22.1 and CUDA
+12.8 wheels:
 
 ```shell
-micromamba env create -f conda.yaml
-micromamba activate dinov3
+conda env create -f conda.yaml
+conda activate mm-dino
+python -m pip install --upgrade pip
+python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements-segmentation.txt
 ```
 
 ## Data preparation

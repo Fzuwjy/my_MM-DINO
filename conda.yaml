@@ -1,23 +1,10 @@
-name: dinov3
+name: mm-dino
 channels:
-  - defaults
   - conda-forge
 dependencies:
   - python=3.11
-  - omegaconf
-  - pip
-  - pip:
-    - ftfy # needed for dino.txt
-    - iopath
-    - omegaconf
-    - pandas 
-    - regex # needed for dino.txt
-    - pandas
-    - scikit-learn
-    - scikit-learn-intelex
-    - submitit
-    - termcolor
-    - torch 
-    - torchvision 
-    - torchmetrics
-    
+  - pip>=24
+
+# Install the CUDA-specific PyTorch build before requirements-segmentation.txt.
+# Do not add an unqualified torch/torchvision dependency here: it can resolve to
+# a build that does not contain RTX 5090 (Blackwell, sm_120) kernels.

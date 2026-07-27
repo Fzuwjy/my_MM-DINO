@@ -73,17 +73,24 @@ Keep the official dataset lists unchanged and pass the generated files through
 
 ## Preflight
 
-Create a Python 3.11 environment. Install the CUDA-compatible `torch` and
-`torchvision` builds selected for the server first, then install the remaining
-packages:
+For the RTX 5090 server, use the project-tested PyTorch floor together with the
+first stable CUDA build that officially supports NVIDIA Blackwell: Python 3.11,
+PyTorch 2.7.1, torchvision 0.22.1 and CUDA 12.8 wheels. Do not select an
+unqualified `torch` package from a cloud image or a generic requirements file.
 
 ```bash
-pip install -r requirements-segmentation.txt
+conda env create -f conda.yaml
+conda activate mm-dino
+python -m pip install --upgrade pip
+python -m pip install torch==2.7.1 torchvision==0.22.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements-segmentation.txt
 ```
 
-The exact PyTorch/CUDA command is intentionally deferred until the server GPU,
-driver and image are known; do not let a generic requirements file silently
-replace the CUDA build with a CPU build.
+The PyTorch wheel contains its CUDA runtime; a separate CUDA Toolkit is not
+needed for normal training. The host still needs an NVIDIA driver new enough for
+the RTX 5090 and CUDA 12.8. Prefer a cloud image advertised for CUDA 12.8, then
+verify the actual environment instead of relying on the image label.
 
 After the environment, data and weights are ready, run:
 
@@ -95,12 +102,15 @@ python scripts/preflight.py \
   --require-cuda
 ```
 
-The check reports Python/PyTorch/CUDA/GPU information and fails on missing
-dependencies, weights, dataset directories or split files.
+The check reports Python/PyTorch/torchvision/CUDA/GPU information and fails on
+missing dependencies, weights, dataset directories or split files. On an RTX
+5090 it also requires CUDA 12.8 and verifies that the installed wheel contains
+`sm_120` (or equivalent PTX) support.
 
 ## Training commands
 
-Single 32 GB RTX 5090 starting point:
+Single 32 GB RTX 5090 conservative smoke-test starting point (increase the two
+batch sizes only after the first run is stable):
 
 ```bash
 python tasks/segmentation/train_multi.py \
@@ -109,9 +119,9 @@ python tasks/segmentation/train_multi.py \
   --backbone-type dinov3_vits16 \
   --train-split-file /path/to/splits/whu_research_train.txt \
   --eval-split-file /path/to/splits/whu_research_val.txt \
-  --batch-size 8 \
+  --batch-size 2 \
   --amp-dtype bf16 \
-  --inference-batch-size 4 \
+  --inference-batch-size 1 \
   --run-name whu_vits16_official_baseline
 ```
 
