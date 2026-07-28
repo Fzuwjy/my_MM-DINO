@@ -9,6 +9,10 @@ import torch
 from scripts.whu_cache_compat import CACHE_CAPACITY, set_dataset_cache_capacity
 from scripts.whu_label_dtype_compat import label_to_int64
 from scripts.prepare_faithful_whu import BACKBONE_FILENAMES
+from scripts.evaluate_whu_vitl_lora import (
+    RELEASED_CONFIG_BATCH_SIZE,
+    RELEASED_INFERENCE_BATCH_SIZE,
+)
 from scripts.run_whu_vitl_lora_accumulated import (
     GradientAccumulationController,
     GradientScaledLoss,
@@ -63,6 +67,15 @@ class FaithfulWhuContractTest(unittest.TestCase):
             BACKBONE_FILENAMES["dinov3_vitl16"],
             "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
         )
+
+    def test_vitl_lora_evaluator_uses_training_time_inference_batch(self):
+        self.assertEqual(RELEASED_CONFIG_BATCH_SIZE, 8)
+        self.assertEqual(RELEASED_INFERENCE_BATCH_SIZE, 32)
+        evaluator = (
+            REPO_ROOT / "scripts" / "evaluate_whu_vitl_lora.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("official_trainer.test(", evaluator)
+        self.assertNotIn("metrics_print_version", evaluator)
 
     def test_accumulation_keeps_released_effective_batch(self):
         validate_effective_batch(4, 2)

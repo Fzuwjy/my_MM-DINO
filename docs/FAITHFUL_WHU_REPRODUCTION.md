@@ -179,6 +179,40 @@ torchrun --standalone --nproc_per_node=1 \
   --grad-accum-steps 2
 ```
 
+## Table III ViT-L LoRA checkpoint comparison
+
+The released standalone `tasks/segmentation/test.py` uses sliding-window
+microbatch 8, which differs from the training-time evaluator's microbatch 32.
+Use the external evaluator below; it loads a checkpoint and directly calls the
+unmodified `train_multi.test` function.  It refuses to overwrite an existing
+JSON result.
+
+Evaluate the author-released checkpoint:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_vitl_lora.py \
+  --checkpoint-path /root/autodl-tmp/mm-dino/checkpoints/official/whu/MMDINO_vitl16_lora_WHU_multi_e50_mIoU55.92.pth \
+  --output-path /root/autodl-tmp/mm-dino/outputs/evaluation/whu_vitl16_lora_multi_official_train_protocol.json
+```
+
+Evaluate the epoch-45 compatibility-reproduction checkpoint:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_vitl_lora.py \
+  --checkpoint-path /root/autodl-tmp/mm-dino/outputs/faithful-whu-author-protocol/DINOv3/WHU_20260728_021847/DINOv3_WHU_e45_mIoU55.58.pth \
+  --output-path /root/autodl-tmp/mm-dino/outputs/evaluation/whu_vitl16_lora_multi_repro_e45_train_protocol.json
+```
+
 ## Formal foreground run
 
 Do not start this command until both probes pass and their output is recorded:
