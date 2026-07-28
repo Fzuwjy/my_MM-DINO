@@ -16,6 +16,7 @@ from scripts.evaluate_whu_vitl_lora import (
 from scripts.run_whu_vitl_lora_accumulated import (
     GradientAccumulationController,
     GradientScaledLoss,
+    scientific_configuration,
     validate_effective_batch,
 )
 
@@ -81,6 +82,23 @@ class FaithfulWhuContractTest(unittest.TestCase):
         validate_effective_batch(4, 2)
         with self.assertRaises(ValueError):
             validate_effective_batch(4, 1)
+
+    def test_accumulated_launcher_locks_uni_and_multimodal_targets(self):
+        rgb_only = scientific_configuration(1)
+        multimodal = scientific_configuration(2)
+        self.assertEqual(rgb_only["num_modalities"], 1)
+        self.assertEqual(multimodal["num_modalities"], 2)
+        locked_fields = (
+            "model_name",
+            "dataset_name",
+            "use_lora",
+            "r",
+            "backbone_type",
+        )
+        for name in locked_fields:
+            self.assertEqual(rgb_only[name], multimodal[name])
+        with self.assertRaises(ValueError):
+            scientific_configuration(0)
 
     def test_accumulation_gates_optimizer_calls(self):
         class Optimizer:

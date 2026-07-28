@@ -1,4 +1,4 @@
-"""Run the released WHU ViT-L LoRA path with a memory-compatible batch.
+"""Run a released WHU ViT-L LoRA path with a memory-compatible batch.
 
 The public trainer remains untouched.  This external launcher makes only the
 minimum batching adaptation required by a 31.4 GiB RTX 5090:
@@ -35,6 +35,21 @@ RELEASED_BATCH_SIZE = 8
 RELEASED_INFERENCE_BATCH_SIZE = 32
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_TRAINER = REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+
+
+def scientific_configuration(num_modalities: int) -> dict[str, Any]:
+    """Return the locked WHU ViT-L LoRA target for one or two modalities."""
+
+    if num_modalities not in (1, 2):
+        raise ValueError("WHU compatibility training supports 1 or 2 modalities")
+    return {
+        "model_name": "DINOv3",
+        "dataset_name": "WHU",
+        "num_modalities": num_modalities,
+        "use_lora": True,
+        "r": 3,
+        "backbone_type": "dinov3_vitl16",
+    }
 
 
 def seed_model_initialization() -> None:
@@ -112,6 +127,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=2)
+    parser.add_argument(
+        "--num-modalities",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="1 for the RGB-only control; 2 preserves the multimodal target",
+    )
     args = parser.parse_args()
     try:
         validate_effective_batch(args.micro_batch_size, args.grad_accum_steps)
@@ -156,14 +178,7 @@ def main() -> None:
     runtime: dict[str, Any] = {}
 
     def get_accumulated_cfg(model_name=None, dataset_name=None, **kwargs):
-        expected = {
-            "model_name": "DINOv3",
-            "dataset_name": "WHU",
-            "num_modalities": 2,
-            "use_lora": True,
-            "r": 3,
-            "backbone_type": "dinov3_vitl16",
-        }
+        expected = scientific_configuration(args.num_modalities)
         actual = {
             "model_name": model_name,
             "dataset_name": dataset_name,
@@ -224,8 +239,12 @@ def main() -> None:
     def move_files_with_protocol(src_dir, dst_dir, exclude_names):
         result = original_move_files(src_dir, dst_dir, exclude_names)
         run_dir = Path(dst_dir).resolve().parent
+        modality_label = "RGB-only" if args.num_modalities == 1 else "Multi"
         protocol = {
-            "protocol": "WHU Table III Multi ViT-L LoRA compatibility reproduction",
+            "protocol": (
+                f"WHU Table III {modality_label} ViT-L LoRA "
+                "compatibility reproduction"
+            ),
             "fidelity": "not exact released batching",
             "seed": SEED,
             "precision": "FP32",
@@ -237,7 +256,7 @@ def main() -> None:
             "backbone_type": "dinov3_vitl16",
             "use_lora": True,
             "lora_rank": 3,
-            "num_modalities": 2,
+            "num_modalities": args.num_modalities,
             "train_micro_batches_per_epoch": runtime.get("micro_batches_per_epoch"),
             "optimizer_steps_per_epoch": runtime.get("optimizer_steps_per_epoch"),
             "compatibility_notes": [
@@ -265,21 +284,23 @@ def main() -> None:
     print(f"gradient_accumulation_steps={args.grad_accum_steps}")
     print(f"effective_batch_size={RELEASED_BATCH_SIZE}")
     print(f"evaluation_inference_batch_size={RELEASED_INFERENCE_BATCH_SIZE}")
+    print(f"num_modalities={args.num_modalities}")
     print(f"whu_cache_capacity={CACHE_CAPACITY}")
 
+    target = scientific_configuration(args.num_modalities)
     official_args = [
         "--model-name",
-        "DINOv3",
+        target["model_name"],
         "--dataset-name",
-        "WHU",
+        target["dataset_name"],
         "--num-modalities",
-        "2",
+        str(target["num_modalities"]),
         "--use-lora",
-        "True",
+        str(target["use_lora"]),
         "--r",
-        "3",
+        str(target["r"]),
         "--backbone-type",
-        "dinov3_vitl16",
+        target["backbone_type"],
     ]
     sys.argv = [str(OFFICIAL_TRAINER), *official_args]
     try:

@@ -104,6 +104,30 @@ Use the same command with `--condition aux-mean` and
 weight scales such as `0.5` and `2.0` are secondary sanity checks, not the first
 formal experiment.
 
+## Independent RGB-only control
+
+The feature-off intervention is not an independently trained RGB baseline.
+Train the RGB-only control with the same seed, ViT-L LoRA rank, 50-epoch
+schedule, microbatch 4, and two-step accumulation used by the multimodal
+compatibility reproduction.  The command must be launched by the user in the
+foreground:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+torchrun --standalone --nproc_per_node=1 \
+  scripts/run_whu_vitl_lora_accumulated.py \
+  --micro-batch-size 4 \
+  --grad-accum-steps 2 \
+  --num-modalities 1
+```
+
+The launcher's default remains two modalities, preserving the existing
+multimodal reproduction command.
+
 ## Interpretation guardrails
 
 - Compare aligned gain and mismatch damage separately; a larger
