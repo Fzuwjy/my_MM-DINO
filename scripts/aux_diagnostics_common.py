@@ -7,7 +7,7 @@ MM-DINO implementation.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from typing import Any
 
 import numpy as np
@@ -238,22 +238,89 @@ def fixed_derangement(length: int, seed: int) -> tuple[list[int], int]:
     return permutation, offset
 
 
+def grouped_derangement(
+    group_keys: Sequence[Hashable],
+    seed: int,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Return deterministic cyclic derangements within compatibility groups.
+
+    Cross-image interventions must not introduce resizing as an extra variable.
+    Every group therefore needs at least two items, and each item is mapped to
+    another item with the same caller-provided compatibility key.
+    """
+
+    if len(group_keys) < 2:
+        raise ValueError("A shuffled auxiliary condition requires at least 2 items")
+
+    grouped_indices: dict[Hashable, list[int]] = {}
+    for index, key in enumerate(group_keys):
+        grouped_indices.setdefault(key, []).append(index)
+
+    singleton_keys = [
+        key for key, indices in grouped_indices.items() if len(indices) < 2
+    ]
+    if singleton_keys:
+        raise ValueError(
+            "Each shuffle compatibility group requires at least 2 items; "
+            f"singleton groups: {singleton_keys!r}"
+        )
+
+    generator = np.random.default_rng(seed)
+    permutation = list(range(len(group_keys)))
+    metadata: list[dict[str, Any]] = []
+    for key, indices in grouped_indices.items():
+        offset = int(generator.integers(1, len(indices)))
+        for position, source_index in enumerate(indices):
+            permutation[source_index] = indices[(position + offset) % len(indices)]
+        metadata.append(
+            {
+                "key": str(key),
+                "indices": list(indices),
+                "offset": offset,
+            }
+        )
+
+    return permutation, metadata
+
+
 class AuxiliaryConditionDataset(torch.utils.data.Dataset):
     """Apply distribution-preserving auxiliary interventions to a dataset."""
 
     MODES = {"normal", "aux-mean", "aux-shuffle"}
 
-    def __init__(self, dataset: Any, mode: str, *, seed: int = 42):
+    def __init__(
+        self,
+        dataset: Any,
+        mode: str,
+        *,
+        seed: int = 42,
+        shuffle_group_keys: Sequence[Hashable] | None = None,
+    ):
         if mode not in self.MODES:
             raise ValueError(f"Unsupported auxiliary dataset mode: {mode}")
         self.dataset = dataset
         self.mode = mode
         self.permutation: list[int] | None = None
         self.permutation_offset: int | None = None
+        self.permutation_strategy: str | None = None
+        self.permutation_groups: list[dict[str, Any]] | None = None
         if mode == "aux-shuffle":
-            self.permutation, self.permutation_offset = fixed_derangement(
-                len(dataset), seed
-            )
+            if shuffle_group_keys is None:
+                self.permutation, self.permutation_offset = fixed_derangement(
+                    len(dataset), seed
+                )
+                self.permutation_strategy = "global-cyclic-derangement"
+            else:
+                if len(shuffle_group_keys) != len(dataset):
+                    raise ValueError(
+                        "Shuffle group keys must match the dataset length: "
+                        f"{len(shuffle_group_keys)} vs {len(dataset)}"
+                    )
+                self.permutation, self.permutation_groups = grouped_derangement(
+                    shuffle_group_keys,
+                    seed,
+                )
+                self.permutation_strategy = "grouped-cyclic-derangement"
 
     def __len__(self) -> int:
         return len(self.dataset)

@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEGMENTATION_ROOT = REPO_ROOT / "tasks" / "segmentation"
@@ -93,8 +94,49 @@ def _dataset_metadata(dataset: Any) -> dict[str, Any]:
             "mode": dataset.mode,
             "permutation": dataset.permutation,
             "permutation_offset": dataset.permutation_offset,
+            "permutation_strategy": dataset.permutation_strategy,
+            "permutation_groups": dataset.permutation_groups,
         }
-    return {"mode": "normal", "permutation": None, "permutation_offset": None}
+    return {
+        "mode": "normal",
+        "permutation": None,
+        "permutation_offset": None,
+        "permutation_strategy": None,
+        "permutation_groups": None,
+    }
+
+
+def _whu_shuffle_group_keys(dataset: Any) -> list[str]:
+    """Group WHU scenes by their paired native spatial size.
+
+    A few released test scenes differ by one pixel in width. Shuffling only
+    within equal-size groups preserves native pixels and avoids making resize
+    or crop policy part of the counterfactual.
+    """
+
+    rgb_files = getattr(dataset, "rgb_files", None)
+    auxiliary_files = getattr(dataset, "sar_files", None)
+    if not rgb_files or not auxiliary_files:
+        raise ValueError("WHU shuffle requires RGB and SAR source-file lists")
+    if len(rgb_files) != len(auxiliary_files) or len(rgb_files) != len(dataset):
+        raise ValueError("WHU RGB/SAR source lists must match the dataset length")
+
+    group_keys: list[str] = []
+    for index, (rgb_path, auxiliary_path) in enumerate(
+        zip(rgb_files, auxiliary_files, strict=True)
+    ):
+        with (
+            Image.open(rgb_path) as rgb_image,
+            Image.open(auxiliary_path) as aux_image,
+        ):
+            if rgb_image.size != aux_image.size:
+                raise ValueError(
+                    f"Paired WHU RGB/SAR sizes differ at index {index}: "
+                    f"{rgb_image.size} vs {aux_image.size}"
+                )
+            width, height = rgb_image.size
+        group_keys.append(f"{height}x{width}")
+    return group_keys
 
 
 def main() -> None:
@@ -152,10 +194,16 @@ def main() -> None:
         backbone_type="dinov3_vitl16",
     )
     if args.condition in ("aux-mean", "aux-shuffle"):
+        shuffle_group_keys = (
+            _whu_shuffle_group_keys(released_dataset)
+            if args.condition == "aux-shuffle"
+            else None
+        )
         dataset: Any = AuxiliaryConditionDataset(
             released_dataset,
             args.condition,
             seed=args.seed,
+            shuffle_group_keys=shuffle_group_keys,
         )
     else:
         dataset = released_dataset
@@ -221,7 +269,7 @@ def main() -> None:
     )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "split": "test",
         "formal_full_split": args.max_images is None,
         "evaluated_images": len(dataset),

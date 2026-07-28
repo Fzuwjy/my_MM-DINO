@@ -13,6 +13,7 @@ from scripts.aux_diagnostics_common import (
     array_summary,
     edge_alignment_summary,
     fixed_derangement,
+    grouped_derangement,
     modality_weight_summary,
 )
 from scripts.evaluate_whu_aux_counterfactual import _condition_auxiliary_scale
@@ -104,6 +105,31 @@ class AuxDiagnosticsTest(unittest.TestCase):
         for index in range(len(dataset)):
             _, auxiliary, _ = dataset[index]
             self.assertNotEqual(float(auxiliary[0, 0, 0]), float(index))
+
+    def test_grouped_derangement_preserves_compatibility(self):
+        group_keys = ["wide", "wide", "wide", "narrow", "narrow"]
+        permutation, metadata = grouped_derangement(group_keys, seed=42)
+        self.assertEqual(sorted(permutation), list(range(len(group_keys))))
+        for index, shuffled_index in enumerate(permutation):
+            self.assertNotEqual(index, shuffled_index)
+            self.assertEqual(group_keys[index], group_keys[shuffled_index])
+        self.assertEqual([len(group["indices"]) for group in metadata], [3, 2])
+
+    def test_grouped_derangement_rejects_singleton_groups(self):
+        with self.assertRaisesRegex(ValueError, "at least 2 items"):
+            grouped_derangement(["wide", "wide", "narrow"], seed=42)
+
+    def test_aux_shuffle_accepts_compatible_group_keys(self):
+        group_keys = ["a", "a", "a", "b", "b"]
+        dataset = AuxiliaryConditionDataset(
+            TinyMultimodalDataset(),
+            "aux-shuffle",
+            seed=42,
+            shuffle_group_keys=group_keys,
+        )
+        self.assertEqual(dataset.permutation_strategy, "grouped-cyclic-derangement")
+        for index, shuffled_index in enumerate(dataset.permutation):
+            self.assertEqual(group_keys[index], group_keys[shuffled_index])
 
     def test_scaled_adapter_scale_one_matches_released_behavior(self):
         torch.manual_seed(7)

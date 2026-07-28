@@ -18,7 +18,8 @@ the released code under `tasks/segmentation`.
 The conditions have distinct meanings:
 
 - `aux-mean`: removes spatial Aux structure while retaining each image's mean;
-- `aux-shuffle`: uses a deterministic cross-image derangement;
+- `aux-shuffle`: uses a deterministic cross-image derangement within native
+  spatial-size groups, so the intervention adds no resize or crop policy;
 - `aux-feature-off`: sets the Aux global fusion scale to zero and renormalizes
   RGB, rather than feeding an arbitrary zero-valued sensor image;
 - `aux-weight-scale`: scans simple global Aux reweighting as a sanity control.
