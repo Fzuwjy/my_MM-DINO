@@ -1,13 +1,17 @@
-"""Evaluate residual-amplitude scaling on an existing WHU NAF-P2 checkpoint.
+"""Evaluate residual-amplitude scaling for the WHU NAF-P2 experiment.
 
 The trained R1 correction is ``ZeroConv(NAF(x) - Bilinear(x))``.  Because the
 ZeroConv has no bias, multiplying its saved weight by ``alpha`` is exactly
 equivalent to multiplying the complete residual correction by ``alpha``.
-This script changes no other checkpoint parameter and performs no training.
+The default ``full-r1`` mode changes no other checkpoint parameter.  The
+``e0-plus-r1-zero`` transplant mode instead restores every released MM-DINO
+parameter to the sealed E0 baseline and copies only the R1 checkpoint's
+learned ZeroConv.  Both modes perform evaluation only and never train.
 
-Alpha zero is an important control, but it is not R0: it keeps the backbone,
-adapter, and decoder after the R1 continuation while suppressing only the NAF
-correction.  A separately trained R0 is still required for the paired claim.
+In ``full-r1`` mode, alpha zero is not R0 because it keeps all old parameters
+after R1 continuation.  In transplant mode, alpha zero must exactly reproduce
+the sealed E0 result and non-zero alpha isolates the saved ZeroConv correction
+on top of those E0 old parameters.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from scripts.whu_label_dtype_compat import (  # noqa: E402
 
 
 ZERO_WEIGHT_KEY = "adapter.naf_zero_conv.weight"
+NAF_STATE_PREFIX = "adapter.naf."
 
 
 def find_epoch_record(path: Path, epoch: int) -> dict:
@@ -104,6 +109,45 @@ def validate_checkpoint(
     return epoch, protocol
 
 
+def transplant_zero_on_e0(model: torch.nn.Module, r1_state: dict) -> torch.Tensor:
+    """Copy only R1's ZeroConv into an E0-old-parameter R1 construction."""
+    e0_state = model.state_dict()
+    naf_keys = {key for key in e0_state if key.startswith(NAF_STATE_PREFIX)}
+    if not naf_keys:
+        raise AssertionError("E0 transplant construction contains no NAF state")
+    missing_naf = naf_keys - set(r1_state)
+    if missing_naf:
+        raise KeyError(f"R1 checkpoint is missing NAF keys: {sorted(missing_naf)}")
+    changed_naf = [
+        key for key in sorted(naf_keys) if not torch.equal(e0_state[key], r1_state[key])
+    ]
+    if changed_naf:
+        raise AssertionError(
+            "Frozen NAF state changed during R1 continuation: "
+            f"{changed_naf}"
+        )
+
+    learned_zero = r1_state[ZERO_WEIGHT_KEY].detach().clone()
+    zero_weight = model.adapter.naf_zero_conv.weight
+    if learned_zero.shape != zero_weight.shape:
+        raise ValueError(
+            "R1 ZeroConv shape does not match the E0 transplant construction: "
+            f"checkpoint={tuple(learned_zero.shape)}, model={tuple(zero_weight.shape)}"
+        )
+    with torch.no_grad():
+        zero_weight.copy_(learned_zero)
+    return learned_zero
+
+
+def assert_evaluation_equal(actual: dict, expected: dict, label: str) -> None:
+    for field in ("prediction_sha256", "label_sha256", "confusion"):
+        if actual[field] != expected[field]:
+            raise AssertionError(f"{label} {field} does not match")
+    for metric_name in ("MIoU", "F1", "Kappa", "Acc"):
+        if actual[metric_name] != float(expected[metric_name]):
+            raise AssertionError(f"{label} {metric_name} does not match")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate alpha-scaled NAF residuals from one trained WHU R1 checkpoint"
@@ -115,6 +159,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e0-result", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--alphas", type=float, nargs="+", required=True)
+    parser.add_argument(
+        "--state-mode",
+        choices=("full-r1", "e0-plus-r1-zero"),
+        default="full-r1",
+        help=(
+            "full-r1 scales the complete R1 checkpoint; e0-plus-r1-zero keeps "
+            "E0 old parameters and transplants only R1's learned ZeroConv"
+        ),
+    )
     parser.add_argument("--inference-batch-size", type=int, default=8)
     parser.add_argument("--guidance-size", type=int, default=224)
     parser.add_argument(
@@ -186,7 +239,10 @@ def main() -> None:
     reference = find_epoch_record(args.reference_eval, checkpoint_epoch)
 
     model, cfg = build_variant(args, "r1")
-    model.load_state_dict(payload["model"], strict=True)
+    if args.state_mode == "full-r1":
+        model.load_state_dict(payload["model"], strict=True)
+    else:
+        transplant_zero_on_e0(model, payload["model"])
     zero_weight = model.adapter.naf_zero_conv.weight
     original_zero_weight = zero_weight.detach().clone()
     original_zero_norm = float(original_zero_weight.norm())
@@ -226,25 +282,26 @@ def main() -> None:
         result["gain_over_alpha_zero"] = result["MIoU"] - alpha_zero["MIoU"]
 
     alpha_one_reproduced_reference = None
+    alpha_zero_reproduced_e0 = None
     if args.max_images is None:
-        if alpha_one["prediction_sha256"] != reference.get("prediction_sha256"):
-            raise AssertionError(
-                "Alpha=1 predictions do not reproduce the recorded R1 evaluation"
-            )
-        for metric_name in ("MIoU", "F1", "Kappa", "Acc"):
-            if alpha_one[metric_name] != float(reference[metric_name]):
-                raise AssertionError(
-                    f"Alpha=1 {metric_name} does not reproduce the recorded R1 evaluation"
-                )
-        alpha_one_reproduced_reference = True
+        if args.state_mode == "full-r1":
+            assert_evaluation_equal(alpha_one, reference, "Alpha=1 full R1")
+            alpha_one_reproduced_reference = True
+        else:
+            assert_evaluation_equal(alpha_zero, e0["r0"], "Alpha=0 E0 transplant")
+            alpha_zero_reproduced_e0 = True
 
     best = max(results, key=lambda result: result["MIoU"])
     output = {
         "status": "PASS",
         "scope": "full-test" if args.max_images is None else "subset-smoke",
+        "state_mode": args.state_mode,
         "interpretation_warning": (
             "alpha=0 suppresses the NAF correction inside the R1-trained model; "
             "it is not the separately trained R0 control"
+            if args.state_mode == "full-r1"
+            else "all old MM-DINO parameters come from E0; only the learned R1 "
+            "ZeroConv is transplanted, and alpha=0 must exactly reproduce E0"
         ),
         "r1_checkpoint": str(args.r1_checkpoint.resolve()),
         "r1_checkpoint_sha256": file_sha256(args.r1_checkpoint),
@@ -260,6 +317,10 @@ def main() -> None:
         "alphas": args.alphas,
         "original_zero_weight_norm": original_zero_norm,
         "alpha_one_reproduced_reference": alpha_one_reproduced_reference,
+        "alpha_zero_reproduced_e0": alpha_zero_reproduced_e0,
+        "transplanted_parameter_keys": (
+            [ZERO_WEIGHT_KEY] if args.state_mode == "e0-plus-r1-zero" else []
+        ),
         "best_alpha": best["alpha"],
         "best_miou": best["MIoU"],
         "best_gain_over_e0": best["gain_over_e0"],
