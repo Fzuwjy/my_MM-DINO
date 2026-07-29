@@ -47,6 +47,9 @@ class DINOSegmentModule(nn.Module):
         backbone_type='dinov3_vitl16',
         # lora_layers=None,
         num_modalities: int = 1,
+        use_naf: bool = False,
+        naf_checkpoint: str = None,
+        naf_guidance_size: int = 224,
     ):
         super().__init__()
 
@@ -75,7 +78,10 @@ class DINOSegmentModule(nn.Module):
         self.adapter = None
         if adapter_type == 'SampleAdapter':
             self.adapter = SampleAdapter(embed_dim,
-                                         num_modalities=num_modalities)
+                                         num_modalities=num_modalities,
+                                         use_naf=use_naf,
+                                         naf_checkpoint=naf_checkpoint,
+                                         naf_guidance_size=naf_guidance_size)
 
         # 根据类型选择解码器
         decoder_kwargs = {
@@ -193,7 +199,10 @@ class DINOSegmentModule(nn.Module):
             if self.adapter is not None:
                 # 使用适配器处理多尺度特征
                 processed_outputs_modalities = self.adapter(
-                    *outputs_modalities, patch_h=patch_h, patch_w=patch_w)
+                    *outputs_modalities,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                    guidance=x)
             else:
                 processed_outputs_modalities = []
                 for outputs_modality in outputs_modalities:

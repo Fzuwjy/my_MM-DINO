@@ -21,7 +21,10 @@ class SampleAdapter(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels=[256, 512, 1024, 1024],
-                 num_modalities: int = 1):
+                 num_modalities: int = 1,
+                 use_naf: bool = False,
+                 naf_checkpoint: str = None,
+                 naf_guidance_size: int = 224):
         super(SampleAdapter, self).__init__()
 
         self.projects = nn.ModuleList([
@@ -54,6 +57,33 @@ class SampleAdapter(nn.Module):
         ])
 
         self.num_modalities = num_modalities
+        self.use_naf = use_naf
+        self.naf = None
+        self.naf_zero_conv = None
+        self.naf_guidance_size = naf_guidance_size
+
+        if self.use_naf:
+            if num_modalities <= 1:
+                raise ValueError("NAF P2 is only defined for multimodal fusion")
+            if out_channels[0] != 256:
+                raise ValueError(
+                    "Released NAF P2 expects 256 scale-0 projection channels"
+                )
+            if naf_checkpoint is None:
+                raise ValueError("naf_checkpoint is required when use_naf=True")
+            if naf_guidance_size <= 0:
+                raise ValueError("naf_guidance_size must be positive")
+
+            # Lazy import keeps the faithful baseline independent of NATTEN.
+            from .naf import load_released_naf
+
+            self.naf = load_released_naf(naf_checkpoint)
+            self.naf_zero_conv = nn.Conv2d(256,
+                                           256,
+                                           kernel_size=1,
+                                           bias=False)
+            nn.init.zeros_(self.naf_zero_conv.weight)
+
         if num_modalities > 1:
             self.modality_weights = nn.ParameterDict()
             for i in range(num_modalities):
@@ -65,7 +95,18 @@ class SampleAdapter(nn.Module):
                     self.modality_weights[param_name].data.fill_(
                         1.0 / num_modalities)
 
-    def forward(self, *features_list, patch_h=None, patch_w=None):
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.naf is not None:
+            # Outer model.train() must not enable NAF's stochastic RoPE mode.
+            self.naf.eval()
+        return self
+
+    def forward(self,
+                *features_list,
+                patch_h=None,
+                patch_w=None,
+                guidance=None):
         if len(features_list) == 0:
             raise ValueError("At least one feature set must be provided")
 
@@ -91,20 +132,39 @@ class SampleAdapter(nn.Module):
                 )
             num_modalities = len(features_list)
 
+            naf_guidance = None
+            if self.use_naf:
+                if guidance is None:
+                    raise ValueError("Optical guidance is required for NAF P2")
+                if guidance.ndim != 4 or guidance.shape[1] != 3:
+                    raise ValueError(
+                        "NAF optical guidance must have shape [B, 3, H, W]"
+                    )
+                naf_guidance = F.interpolate(
+                    guidance.detach(),
+                    size=(self.naf_guidance_size, self.naf_guidance_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
             # 处理每个模态的特征
             all_processed_features = [[] for _ in range(len(features_list))
                                       ]  # 为每个层级创建列表
             for i, modality_features in enumerate(zip(*features_list)):
                 processed_features = []
+                projected_features = [] if self.use_naf and i == 0 else None
                 for feat in modality_features:
                     feat = feat.permute(0, 2, 1).reshape(
                         (feat.shape[0], feat.shape[-1], patch_h, patch_w))
 
                     feat = self.projects[i](feat)
+                    if projected_features is not None:
+                        projected_features.append(feat)
                     feat = self.resize_layers[i](feat)
 
                     processed_features.append(feat)
 
+                naf_correction = None
                 for j, feat in enumerate(processed_features):
                     weight_param_names = [
                         f'weight_modality_{i}' for i in range(num_modalities)
@@ -121,6 +181,28 @@ class SampleAdapter(nn.Module):
                     # 加权求和
                     fused_feature = sum(w * f for w, f in zip(
                         normalized_weights, processed_features))
+
+                    if self.use_naf and i == 0:
+                        if naf_correction is None:
+                            fused_low_resolution = sum(
+                                w * f for w, f in zip(
+                                    normalized_weights,
+                                    projected_features,
+                                ))
+                            naf_upsampled = self.naf(
+                                naf_guidance,
+                                fused_low_resolution,
+                                fused_feature.shape[-2:],
+                            )
+                            bilinear_upsampled = F.interpolate(
+                                fused_low_resolution,
+                                size=fused_feature.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                            naf_delta = naf_upsampled - bilinear_upsampled
+                            naf_correction = self.naf_zero_conv(naf_delta)
+                        fused_feature = fused_feature + naf_correction
 
                     all_processed_features[j].append(fused_feature)
 

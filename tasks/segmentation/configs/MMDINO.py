@@ -41,7 +41,11 @@ def get_cfg(model_name=None, dataset_name=None, **kwargs):
                             n_classes=len(labels),
                             use_lora=kwargs.get('use_lora'),
                             r=kwargs.get('r'),
-                            num_modalities=kwargs.get('num_modalities', 1))
+                            num_modalities=kwargs.get('num_modalities', 1),
+                            use_naf=kwargs.get('use_naf', False),
+                            naf_checkpoint=kwargs.get('naf_checkpoint'),
+                            naf_guidance_size=kwargs.get(
+                                'naf_guidance_size', 224))
     else:
         raise ValueError("Model name not recognized")
 
