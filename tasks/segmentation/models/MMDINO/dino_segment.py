@@ -50,6 +50,9 @@ class DINOSegmentModule(nn.Module):
         use_naf: bool = False,
         naf_checkpoint: str = None,
         naf_guidance_size: int = 224,
+        naf_backend: str = "cutlass-fna",
+        naf_q_tile_shape=None,
+        naf_kv_tile_shape=None,
     ):
         super().__init__()
 
@@ -81,7 +84,10 @@ class DINOSegmentModule(nn.Module):
                                          num_modalities=num_modalities,
                                          use_naf=use_naf,
                                          naf_checkpoint=naf_checkpoint,
-                                         naf_guidance_size=naf_guidance_size)
+                                         naf_guidance_size=naf_guidance_size,
+                                         naf_backend=naf_backend,
+                                         naf_q_tile_shape=naf_q_tile_shape,
+                                         naf_kv_tile_shape=naf_kv_tile_shape)
 
         # 根据类型选择解码器
         decoder_kwargs = {

@@ -24,7 +24,10 @@ class SampleAdapter(nn.Module):
                  num_modalities: int = 1,
                  use_naf: bool = False,
                  naf_checkpoint: str = None,
-                 naf_guidance_size: int = 224):
+                 naf_guidance_size: int = 224,
+                 naf_backend: str = "cutlass-fna",
+                 naf_q_tile_shape=None,
+                 naf_kv_tile_shape=None):
         super(SampleAdapter, self).__init__()
 
         self.projects = nn.ModuleList([
@@ -77,7 +80,12 @@ class SampleAdapter(nn.Module):
             # Lazy import keeps the faithful baseline independent of NATTEN.
             from .naf import load_released_naf
 
-            self.naf = load_released_naf(naf_checkpoint)
+            self.naf = load_released_naf(
+                naf_checkpoint,
+                backend=naf_backend,
+                q_tile_shape=naf_q_tile_shape,
+                kv_tile_shape=naf_kv_tile_shape,
+            )
             self.naf_zero_conv = nn.Conv2d(256,
                                            256,
                                            kernel_size=1,

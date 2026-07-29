@@ -81,6 +81,9 @@ def build_models(args: argparse.Namespace):
         use_naf=True,
         naf_checkpoint=str(args.naf_checkpoint),
         naf_guidance_size=args.guidance_size,
+        naf_backend=args.naf_backend,
+        naf_q_tile_shape=args.naf_q_tile,
+        naf_kv_tile_shape=args.naf_kv_tile,
         **common,
     )
     baseline = baseline_cfg["model"]
@@ -441,6 +444,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--naf-checkpoint", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--guidance-size", type=int, default=224)
+    parser.add_argument(
+        "--naf-backend",
+        choices=("cutlass-fna", "flex-fna"),
+        default="cutlass-fna",
+    )
+    parser.add_argument("--naf-q-tile", type=int, nargs=2)
+    parser.add_argument("--naf-kv-tile", type=int, nargs=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -451,6 +461,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be positive")
     if args.guidance_size <= 0:
         parser.error("--guidance-size must be positive")
+    if (args.naf_q_tile is None) != (args.naf_kv_tile is None):
+        parser.error("--naf-q-tile and --naf-kv-tile must be set together")
+    if args.naf_q_tile is not None:
+        if any(value <= 0 for value in (*args.naf_q_tile, *args.naf_kv_tile)):
+            parser.error("NAF tile dimensions must be positive")
+        args.naf_q_tile = tuple(args.naf_q_tile)
+        args.naf_kv_tile = tuple(args.naf_kv_tile)
     return args
 
 
@@ -468,6 +485,10 @@ def main() -> None:
     print(f"baseline_checkpoint_sha256={file_sha256(args.baseline_checkpoint)}")
     print(f"naf_checkpoint_sha256={file_sha256(args.naf_checkpoint)}")
     print(f"naf_guidance=optical_common_normalized_{args.guidance_size}x{args.guidance_size}")
+    print(
+        f"naf_attention=backend:{args.naf_backend},"
+        f"q_tile:{args.naf_q_tile},kv_tile:{args.naf_kv_tile}"
+    )
 
     baseline_cfg, naf_cfg = build_models(args)
     import natten  # Imported lazily by the NAF-enabled model above.

@@ -45,7 +45,11 @@ def get_cfg(model_name=None, dataset_name=None, **kwargs):
                             use_naf=kwargs.get('use_naf', False),
                             naf_checkpoint=kwargs.get('naf_checkpoint'),
                             naf_guidance_size=kwargs.get(
-                                'naf_guidance_size', 224))
+                                'naf_guidance_size', 224),
+                            naf_backend=kwargs.get('naf_backend',
+                                                   'cutlass-fna'),
+                            naf_q_tile_shape=kwargs.get('naf_q_tile_shape'),
+                            naf_kv_tile_shape=kwargs.get('naf_kv_tile_shape'))
     else:
         raise ValueError("Model name not recognized")
 

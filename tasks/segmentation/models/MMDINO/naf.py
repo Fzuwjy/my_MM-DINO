@@ -180,13 +180,22 @@ class ImageEncoder(nn.Module):
 
 class CrossAttention(nn.Module):
     def __init__(
-        self, dim: int, num_heads: int, kernel_size: tuple[int, int] = (9, 9)
+        self,
+        dim: int,
+        num_heads: int,
+        kernel_size: tuple[int, int] = (9, 9),
+        backend: str = "cutlass-fna",
+        q_tile_shape: tuple[int, int] | None = None,
+        kv_tile_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("NAF dim must be divisible by its attention heads")
         self.num_heads = num_heads
         self.kernel_size = kernel_size
+        self.backend = backend
+        self.q_tile_shape = q_tile_shape
+        self.kv_tile_shape = kv_tile_shape
 
     def _resize(self, x: Tensor, size: tuple[int, int], dtype: torch.dtype) -> Tensor:
         x = F.interpolate(x, size=size, mode="nearest-exact")
@@ -222,7 +231,9 @@ class CrossAttention(nn.Module):
             kernel_size=self.kernel_size,
             dilation=dilation,
             stride=1,
-            backend="cutlass-fna",
+            backend=self.backend,
+            q_tile_shape=self.q_tile_shape,
+            kv_tile_shape=self.kv_tile_shape,
         )
         return out.permute(0, 3, 4, 1, 2).reshape(
             batch, channels, height, width
@@ -242,6 +253,9 @@ class NAF(nn.Module):
         rope_base: float = 100.0,
         rope_rescale: float = 2.0,
         img_layers: int = 2,
+        backend: str = "cutlass-fna",
+        q_tile_shape: tuple[int, int] | None = None,
+        kv_tile_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.image_encoder = ImageEncoder(
@@ -257,6 +271,9 @@ class NAF(nn.Module):
             dim=dim,
             num_heads=heads_attn,
             kernel_size=(kernel_size, kernel_size),
+            backend=backend,
+            q_tile_shape=q_tile_shape,
+            kv_tile_shape=kv_tile_shape,
         )
 
     def forward(
@@ -267,14 +284,24 @@ class NAF(nn.Module):
         return self.upsampler(queries, keys, features)
 
 
-def load_released_naf(checkpoint_path: str) -> NAF:
+def load_released_naf(
+    checkpoint_path: str,
+    *,
+    backend: str = "cutlass-fna",
+    q_tile_shape: tuple[int, int] | None = None,
+    kv_tile_shape: tuple[int, int] | None = None,
+) -> NAF:
     """Strictly load the released standalone NAF state dict and freeze it."""
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise TypeError("NAF checkpoint must contain a state-dict mapping")
 
-    model = NAF()
+    model = NAF(
+        backend=backend,
+        q_tile_shape=q_tile_shape,
+        kv_tile_shape=kv_tile_shape,
+    )
     model.load_state_dict(checkpoint, strict=True)
     model.requires_grad_(False)
     model.eval()
