@@ -84,6 +84,7 @@ class SpatialDiagnosticsTest(unittest.TestCase):
         self.assertEqual(summary["errors"], 1)
         self.assertAlmostEqual(summary["coverage"], 0.15)
         self.assertGreater(summary["relative_error_risk"], 1.0)
+        self.assertGreater(summary["error_enrichment_over_global"], 1.0)
         self.assertGreater(summary["oracle_gain_pp"], 0.0)
         self.assertGreater(summary["per_class"]["a"]["relative_error_risk"], 1.0)
         self.assertGreater(summary["per_class"]["a"]["oracle_iou_gain_pp"], 0.0)

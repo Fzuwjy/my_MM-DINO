@@ -295,13 +295,13 @@ def build_spatial_region_masks(
     target: np.ndarray,
     num_classes: int,
     *,
-    boundary_radii: Iterable[int] = (1, 2, 4, 8),
+    boundary_radii: Iterable[int] = (0, 1, 2, 4, 8),
     component_area_thresholds: Iterable[int] = (256, 1024, 4096),
     component_thickness_thresholds: Iterable[int] = (4, 8, 16),
     patch_size: int = 16,
-    union_boundary_radius: int = 4,
-    union_component_area: int = 1024,
-    union_component_thickness: int = 8,
+    union_boundary_radius: int = 0,
+    union_component_area: int = 256,
+    union_component_thickness: int = 4,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Build all first-gate region masks and their exact definitions."""
 
@@ -418,6 +418,7 @@ def region_summary(
     complement_pixels = total_pixels - region_pixels
     complement_errors = total_errors - region_errors
     error_rate = region_errors / region_pixels if region_pixels else float("nan")
+    global_error_rate = total_errors / total_pixels if total_pixels else float("nan")
     complement_error_rate = (
         complement_errors / complement_pixels if complement_pixels else float("nan")
     )
@@ -466,6 +467,9 @@ def region_summary(
         "errors": region_errors,
         "error_share": float(region_errors / total_errors) if total_errors else None,
         "error_rate": float(error_rate) if np.isfinite(error_rate) else None,
+        "error_enrichment_over_global": _optional_ratio(
+            error_rate, global_error_rate
+        ),
         "complement_error_rate": (
             float(complement_error_rate)
             if np.isfinite(complement_error_rate)

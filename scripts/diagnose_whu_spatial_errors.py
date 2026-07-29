@@ -244,7 +244,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-images", type=int)
     parser.add_argument("--miou-tolerance", type=float, default=1e-12)
-    parser.add_argument("--boundary-radii", type=int, nargs="+", default=(1, 2, 4, 8))
+    parser.add_argument(
+        "--boundary-radii", type=int, nargs="+", default=(0, 1, 2, 4, 8)
+    )
     parser.add_argument(
         "--component-area-thresholds",
         type=int,
@@ -258,9 +260,9 @@ def parse_args() -> argparse.Namespace:
         default=(4, 8, 16),
     )
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--union-boundary-radius", type=int, default=4)
-    parser.add_argument("--union-component-area", type=int, default=1024)
-    parser.add_argument("--union-component-thickness", type=int, default=8)
+    parser.add_argument("--union-boundary-radius", type=int, default=0)
+    parser.add_argument("--union-component-area", type=int, default=256)
+    parser.add_argument("--union-component-thickness", type=int, default=4)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260730)
     args = parser.parse_args()
