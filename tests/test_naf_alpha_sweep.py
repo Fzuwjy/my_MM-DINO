@@ -5,7 +5,7 @@ import unittest
 import torch
 from torch import nn
 
-from scripts.evaluate_whu_naf_alpha_sweep import transplant_zero_on_e0
+from scripts.evaluate_whu_naf_alpha_sweep import class_ious, transplant_zero_on_e0
 
 
 class _ToyAdapter(nn.Module):
@@ -24,6 +24,11 @@ class _ToyModel(nn.Module):
 
 
 class NafAlphaSweepContractTest(unittest.TestCase):
+    def test_class_ious_uses_rows_as_labels_and_columns_as_predictions(self):
+        values = class_ious([[5, 1], [2, 4]], ["city", "road"])
+        self.assertEqual(values["city"], 5 / 8)
+        self.assertEqual(values["road"], 4 / 7)
+
     def test_transplant_copies_only_zero_conv(self):
         model = _ToyModel()
         before = {key: value.clone() for key, value in model.state_dict().items()}

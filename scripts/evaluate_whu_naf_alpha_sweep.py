@@ -148,6 +148,21 @@ def assert_evaluation_equal(actual: dict, expected: dict, label: str) -> None:
             raise AssertionError(f"{label} {metric_name} does not match")
 
 
+def class_ious(confusion: list[list[int]], labels: list[str]) -> dict[str, float | None]:
+    if len(confusion) != len(labels) or any(len(row) != len(labels) for row in confusion):
+        raise ValueError("Confusion matrix shape does not match class labels")
+    values = {}
+    for index, label in enumerate(labels):
+        intersection = confusion[index][index]
+        union = (
+            sum(confusion[index])
+            + sum(row[index] for row in confusion)
+            - intersection
+        )
+        values[label] = intersection / union if union else None
+    return values
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate alpha-scaled NAF residuals from one trained WHU R1 checkpoint"
@@ -268,6 +283,7 @@ def main() -> None:
                     "alpha": alpha,
                     "gain_over_e0": evaluation["MIoU"] - float(e0["r0"]["MIoU"]),
                     "zero_weight_norm": float(zero_weight.detach().norm()),
+                    "class_iou": class_ious(evaluation["confusion"], cfg["labels"]),
                 }
             )
             results.append(evaluation)
