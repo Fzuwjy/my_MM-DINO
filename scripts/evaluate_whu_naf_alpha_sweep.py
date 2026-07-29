@@ -168,7 +168,15 @@ def main() -> None:
     install_whu_label_dtype_compat()
     install_whu_cache_compat(CACHE_CAPACITY)
     e0, baseline_sha, naf_sha = read_verified_e0(args)
-    payload = torch.load(args.r1_checkpoint, map_location="cpu", weights_only=True)
+    # The checkpoint is produced by our paired runner. Its recorded
+    # ``torch.__version__`` is a TorchVersion (a str subclass), which PyTorch
+    # 2.7 intentionally rejects unless it is explicitly allowlisted.
+    with torch.serialization.safe_globals([torch.torch_version.TorchVersion]):
+        payload = torch.load(
+            args.r1_checkpoint,
+            map_location="cpu",
+            weights_only=True,
+        )
     checkpoint_epoch, protocol = validate_checkpoint(
         payload,
         args,
