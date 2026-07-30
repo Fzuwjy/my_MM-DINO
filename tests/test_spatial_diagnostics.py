@@ -23,6 +23,11 @@ from scripts.evaluate_whu_phase_ensemble import (
     aligned_two_view_prediction,
     efficacy_decision,
 )
+from scripts.evaluate_whu_phase_ensemble_2d import (
+    ceiling_decision,
+    four_phase_shifts,
+    prediction_from_aligned_score_sum,
+)
 
 
 class SpatialDiagnosticsTest(unittest.TestCase):
@@ -216,6 +221,41 @@ class SpatialDiagnosticsTest(unittest.TestCase):
         self.assertEqual(
             efficacy_decision(primary, control, names)["outcome"], "STOP"
         )
+
+    def test_four_phase_shifts_form_fixed_two_dimensional_square(self):
+        self.assertEqual(
+            four_phase_shifts(8), ((0, 0), (0, 8), (8, 0), (8, 8))
+        )
+
+    def test_four_phase_prediction_keeps_pixels_outside_common_region(self):
+        baseline = np.zeros((1, 4, 6), dtype=np.int64)
+        score_sum = torch.zeros((2, 2, 3), dtype=torch.float32)
+        score_sum[1] = 3.0
+        original = (slice(1, 3), slice(2, 5))
+        prediction = prediction_from_aligned_score_sum(
+            baseline, score_sum, original
+        )
+        expected = baseline.copy()
+        expected[0][original] = 1
+        np.testing.assert_array_equal(prediction, expected)
+
+    def test_four_phase_ceiling_decision_uses_fixed_thresholds(self):
+        regions = {
+            "component_area_le_256px2": {
+                "candidate_minus_baseline_error_rate_pp": -0.01
+            },
+            "component_thickness_le_4px": {
+                "candidate_minus_baseline_error_rate_pp": 0.02
+            },
+        }
+        strong = ceiling_decision(0.21, 0.14, 0.12, regions)
+        self.assertEqual(strong["outcome"], "STRONG_GO")
+        limited = ceiling_decision(0.18, 0.14, 0.12, regions)
+        self.assertEqual(limited["outcome"], "LIMITED_GO")
+        saturated = ceiling_decision(0.13, 0.05, 0.12, regions)
+        self.assertEqual(saturated["outcome"], "SATURATED")
+        borderline = ceiling_decision(0.155, 0.05, 0.12, regions)
+        self.assertEqual(borderline["outcome"], "BORDERLINE")
 
 
 if __name__ == "__main__":
