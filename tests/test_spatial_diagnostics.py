@@ -19,6 +19,10 @@ from scripts.spatial_diagnostics_common import (
     semantic_boundary_mask,
 )
 from scripts.evaluate_whu_translation_consistency import translate_tensor
+from scripts.evaluate_whu_phase_ensemble import (
+    aligned_two_view_prediction,
+    efficacy_decision,
+)
 
 
 class SpatialDiagnosticsTest(unittest.TestCase):
@@ -180,6 +184,38 @@ class SpatialDiagnosticsTest(unittest.TestCase):
         result = bootstrap_paired_miou_delta(references, candidates, samples)
         self.assertGreater(result["median_pp"], 0.0)
         self.assertGreater(result["ci95_pp"][0], 0.0)
+
+    def test_phase_ensemble_changes_only_the_shared_valid_region(self):
+        baseline = torch.zeros((1, 2, 4, 6), dtype=torch.float32)
+        baseline[:, 0] = 2.0
+        shifted = torch.zeros_like(baseline)
+        shifted[:, 1] = 4.0
+        original = (slice(1, 3), slice(1, 4))
+        shifted_slice = (slice(1, 3), slice(2, 5))
+        prediction = aligned_two_view_prediction(
+            baseline, shifted, original, shifted_slice
+        )
+        expected = np.zeros((1, 4, 6), dtype=np.int64)
+        expected[0][original] = 1
+        np.testing.assert_array_equal(prediction, expected)
+
+    def test_phase_ensemble_efficacy_rule_is_prospective_and_conjunctive(self):
+        names = ["farm", "city", "village", "water", "forest", "road", "other"]
+        primary = {
+            "candidate_minus_baseline_miou_pp": 0.12,
+            "class_candidate_minus_baseline_iou_pp": {
+                name: 0.0 for name in names
+            },
+        }
+        control = {"candidate_minus_baseline_miou_pp": 0.06}
+        self.assertEqual(
+            efficacy_decision(primary, control, names)["outcome"], "GO"
+        )
+        primary["class_candidate_minus_baseline_iou_pp"]["city"] = -0.01
+        primary["class_candidate_minus_baseline_iou_pp"]["road"] = -0.01
+        self.assertEqual(
+            efficacy_decision(primary, control, names)["outcome"], "STOP"
+        )
 
 
 if __name__ == "__main__":
