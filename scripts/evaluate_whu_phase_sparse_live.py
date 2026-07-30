@@ -47,6 +47,7 @@ from scripts.phase_closure_common import (  # noqa: E402
     validate_levels,
 )
 from scripts.phase_sparse_live_common import (  # noqa: E402
+    forward_selected_phase_key_crops,
     forward_selected_phase_crops,
     normalized_phase_logits,
 )
@@ -73,7 +74,7 @@ from scripts.whu_label_dtype_compat import (  # noqa: E402
 
 
 ARTIFACT_TYPE = "whu_phase_sparse_live_b1b_smoke"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 NUM_CLASSES = 7
 LOGIT_ATOL = 1e-5
 LOGIT_RTOL = 1e-5
@@ -127,6 +128,69 @@ def _execution_summary(execution: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _global_phase_execution_summary(execution: Mapping[str, Any]) -> dict[str, Any]:
+    phase_summaries: dict[str, Any] = {}
+    for phase_name in PHASE_NAMES:
+        phase = execution["phases"].get(phase_name)
+        if phase is None:
+            phase_summaries[phase_name] = {
+                "crop_samples": 0,
+                "observed_crop_ids": [],
+            }
+            continue
+        phase_summaries[phase_name] = {
+            "crop_samples": int(phase["crop_samples"]),
+            "observed_crop_ids": list(phase["observed_crop_ids"]),
+            "sum_logits_sha256": array_sha256(phase["sum_logits"]),
+            "count_mat_sha256": array_sha256(phase["count_mat"]),
+        }
+    return {
+        "packing_scope": "single-image global pool across phases",
+        "canonical_order": "phase_order_then_ascending_local_crop_id",
+        "selected_crop_samples": int(execution["selected_crop_samples"]),
+        "model_forward_crop_samples": int(execution["model_forward_crop_samples"]),
+        "padding_crop_samples": int(execution["padding_crop_samples"]),
+        "batch_calls": int(execution["batch_calls"]),
+        "real_batch_sizes": list(execution["real_batch_sizes"]),
+        "model_batch_sizes": list(execution["model_batch_sizes"]),
+        "mean_real_batch_size": execution["mean_real_batch_size"],
+        "mean_model_batch_size": execution["mean_model_batch_size"],
+        "padding_policy": execution["padding_policy"],
+        "observed_phase_crop_keys": [
+            [phase_name, int(crop_id)]
+            for phase_name, crop_id in execution["observed_phase_crop_keys"]
+        ],
+        "processed_phase_crop_keys": [
+            [phase_name, int(crop_id)]
+            for phase_name, crop_id in execution["processed_phase_crop_keys"]
+        ],
+        "padding_phase_crop_keys": [
+            [phase_name, int(crop_id)]
+            for phase_name, crop_id in execution["padding_phase_crop_keys"]
+        ],
+        "phases": phase_summaries,
+        "wall_seconds": float(execution["wall_seconds"]),
+    }
+
+
+def _add_model_sample_cost(
+    execution_summary: dict[str, Any], baseline_crop_samples: int
+) -> None:
+    baseline = int(baseline_crop_samples)
+    if baseline <= 0:
+        raise ValueError("baseline crop sample count must be positive")
+    selected = int(execution_summary["selected_crop_samples"])
+    processed = int(execution_summary["model_forward_crop_samples"])
+    execution_summary["cost_accounting"] = {
+        "baseline_crop_samples": baseline,
+        "selected_extra_crop_samples": selected,
+        "processed_extra_crop_samples_including_padding": processed,
+        "logical_unique_crop_cost_ratio": float((baseline + selected) / baseline),
+        "physical_model_sample_cost_ratio": float((baseline + processed) / baseline),
+        "padding_is_counted_as_model_compute": True,
+    }
+
+
 def _execute_shifted_phases(
     optical: torch.Tensor,
     sar: torch.Tensor,
@@ -145,48 +209,45 @@ def _execute_shifted_phases(
 ]:
     crop_ids = expected_phase_crop_ids(levels, geometry, image_index)
     windows = geometry["windows_by_image"][image_index]
-    accumulations: dict[str, dict[str, Any]] = {}
-    summaries: dict[str, dict[str, Any]] = {}
-    observed_keys: list[tuple[int, str, int]] = []
+    phase_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for phase_name in PHASE_NAMES:
         selected = crop_ids[phase_name]
         if not selected:
-            summaries[phase_name] = {
-                "crop_samples": 0,
-                "batch_calls": 0,
-                "observed_crop_ids": [],
-            }
             continue
         dy, dx = geometry["phase_shifts"][phase_name]
         phase_optical = translate_tensor(optical, dy, dx).to(device)
         phase_sar = translate_tensor(sar, dy, dx).to(device)
-        execution = forward_selected_phase_crops(
-            phase_optical,
-            phase_sar,
-            model,
-            windows,
-            selected,
-            n_output_channels=NUM_CLASSES,
-            batch_size=batch_size,
-            decoder_head_type="linear",
-        )
-        accumulations[phase_name] = execution
-        summaries[phase_name] = _execution_summary(execution)
-        observed_keys.extend(
-            (image_index, phase_name, int(crop_id))
-            for crop_id in execution["observed_crop_ids"]
-        )
-        del phase_optical, phase_sar
-        torch.cuda.empty_cache()
-        print(
-            f"{label} phase={phase_name} crops={len(selected)} PASS",
-            flush=True,
-        )
+        phase_tensors[phase_name] = (phase_optical, phase_sar)
+    execution = forward_selected_phase_key_crops(
+        phase_tensors,
+        model,
+        windows,
+        crop_ids,
+        phase_order=PHASE_NAMES,
+        n_output_channels=NUM_CLASSES,
+        batch_size=batch_size,
+        decoder_head_type="linear",
+    )
+    accumulations = execution["phases"]
+    summary = _global_phase_execution_summary(execution)
+    observed_keys = [
+        (image_index, phase_name, int(crop_id))
+        for phase_name, crop_id in execution["observed_phase_crop_keys"]
+    ]
     expected_keys = _phase_key_subset(levels, geometry, image_index)
     key_validation = validate_observed_crop_keys(tuple(observed_keys), expected_keys)
     key_validation["expected_keys"] = [list(key) for key in expected_keys]
     key_validation["observed_keys"] = [list(key) for key in observed_keys]
-    return accumulations, summaries, key_validation
+    print(
+        f"{label} selected={summary['selected_crop_samples']} "
+        f"processed={summary['model_forward_crop_samples']} "
+        f"padding={summary['padding_crop_samples']} "
+        f"batches={summary['batch_calls']} PASS",
+        flush=True,
+    )
+    del phase_tensors, execution
+    torch.cuda.empty_cache()
+    return accumulations, summary, key_validation
 
 
 def _anchor_summary(
@@ -204,7 +265,11 @@ def _anchor_summary(
     sha_equal = actual_sha == expected_sha
     confusion_equal = bool(np.array_equal(actual_confusion, expected_confusion))
     if not sha_equal or not confusion_equal:
-        raise AssertionError(f"{name} does not reproduce the Stage-A first-image anchor")
+        raise AssertionError(
+            f"{name} does not reproduce the Stage-A first-image anchor: "
+            f"prediction_sha_equal={sha_equal} confusion_equal={confusion_equal} "
+            f"actual_sha={actual_sha} expected_sha={expected_sha}"
+        )
     return {
         "name": name,
         "prediction_sha256": actual_sha,
@@ -482,6 +547,9 @@ def main() -> None:
             label="support-pruned-k4-reference",
         )
     )
+    _add_model_sample_cost(
+        dense_phase_summaries, normal_execution_summary["crop_samples"]
+    )
     k2_output = compose_policy_logits(
         normal_logits,
         {"x8": dense_phases["x8"]},
@@ -523,6 +591,9 @@ def main() -> None:
             label="frozen-middle",
         )
     )
+    _add_model_sample_cost(
+        middle_summaries, normal_execution_summary["crop_samples"]
+    )
     middle_result = _policy_correctness(
         name="frozen_middle",
         levels=middle_levels,
@@ -530,7 +601,7 @@ def main() -> None:
         dense_phases=dense_phases,
         sparse_phases=middle_phases,
         sparse_execution={
-            "phases": middle_summaries,
+            "global_batching": middle_summaries,
             "key_validation": middle_key_validation,
         },
         geometry=geometry,
@@ -554,6 +625,9 @@ def main() -> None:
             label="b0-rescue-first-image",
         )
     )
+    _add_model_sample_cost(
+        rescue_summaries, normal_execution_summary["crop_samples"]
+    )
     rescue_result = _policy_correctness(
         name="b0_rescue_first_image",
         levels=rescue_levels,
@@ -561,7 +635,7 @@ def main() -> None:
         dense_phases=dense_phases,
         sparse_phases=rescue_phases,
         sparse_execution={
-            "phases": rescue_summaries,
+            "global_batching": rescue_summaries,
             "key_validation": rescue_key_validation,
         },
         geometry=geometry,
@@ -622,6 +696,16 @@ def main() -> None:
             "prediction_requirement": "array, SHA256, and confusion exact",
             "normal_k1": "complete sealed row-major slide",
             "dense_reference": "support-pruned K4 closure for the first image",
+            "shifted_crop_batch_packing": (
+                "one per-image global pool in phase order then local crop-ID order"
+            ),
+            "model_batch_shape": (
+                "every non-empty shifted model call equals inference_batch_size"
+            ),
+            "final_batch_padding": (
+                "cyclic duplicate from the final real batch; duplicate outputs are "
+                "discarded and counted as physical model samples"
+            ),
         },
         "sample": {
             "image_index": image_index,
@@ -630,7 +714,7 @@ def main() -> None:
         },
         "normal_k1_execution": normal_execution_summary,
         "support_pruned_k4_reference": {
-            "phases": dense_phase_summaries,
+            "global_batching": dense_phase_summaries,
             "key_validation": dense_key_validation,
         },
         "stage_a_first_image_anchors": {
