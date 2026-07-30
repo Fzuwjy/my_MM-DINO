@@ -50,6 +50,18 @@ ARTIFACT_TYPE = "whu_phase_closure_stage_b0"
 SCHEMA_VERSION = 1
 EXPECTED_STAGE_A_TYPE = "whu_phase_utility_stage_a"
 EXPECTED_STAGE_A_ROUTE = "a2_hierarchical_x"
+REQUIRED_REFERENCE_CHECKS = (
+    "k1_prediction_sha256_equal",
+    "label_sha256_equal",
+    "k1_confusion_equal",
+    "k1_miou_within_tolerance",
+    "legacy_k2_prediction_sha256_equal",
+    "legacy_k2_confusion_equal",
+    "legacy_k2_miou_within_tolerance",
+    "k4_prediction_sha256_equal",
+    "k4_confusion_equal",
+    "k4_miou_within_tolerance",
+)
 RANDOM_REPLICATES = 1000
 RANDOM_SEED = 20260730
 MIN_RETENTION = 0.70
@@ -156,13 +168,8 @@ def load_stage_a(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("Stage A did not authorize the frozen A2 Stage-B route")
     validation = payload.get("reference_validation", {})
-    checks = [
-        value
-        for key, value in validation.items()
-        if key != "checked" and key.endswith(("_equal", "_tolerance"))
-    ]
-    if validation.get("checked") is not True or not checks or not all(
-        value is True for value in checks
+    if validation.get("checked") is not True or not all(
+        validation.get(name) is True for name in REQUIRED_REFERENCE_CHECKS
     ):
         raise ValueError("Stage-A sealed references are not fully validated")
     protocol = payload.get("protocol", {})
@@ -177,6 +184,8 @@ def load_stage_a(path: Path) -> dict[str, Any]:
         "stride_hw"
     ) != [341, 341]:
         raise ValueError("Stage-A sliding geometry differs from 512/341")
+    if protocol.get("valid_margin") != 512:
+        raise ValueError("Stage-A valid margin differs from the sealed 512 pixels")
     if not isinstance(payload.get("images"), list) or not isinstance(
         payload.get("cells"), list
     ):

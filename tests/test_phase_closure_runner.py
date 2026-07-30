@@ -34,12 +34,21 @@ class StageB0RunnerTest(unittest.TestCase):
             "reference_validation": {
                 "checked": True,
                 "k1_prediction_sha256_equal": True,
+                "label_sha256_equal": True,
+                "k1_confusion_equal": True,
                 "k1_miou_within_tolerance": True,
+                "legacy_k2_prediction_sha256_equal": True,
+                "legacy_k2_confusion_equal": True,
+                "legacy_k2_miou_within_tolerance": True,
+                "k4_prediction_sha256_equal": True,
+                "k4_confusion_equal": True,
+                "k4_miou_within_tolerance": True,
             },
             "protocol": {
                 "teacher_phases_dy_dx": [[0, 0], [0, 8], [8, 0], [8, 8]],
                 "crop_size_hw": [512, 512],
                 "stride_hw": [341, 341],
+                "valid_margin": 512,
             },
             "images": [{}],
             "cells": [{}],
@@ -68,6 +77,21 @@ class StageB0RunnerTest(unittest.TestCase):
             payload["stage_a_decision"]["selected_route"] = "a1_binary"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "did not authorize"):
+                load_stage_a(path)
+
+    def test_stage_a_loader_requires_every_reference_check_and_valid_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stage_a.json"
+            payload = self._minimal_stage_a()
+            payload["reference_validation"].pop("k4_confusion_equal")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "references"):
+                load_stage_a(path)
+
+            payload = self._minimal_stage_a()
+            payload["protocol"]["valid_margin"] = 511
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "valid margin"):
                 load_stage_a(path)
 
     def test_atomic_json_is_strict_and_refuses_overwrite(self):
