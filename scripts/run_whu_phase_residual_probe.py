@@ -746,8 +746,11 @@ def exact_full_slide_evaluation(
         "float16_roundtrip_mismatch_fraction": float(
             rounded_mismatch.to(dtype=torch.float32).mean().item()
         ),
-        "prediction_equal": prediction_equal,
-        "confusion_equal": confusion_equal,
+        "prediction_equal_report_only": prediction_equal,
+        "prediction_difference_pixels_report_only": int(
+            live_prediction.ne(cached_prediction).sum().item()
+        ),
+        "confusion_equal_report_only": confusion_equal,
         "cached_prediction_sha256": tensor_sha256(cached_prediction),
         "live_prediction_sha256": tensor_sha256(live_prediction),
         "cached_confusion": cached_confusion.tolist(),
@@ -760,16 +763,19 @@ def exact_full_slide_evaluation(
             torch.sqrt(centered_difference.square().mean())
         ),
     }
-    if not float16_roundtrip_equal or not prediction_equal or not confusion_equal:
+    if not float16_roundtrip_equal:
         raise RuntimeError(
-            "live normal-phase 512/341 E0 does not exactly reproduce the "
-            "float16 companion cache: "
+            "live normal-phase 512/341 E0 does not reproduce the companion at "
+            "its declared float16 storage precision: "
             + json.dumps(base_validation, ensure_ascii=False, sort_keys=True)
         )
 
-    behavior = phase_residual_behavior_statistics(
-        cached_e0, teacher, corrected, labels
-    )
+    # The cache seals the training target at float16 storage precision, but the
+    # resource gate must compare the actually deployed float32 slide outputs.
+    # Low-margin argmax ties may legitimately differ after float16 storage even
+    # when every rounded logit is identical, so use live E0 for both the mask
+    # and the full-slide baseline here.
+    behavior = phase_residual_behavior_statistics(base, teacher, corrected, labels)
     ground_truth_support = [
         int((labels == class_index).sum().item()) for class_index in range(NUM_CLASSES)
     ]
@@ -787,7 +793,7 @@ def exact_full_slide_evaluation(
     small = torch.from_numpy(np.ascontiguousarray(small_np)).unsqueeze(0)
     thin = torch.from_numpy(np.ascontiguousarray(thin_np)).unsqueeze(0)
     valid = labels.ge(0) & labels.lt(NUM_CLASSES)
-    e0_prediction = cached_e0.argmax(dim=1)
+    e0_prediction = base.argmax(dim=1)
     teacher_prediction = teacher.argmax(dim=1)
     corrected_prediction = corrected.argmax(dim=1)
     both_wrong = (
@@ -837,10 +843,10 @@ def exact_full_slide_evaluation(
         "resource_gate": gate,
         "regions": {
             "small_component": region_change_statistics(
-                cached_e0, corrected, labels, small
+                base, corrected, labels, small
             ),
             "thin_component": region_change_statistics(
-                cached_e0, corrected, labels, thin
+                base, corrected, labels, thin
             ),
             "both_teacher_and_e0_wrong": both_wrong_report,
         },
@@ -1019,8 +1025,9 @@ def build_probe_protocol(
             "inference_batch_size": int(args.inference_batch_size),
             "live_e0_cache_validity": (
                 "live normal-phase logits converted to float16 must be exactly "
-                "equal to the companion array; prediction and confusion must "
-                "also be exactly equal"
+                "equal to the companion array; float16-induced prediction and "
+                "confusion changes are reported, while the final behavior gate "
+                "uses the actual live float32 E0 baseline"
             ),
             "hard_checks": [
                 "non-empty M_fix",
