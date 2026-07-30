@@ -4,6 +4,21 @@ logs/
 tasks/segmentation/logs
 *.egg-info/
 **/__pycache__/
+.pytest_cache/
+
+# Project experiment artifacts must stay outside version control.
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.jsonl
+*.part
+checkpoints/
+experiments/
+outputs/
+artifacts/
 
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**
