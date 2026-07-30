@@ -60,6 +60,7 @@ from scripts.phase_distillation_common import (  # noqa: E402
 )
 from scripts.phase_residual_common import (  # noqa: E402
     PhaseResidualGateThresholds,
+    center_class_logits,
     fix_mask_rms_scale,
     full_resolution_centered_delta,
     matched_phase_residual_target,
@@ -1136,9 +1137,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if fix_pixels <= 0 or keep_pixels <= 0:
         raise RuntimeError("residual probe requires non-empty fix and keep masks")
     scale = fix_mask_rms_scale(target, fix_mask)
-    target_statistics = magnitude_statistics(target, fix_mask)
+    # Match fix_mask_rms_scale's defensive float32 re-centering before the
+    # report; both RMS reductions then consume the same CPU-float64 values.
+    target_statistics = magnitude_statistics(
+        center_class_logits(target.detach().to(dtype=torch.float32)), fix_mask
+    )
     if not math.isclose(
-        target_statistics["rms"], scale, rel_tol=1e-12, abs_tol=1e-12
+        target_statistics["rms"], scale, rel_tol=0.0, abs_tol=1e-15
     ):
         raise AssertionError("reported target RMS differs from the fixed loss scale")
 

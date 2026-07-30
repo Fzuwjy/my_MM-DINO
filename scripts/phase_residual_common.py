@@ -203,7 +203,11 @@ def fix_mask_rms_scale(
     """
 
     target = center_class_logits(centered_target.detach().to(dtype=torch.float32))
-    selected = _selected_class_values(target, fix_mask).to(dtype=torch.float64)
+    # Accumulate on CPU float64 so the sealed scale is independent of GPU
+    # reduction order and exactly reproducible by the audit statistics.
+    selected = _selected_class_values(target, fix_mask).to(
+        device="cpu", dtype=torch.float64
+    )
     scale = torch.sqrt(selected.square().mean())
     value = float(scale.item())
     if not math.isfinite(value) or value <= 0.0:

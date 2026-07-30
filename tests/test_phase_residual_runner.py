@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from scripts.cache_whu_e0_slide_companion import E0SlideCompanionRecord
+from scripts.phase_residual_common import center_class_logits, fix_mask_rms_scale
 from scripts.run_whu_phase_distillation import SmallArrayCache, canonical_json_sha256
 from scripts.run_whu_phase_residual_probe import (
     companion_crops_for_batch,
@@ -33,6 +34,10 @@ class PhaseResidualRunnerTests(unittest.TestCase):
         self.assertEqual(result["divisor"], 5.0)
         with self.assertRaises(ValueError):
             magnitude_statistics(values, torch.zeros_like(mask))
+        centered = center_class_logits(values)
+        scale = fix_mask_rms_scale(centered, mask)
+        audited = magnitude_statistics(center_class_logits(centered), mask)
+        self.assertEqual(audited["rms"], scale)
 
     def test_companion_crop_uses_original_batch_coordinates_and_float32(self):
         with tempfile.TemporaryDirectory() as directory:

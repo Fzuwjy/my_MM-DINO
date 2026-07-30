@@ -156,6 +156,17 @@ class PhaseResidualCommonTests(unittest.TestCase):
                 scale=1.0,
             )
 
+    def test_fix_rms_scale_is_cpu_float64_reproducible(self) -> None:
+        target = torch.tensor(
+            [[[[0.1, -0.3]], [[-0.2, 0.4]], [[0.1, -0.1]]]],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor([[[True, True]]])
+        centered = center_class_logits(target)
+        selected = centered.permute(0, 2, 3, 1)[mask].reshape(-1).double()
+        expected = float(torch.sqrt(selected.square().mean()).item())
+        self.assertEqual(fix_mask_rms_scale(target, mask), expected)
+
     def test_miou_uses_repository_union_supported_class_set(self) -> None:
         labels = torch.tensor([[[0, 1]]])
         prediction = torch.tensor([[[0, 2]]])
