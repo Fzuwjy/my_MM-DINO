@@ -1783,9 +1783,23 @@ def build_scientific_protocol(
     manifest_metadata: Mapping[str, Any],
     initial_branch: Mapping[str, Any],
 ) -> dict[str, Any]:
+    objective_mask_mode = (
+        args.objective_mask if args.mode == "objective" else None
+    )
+    kd_mask_description = (
+        "valid AND teacher argmax equals the ground-truth label AND frozen E0 "
+        "argmax differs from the ground-truth label; gain is retained only for "
+        "routing diagnostics"
+        if objective_mask_mode == "correction"
+        else (
+            "gain AND valid; small/thin pixels remain eligible when the teacher "
+            "has lower true-class CE"
+        )
+    )
     return {
         "name": "WHU paired single-phase phase-distillation V1",
         "execution_mode": args.mode,
+        "objective_mask_mode": objective_mask_mode,
         "evidence_scope": (
             "Exploratory test-selected method screen for deciding whether the route "
             "deserves more resources; not unbiased paper-level evidence."
@@ -1834,10 +1848,7 @@ def build_scientific_protocol(
             "temperature": KD_TEMPERATURE,
             "gain_mask": "teacher true-class CE < E0 true-class CE",
             "gain_margin": GAIN_MARGIN,
-            "kd_mask": (
-                "gain AND valid; small/thin pixels remain eligible when the teacher "
-                "has lower true-class CE"
-            ),
+            "kd_mask": kd_mask_description,
             "empty_mask_loss": 0.0,
             "kl_normalization": "valid KD-mask pixels",
             "lambda": KD_WEIGHT,
@@ -1941,6 +1952,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--smoke-steps", type=int, default=3)
     parser.add_argument("--overfit-steps", type=int, default=100)
+    parser.add_argument(
+        "--objective-mask",
+        choices=("gain", "correction"),
+        default="gain",
+        help=(
+            "KD routing for objective mode: the original lower-CE gain mask or "
+            "only pixels where the teacher corrects a frozen-E0 error"
+        ),
+    )
     args = parser.parse_args(argv)
 
     for path in (
@@ -1975,8 +1995,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--smoke-steps must be within 1..5")
     if args.overfit_steps <= 0:
         parser.error("--overfit-steps must be positive")
-    if args.mode == "objective" and args.overfit_steps < 10:
-        parser.error("objective mode requires at least 10 steps")
+    if args.mode == "objective" and args.overfit_steps != 100:
+        parser.error("objective mode is pre-registered at exactly 100 steps")
+    if args.mode != "objective" and args.objective_mask != "gain":
+        parser.error("--objective-mask correction is only defined for objective mode")
     return args
 
 
@@ -2259,6 +2281,69 @@ def kd_capacity_decision(initial_kd: float, last_ten_kd: Sequence[float]) -> dic
     }
 
 
+def select_objective_kd_mask(
+    prepared: Mapping[str, torch.Tensor],
+    mode: str,
+) -> torch.Tensor:
+    if mode == "gain":
+        return prepared["kd_mask"].to(dtype=torch.bool)
+    if mode != "correction":
+        raise ValueError(f"unknown objective KD mask mode: {mode}")
+    labels = prepared["labels"]
+    valid = prepared["valid"]
+    teacher_correct = prepared["teacher_logits"].argmax(dim=1).eq(labels)
+    baseline_wrong = prepared["base_logits"].argmax(dim=1).ne(labels)
+    return valid & teacher_correct & baseline_wrong
+
+
+def active_kd_mask_statistics(
+    prepared: Mapping[str, torch.Tensor],
+    labels: Sequence[str],
+) -> dict[str, Any]:
+    active = prepared["kd_mask"].to(dtype=torch.bool)
+    valid = prepared["valid"].to(dtype=torch.bool)
+    small = prepared["small"].to(dtype=torch.bool)
+    thin = prepared["thin"].to(dtype=torch.bool)
+    target = prepared["labels"]
+    teacher_correct = prepared["teacher_logits"].argmax(dim=1).eq(target)
+    baseline_correct = prepared["base_logits"].argmax(dim=1).eq(target)
+    active_count = int(active.sum())
+    valid_count = int(valid.sum())
+
+    def ratio(numerator: int, denominator: int) -> float | None:
+        return float(numerator / denominator) if denominator > 0 else None
+
+    quadrants = {
+        "teacher_correct_base_wrong": teacher_correct & ~baseline_correct & valid,
+        "both_correct": teacher_correct & baseline_correct & valid,
+        "teacher_wrong_base_correct": ~teacher_correct & baseline_correct & valid,
+        "both_wrong": ~teacher_correct & ~baseline_correct & valid,
+    }
+    return {
+        "valid_pixels": valid_count,
+        "active_pixels": active_count,
+        "active_coverage": ratio(active_count, valid_count),
+        "active_on_small_pixels": int((active & small & valid).sum()),
+        "active_on_thin_pixels": int((active & thin & valid).sum()),
+        "per_class": {
+            str(class_name): {
+                "valid_pixels": int(((target == index) & valid).sum()),
+                "active_pixels": int(((target == index) & active).sum()),
+            }
+            for index, class_name in enumerate(labels)
+        },
+        "correctness_quadrants": {
+            name: {
+                "active_pixels": int((active & quadrant).sum()),
+                "fraction_of_active": ratio(
+                    int((active & quadrant).sum()), active_count
+                ),
+            }
+            for name, quadrant in quadrants.items()
+        },
+    }
+
+
 def run_diagnostic_mode(
     args: argparse.Namespace,
     *,
@@ -2385,14 +2470,9 @@ def run_objective_diagnostic(
         extractor=extractor,
         device=device,
     )
-    if int(prepared["kd_mask"].sum()) <= 0:
-        raise RuntimeError("objective diagnostic fixed batch has zero KD pixels")
-    if branch_metadata(combined_branch) != branch_metadata(kd_only_branch):
-        raise AssertionError("objective diagnostic branches do not start identically")
-
-    counters = empty_mask_counters()
+    routing_counters = empty_mask_counters()
     count_mask_statistics(
-        counters,
+        routing_counters,
         labels=prepared["labels"],
         base_logits=prepared["base_logits"],
         teacher_logits=prepared["teacher_logits"],
@@ -2400,6 +2480,20 @@ def run_objective_diagnostic(
         small=prepared["small"],
         thin=prepared["thin"],
     )
+    prepared["kd_mask"] = select_objective_kd_mask(
+        prepared, args.objective_mask
+    )
+    if int(prepared["kd_mask"].sum()) <= 0:
+        raise RuntimeError(
+            f"objective diagnostic fixed batch has zero {args.objective_mask} KD pixels"
+        )
+    combined_initial_metadata = branch_metadata(combined_branch)
+    kd_only_initial_metadata = branch_metadata(kd_only_branch)
+    if combined_initial_metadata != kd_only_initial_metadata:
+        raise AssertionError("objective diagnostic branches do not start identically")
+
+    active_statistics = active_kd_mask_statistics(prepared, cfg["labels"])
+    fixed_batch_hashes = batch_input_hashes(fixed_batch)
     initial_combined = objective_loss_snapshot(
         combined_branch, prepared, supervised_loss
     )
@@ -2474,7 +2568,7 @@ def run_objective_diagnostic(
             "kd_only_branch": kd_only_after,
         }
         if step == 1:
-            record["batch"] = batch_input_hashes(fixed_batch)
+            record["batch"] = fixed_batch_hashes
         records.append(record)
         append_jsonl(args.output_dir / "objective_steps.jsonl", record)
         if step in (1, 10, args.overfit_steps):
@@ -2501,22 +2595,35 @@ def run_objective_diagnostic(
         float(initial_kd_only["kd"]),
         kd_only_values[-10:],
     )
+    routing_statistics = serialize_mask_counters(
+        routing_counters, cfg["labels"]
+    )
     result = {
         "status": "PASS",
         "mode": "objective",
+        "objective_mask_mode": args.objective_mask,
         "steps": args.overfit_steps,
         "scientific_question": (
-            "Does the fixed P2 branch have KD capacity independently of the "
-            "released CE+Dice objective, and how do the two gradients interact?"
+            "Does the fixed P2 branch have fixed-batch KD capacity under the "
+            "selected oracle routing mask independently of the released CE+Dice "
+            "objective, and how do the two gradients interact?"
         ),
         "fixed_variables": {
             "same_cached_batch": True,
             "same_zero_initialization": True,
+            "objective_mask_mode": args.objective_mask,
+            "broad_gain_mask_used_for_loss": args.objective_mask == "gain",
+            "mask_uses_ground_truth": args.objective_mask == "correction",
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "temperature": KD_TEMPERATURE,
             "lambda_in_combined_branch": KD_WEIGHT,
             "hyperparameter_sweep": False,
+        },
+        "fixed_batch": fixed_batch_hashes,
+        "initial_branch_metadata": {
+            "combined_branch": combined_initial_metadata,
+            "kd_only_branch": kd_only_initial_metadata,
         },
         "initial": {
             "combined_branch": initial_combined,
@@ -2535,7 +2642,11 @@ def run_objective_diagnostic(
             "minimum_step": kd_only_values.index(min(kd_only_values)) + 1,
         },
         "gradient_probes": gradient_probes,
-        "mask_statistics": serialize_mask_counters(counters, cfg["labels"]),
+        # Keep the original key as a broad-gain compatibility alias.  In
+        # correction mode it is routing context, not the active loss mask.
+        "mask_statistics": routing_statistics,
+        "routing_gain_statistics": routing_statistics,
+        "active_kd_mask_statistics": active_statistics,
         "runtime": {
             "elapsed_seconds": time.perf_counter() - started,
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3,

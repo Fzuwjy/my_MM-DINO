@@ -17,6 +17,7 @@ from scripts.run_whu_phase_distillation import (
     COMMON_STD,
     PhaseImageRecord,
     WHUPhaseCropDataset,
+    active_kd_mask_statistics,
     build_optimizers,
     checkpoint_epoch_from_path,
     committed_stage_result,
@@ -33,6 +34,7 @@ from scripts.run_whu_phase_distillation import (
     rebuild_metric_indexes,
     load_paired_checkpoint,
     save_paired_checkpoint,
+    select_objective_kd_mask,
     stage_decision,
     validate_resume_commit,
     validate_teacher_protocol,
@@ -233,6 +235,43 @@ class PhaseDistillationRunnerTests(unittest.TestCase):
             kd_capacity_decision(1.0, [0.90] * 10)["outcome"],
             "NO_DEMONSTRATED_CAPACITY",
         )
+
+    def test_correction_objective_mask_selects_only_teacher_repairs(self):
+        labels = torch.tensor([[[0, 0], [1, 7]]])
+        teacher_predictions = torch.tensor([[[0, 0], [0, 0]]])
+        baseline_predictions = torch.tensor([[[1, 0], [1, 1]]])
+
+        def logits_from_predictions(predictions):
+            logits = torch.full((1, 2, 2, 2), -1.0)
+            return logits.scatter_(1, predictions.unsqueeze(1), 1.0)
+
+        prepared = {
+            "labels": labels,
+            "valid": labels.ne(7),
+            "teacher_logits": logits_from_predictions(teacher_predictions),
+            "base_logits": logits_from_predictions(baseline_predictions),
+            "kd_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+            "small": torch.tensor([[[True, False], [False, False]]]),
+            "thin": torch.zeros(1, 2, 2, dtype=torch.bool),
+        }
+        gain_mask = select_objective_kd_mask(prepared, "gain")
+        self.assertTrue(torch.equal(gain_mask, prepared["kd_mask"]))
+        correction_mask = select_objective_kd_mask(prepared, "correction")
+        expected = torch.tensor([[[True, False], [False, False]]])
+        self.assertTrue(torch.equal(correction_mask, expected))
+
+        prepared["kd_mask"] = correction_mask
+        statistics = active_kd_mask_statistics(prepared, ("a", "b"))
+        self.assertEqual(statistics["active_pixels"], 1)
+        self.assertEqual(statistics["active_on_small_pixels"], 1)
+        self.assertEqual(
+            statistics["correctness_quadrants"][
+                "teacher_correct_base_wrong"
+            ]["fraction_of_active"],
+            1.0,
+        )
+        with self.assertRaises(ValueError):
+            select_objective_kd_mask(prepared, "unknown")
 
     def test_initial_gradient_diagnostic_separates_zero_head_and_upstream(self):
         torch.manual_seed(3)
