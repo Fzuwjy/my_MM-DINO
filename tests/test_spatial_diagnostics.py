@@ -3,18 +3,22 @@
 import unittest
 
 import numpy as np
+import torch
 
 from scripts.spatial_diagnostics_common import (
     bootstrap_oracle_gain,
+    bootstrap_paired_miou_delta,
     build_spatial_region_masks,
     component_geometry_masks,
     confusion_from_arrays,
+    common_translation_slices,
     image_origin_mixed_patch_mask,
     mean_iou_from_confusion,
     oracle_confusion,
     region_summary,
     semantic_boundary_mask,
 )
+from scripts.evaluate_whu_translation_consistency import translate_tensor
 
 
 class SpatialDiagnosticsTest(unittest.TestCase):
@@ -132,6 +136,50 @@ class SpatialDiagnosticsTest(unittest.TestCase):
         second = bootstrap_oracle_gain(baselines, regions, samples)
         self.assertEqual(first, second)
         self.assertEqual(first["replicates"], 3)
+
+    def test_common_translation_slices_use_one_shared_field_of_view(self):
+        original, shifted = common_translation_slices(
+            (100, 120), ((0, 1), (0, 8), (0, 16)), margin=10
+        )
+        self.assertEqual(original, (slice(10, 90), slice(10, 94)))
+        self.assertEqual(shifted[(0, 1)], (slice(10, 90), slice(11, 95)))
+        self.assertEqual(shifted[(0, 16)], (slice(10, 90), slice(26, 110)))
+
+    def test_translate_and_inverse_slices_recover_original_values(self):
+        source = torch.arange(1 * 1 * 8 * 10).reshape(1, 1, 8, 10)
+        translated = translate_tensor(source, dy=1, dx=2)
+        original_slice, shifted = common_translation_slices(
+            (8, 10), ((1, 2),), margin=1
+        )
+        np.testing.assert_array_equal(
+            source.numpy()[0, 0][original_slice],
+            translated.numpy()[0, 0][shifted[(1, 2)]],
+        )
+        self.assertTrue(
+            torch.equal(
+                translated[..., 0, :], torch.zeros_like(translated[..., 0, :])
+            )
+        )
+
+    def test_paired_miou_bootstrap_reports_candidate_minus_reference(self):
+        references = np.array(
+            [
+                [[8, 2], [1, 9]],
+                [[7, 3], [2, 8]],
+            ],
+            dtype=np.int64,
+        )
+        candidates = np.array(
+            [
+                [[9, 1], [1, 9]],
+                [[8, 2], [1, 9]],
+            ],
+            dtype=np.int64,
+        )
+        samples = np.array([[0, 0], [0, 1], [1, 1]], dtype=np.int64)
+        result = bootstrap_paired_miou_delta(references, candidates, samples)
+        self.assertGreater(result["median_pp"], 0.0)
+        self.assertGreater(result["ci95_pp"][0], 0.0)
 
 
 if __name__ == "__main__":

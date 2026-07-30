@@ -552,3 +552,84 @@ def bootstrap_oracle_gain(
         "median_pp": float(median),
         "ci95_pp": [float(lower), float(upper)],
     }
+
+
+def common_translation_slices(
+    shape: tuple[int, int],
+    shifts: Sequence[tuple[int, int]],
+    margin: int,
+) -> tuple[tuple[slice, slice], dict[tuple[int, int], tuple[slice, slice]]]:
+    """Return one original region and aligned shifted regions shared by all shifts.
+
+    A shift ``(dy, dx)`` means ``shifted[y + dy, x + dx] = original[y, x]``.
+    Both original and shifted coordinates stay at least ``margin`` pixels from
+    the image border.  Using one intersection region makes different shift
+    conditions directly paired rather than comparing slightly different FOVs.
+    """
+
+    if len(shape) != 2 or any(int(value) <= 0 for value in shape):
+        raise ValueError("shape must contain positive height and width")
+    if not shifts:
+        raise ValueError("at least one shift is required")
+    if margin < 0:
+        raise ValueError("margin cannot be negative")
+    height, width = (int(value) for value in shape)
+    normalized = tuple((int(dy), int(dx)) for dy, dx in shifts)
+
+    y_start = max([margin, *[margin - dy for dy, _ in normalized]])
+    y_end = min([height - margin, *[height - margin - dy for dy, _ in normalized]])
+    x_start = max([margin, *[margin - dx for _, dx in normalized]])
+    x_end = min([width - margin, *[width - margin - dx for _, dx in normalized]])
+    if y_start >= y_end or x_start >= x_end:
+        raise ValueError(
+            "translation intersection is empty; reduce shifts or valid margin"
+        )
+
+    original = (slice(y_start, y_end), slice(x_start, x_end))
+    shifted = {
+        (dy, dx): (
+            slice(y_start + dy, y_end + dy),
+            slice(x_start + dx, x_end + dx),
+        )
+        for dy, dx in normalized
+    }
+    return original, shifted
+
+
+def bootstrap_paired_miou_delta(
+    reference_confusions: np.ndarray,
+    candidate_confusions: np.ndarray,
+    sample_indices: np.ndarray,
+) -> dict[str, Any] | None:
+    """Image-cluster bootstrap for candidate-minus-reference mIoU."""
+
+    references = np.asarray(reference_confusions, dtype=np.int64)
+    candidates = np.asarray(candidate_confusions, dtype=np.int64)
+    samples = np.asarray(sample_indices, dtype=np.int64)
+    if references.ndim != 3 or references.shape != candidates.shape:
+        raise ValueError("confusion stacks must have matching [image, class, class] shape")
+    if samples.ndim != 2 or samples.shape[1] != references.shape[0]:
+        raise ValueError("sample_indices must be [replicate, image]")
+    if references.shape[0] < 2 or samples.shape[0] == 0:
+        return None
+
+    sampled_references = references[samples].sum(axis=1)
+    sampled_candidates = candidates[samples].sum(axis=1)
+
+    def batch_miou(confusions: np.ndarray) -> np.ndarray:
+        diagonal = np.diagonal(confusions, axis1=1, axis2=2)
+        union = confusions.sum(axis=2) + confusions.sum(axis=1) - diagonal
+        ious = np.full(union.shape, np.nan, dtype=np.float64)
+        np.divide(diagonal, union, out=ious, where=union > 0)
+        return np.nanmean(ious, axis=1)
+
+    deltas = (
+        batch_miou(sampled_candidates) - batch_miou(sampled_references)
+    ) * 100.0
+    lower, median, upper = np.percentile(deltas, [2.5, 50.0, 97.5])
+    return {
+        "unit": "test image",
+        "replicates": int(samples.shape[0]),
+        "median_pp": float(median),
+        "ci95_pp": [float(lower), float(upper)],
+    }
