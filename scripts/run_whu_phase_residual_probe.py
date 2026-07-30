@@ -732,14 +732,20 @@ def exact_full_slide_evaluation(
         live_prediction[0].numpy(), labels[0].numpy(), NUM_CLASSES
     )
     confusion_equal = np.array_equal(cached_confusion, live_confusion)
-    if not float16_roundtrip_equal or not prediction_equal or not confusion_equal:
-        raise RuntimeError(
-            "live normal-phase 512/341 E0 does not exactly reproduce the "
-            "float16 companion cache"
-        )
     difference = (base - cached_e0).abs()
+    centered_difference = base - cached_e0
+    centered_difference = centered_difference - centered_difference.mean(
+        dim=1, keepdim=True
+    )
+    rounded_mismatch = base.to(dtype=torch.float16).ne(
+        cached_e0.to(dtype=torch.float16)
+    )
     base_validation = {
         "float16_roundtrip_logits_equal": float16_roundtrip_equal,
+        "float16_roundtrip_mismatch_values": int(rounded_mismatch.sum().item()),
+        "float16_roundtrip_mismatch_fraction": float(
+            rounded_mismatch.to(dtype=torch.float32).mean().item()
+        ),
         "prediction_equal": prediction_equal,
         "confusion_equal": confusion_equal,
         "cached_prediction_sha256": tensor_sha256(cached_prediction),
@@ -748,7 +754,18 @@ def exact_full_slide_evaluation(
         "live_confusion": live_confusion.tolist(),
         "logit_max_abs_difference_from_float16_cache": float(difference.max()),
         "logit_mean_abs_difference_from_float16_cache": float(difference.mean()),
+        "centered_logit_max_abs_difference": float(centered_difference.abs().max()),
+        "centered_logit_mean_abs_difference": float(centered_difference.abs().mean()),
+        "centered_logit_rms_difference": float(
+            torch.sqrt(centered_difference.square().mean())
+        ),
     }
+    if not float16_roundtrip_equal or not prediction_equal or not confusion_equal:
+        raise RuntimeError(
+            "live normal-phase 512/341 E0 does not exactly reproduce the "
+            "float16 companion cache: "
+            + json.dumps(base_validation, ensure_ascii=False, sort_keys=True)
+        )
 
     behavior = phase_residual_behavior_statistics(
         cached_e0, teacher, corrected, labels
