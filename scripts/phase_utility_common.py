@@ -16,7 +16,7 @@ oracle score vector at runtime.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import math
 from typing import Any
@@ -980,6 +980,830 @@ def hierarchical_phase_cost(
         "q2": float(q2),
         "q4": float(q4),
         "forward_equivalent_cost": float(1.0 + q2 + 2.0 * q4),
+    }
+
+
+def _phase_confusion_stacks(
+    records: Sequence[dict[str, Any]],
+    num_classes: int,
+) -> dict[int, np.ndarray]:
+    stacks = {}
+    for level in PHASE_LEVELS:
+        level_name = f"k{level}"
+        matrices = []
+        for record in records:
+            matrix = np.asarray(record["confusion"][level_name])
+            if matrix.shape != (num_classes, num_classes):
+                raise ValueError("cell confusion shape does not match num_classes")
+            if not np.issubdtype(matrix.dtype, np.integer):
+                raise TypeError("cell confusions must contain integer counts")
+            if np.any(matrix < 0):
+                raise ValueError("cell confusions must be non-negative")
+            matrices.append(matrix.astype(np.int64, copy=False))
+        stacks[level] = np.stack(matrices, axis=0)
+
+    reference_rows = stacks[1].sum(axis=2)
+    for level in (2, 4):
+        if not np.array_equal(stacks[level].sum(axis=2), reference_rows):
+            raise ValueError(
+                "K1, K2, and K4 cell confusions must have identical target counts"
+            )
+    return stacks
+
+
+def _full_reference_confusion(
+    cell_k1: np.ndarray,
+    num_classes: int,
+    reference_confusion: np.ndarray | None,
+) -> np.ndarray:
+    common_k1 = cell_k1.sum(axis=0, dtype=np.int64)
+    if reference_confusion is None:
+        baseline = common_k1.copy()
+    else:
+        raw = np.asarray(reference_confusion)
+        if raw.shape != (num_classes, num_classes):
+            raise ValueError("reference_confusion shape does not match num_classes")
+        if not np.issubdtype(raw.dtype, np.integer):
+            raise TypeError("reference_confusion must contain integer counts")
+        if np.any(raw < 0):
+            raise ValueError("reference_confusion must be non-negative")
+        baseline = raw.astype(np.int64, copy=True)
+        if np.any(baseline < common_k1):
+            raise ValueError(
+                "reference_confusion must contain all cell K1 confusion"
+            )
+    if not np.isfinite(mean_iou_from_confusion(baseline)):
+        raise ValueError("reference confusion must support at least one class")
+    return baseline
+
+
+def _batch_miou_after_deltas(
+    confusion: np.ndarray,
+    deltas: np.ndarray,
+) -> np.ndarray:
+    """Vectorized mIoU for several candidate confusion-matrix deltas."""
+
+    candidates = confusion[None, :, :] + deltas
+    if np.any(candidates < 0):
+        raise ValueError("a cell action would produce a negative confusion count")
+    diagonal = np.diagonal(candidates, axis1=1, axis2=2)
+    union = candidates.sum(axis=2) + candidates.sum(axis=1) - diagonal
+    supported = union > 0
+    support_count = supported.sum(axis=1)
+    if np.any(support_count == 0):
+        raise ValueError("a candidate confusion has no supported classes")
+    ious = np.zeros(diagonal.shape, dtype=np.float64)
+    np.divide(diagonal, union, out=ious, where=supported)
+    return ious.sum(axis=1) / support_count
+
+
+def _validated_extra_cost_budgets(
+    budgets: Iterable[int],
+    *,
+    total_cells: int,
+) -> tuple[int, ...]:
+    try:
+        values = tuple(budgets)
+    except TypeError as error:
+        raise TypeError("extra_cost_budgets must be an iterable of integers") from error
+    if not values:
+        raise ValueError("extra_cost_budgets must not be empty")
+    result = []
+    maximum = 3 * total_cells
+    for index, value in enumerate(values):
+        budget = _require_nonnegative_int(value, name=f"extra_cost_budgets[{index}]")
+        if budget > maximum:
+            raise ValueError(
+                f"extra cost budget must not exceed full K4 cost {maximum}"
+            )
+        result.append(budget)
+    return tuple(result)
+
+
+def _levels_after_actions(
+    total_cells: int,
+    actions: Sequence[dict[str, Any]],
+    action_count: int,
+) -> np.ndarray:
+    levels = np.ones(total_cells, dtype=np.int64)
+    for action in actions[:action_count]:
+        cell_index = int(action["cell_index"])
+        from_level = int(action["from_level"])
+        to_level = int(action["to_level"])
+        if levels[cell_index] != from_level:
+            raise AssertionError("hierarchical action trace violates precedence")
+        levels[cell_index] = to_level
+    return levels
+
+
+def _hierarchical_snapshot(
+    records: Sequence[dict[str, Any]],
+    levels: np.ndarray,
+    *,
+    num_classes: int,
+    reference_confusion: np.ndarray,
+    common_k1_confusion: np.ndarray,
+    requested_budget: int,
+    actual_cost: int,
+    chosen_action_count: int,
+    explored_cost: int,
+    explored_action_count: int,
+) -> dict[str, Any]:
+    common = aggregate_cell_assignment(records, levels, num_classes=num_classes)
+    full_confusion = (
+        reference_confusion
+        + np.asarray(common["confusion"], dtype=np.int64)
+        - common_k1_confusion
+    )
+    if np.any(full_confusion < 0):
+        raise AssertionError("hierarchical assignment produced negative confusion")
+    counts = {
+        "k1": int(np.count_nonzero(levels == 1)),
+        "k2": int(np.count_nonzero(levels == 2)),
+        "k4": int(np.count_nonzero(levels == 4)),
+    }
+    cost = hierarchical_phase_cost(
+        counts["k2"] + counts["k4"], counts["k4"], len(records)
+    )
+    implied_extra_cost = counts["k2"] + 3 * counts["k4"]
+    if implied_extra_cost != actual_cost:
+        raise AssertionError("hierarchical level counts disagree with action cost")
+    return {
+        "requested_extra_proxy_cost": requested_budget,
+        "actual_extra_proxy_cost": actual_cost,
+        "chosen_action_count": chosen_action_count,
+        "explored_through_budget_cost": explored_cost,
+        "explored_through_budget_action_count": explored_action_count,
+        "levels_by_cell": levels,
+        "selected_counts": counts,
+        "cost": cost,
+        "aggregate": {
+            "full_confusion": full_confusion,
+            "full_miou": mean_iou_from_confusion(full_confusion),
+            "common_support": common,
+        },
+    }
+
+
+def _run_hierarchical_budget(
+    stacks: Mapping[int, np.ndarray],
+    baseline: np.ndarray,
+    *,
+    budget: int,
+) -> tuple[tuple[dict[str, Any], ...], np.ndarray, int]:
+    """Run one budget-aware positive-marginal hierarchical greedy search."""
+
+    total_cells, num_classes = stacks[1].shape[:2]
+    levels = np.ones(total_cells, dtype=np.int64)
+    current_confusion = baseline.copy()
+    current_miou = mean_iou_from_confusion(current_confusion)
+    used_cost = 0
+    actions: list[dict[str, Any]] = []
+    while True:
+        eligible = np.flatnonzero(levels < 4).astype(np.int64, copy=False)
+        if eligible.size == 0:
+            break
+        from_levels = levels[eligible]
+        to_levels = np.where(from_levels == 1, 2, 4)
+        incremental_costs = np.where(from_levels == 1, 1, 2).astype(
+            np.int64, copy=False
+        )
+        fits_budget = used_cost + incremental_costs <= budget
+        if not np.any(fits_budget):
+            break
+        eligible = eligible[fits_budget]
+        from_levels = from_levels[fits_budget]
+        to_levels = to_levels[fits_budget]
+        incremental_costs = incremental_costs[fits_budget]
+        deltas = np.empty(
+            (len(eligible), num_classes, num_classes), dtype=np.int64
+        )
+        from_k1 = from_levels == 1
+        deltas[from_k1] = stacks[2][eligible[from_k1]] - stacks[1][
+            eligible[from_k1]
+        ]
+        deltas[~from_k1] = stacks[4][eligible[~from_k1]] - stacks[2][
+            eligible[~from_k1]
+        ]
+        candidate_mious = _batch_miou_after_deltas(current_confusion, deltas)
+        gains = candidate_mious - current_miou
+        positive = gains > 0.0
+        if not np.any(positive):
+            break
+        eligible = eligible[positive]
+        from_levels = from_levels[positive]
+        to_levels = to_levels[positive]
+        incremental_costs = incremental_costs[positive]
+        deltas = deltas[positive]
+        candidate_mious = candidate_mious[positive]
+        gains = gains[positive]
+        ratios = gains / incremental_costs
+        order = np.lexsort((eligible, -ratios))
+        position = int(order[0])
+        cell_index = int(eligible[position])
+        from_level = int(from_levels[position])
+        to_level = int(to_levels[position])
+        incremental_cost = int(incremental_costs[position])
+        next_miou = float(candidate_mious[position])
+        used_cost += incremental_cost
+        actions.append(
+            {
+                "step": len(actions) + 1,
+                "cell_index": cell_index,
+                "from_level": from_level,
+                "to_level": to_level,
+                "incremental_extra_proxy_cost": incremental_cost,
+                "cumulative_extra_proxy_cost": used_cost,
+                "full_miou_before": float(current_miou),
+                "full_miou_after": next_miou,
+                "full_miou_gain": float(next_miou - current_miou),
+                "full_miou_gain_per_cost": float(
+                    (next_miou - current_miou) / incremental_cost
+                ),
+            }
+        )
+        levels[cell_index] = to_level
+        current_confusion += deltas[position]
+        current_miou = next_miou
+    return tuple(actions), levels, used_cost
+
+
+def hierarchical_greedy_oracle(
+    cell_stats: Sequence[dict[str, Any]],
+    extra_cost_budgets: Iterable[int],
+    *,
+    num_classes: int,
+    reference_confusion: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic dynamic K1 -> K2 -> K4 greedy path.
+
+    Every K1 -> K2 action costs one extra phase unit, and every subsequent
+    K2 -> K4 action costs two, giving cumulative per-cell costs 0/1/3.  At
+    each step, all precedence-eligible actions are rescored against the
+    *current full-image confusion*.  The action with largest current global
+    mIoU gain per new cost is selected; an exact tie goes to the lower cell
+    index.  Exploration stops as soon as no eligible action has a strictly
+    positive full-image mIoU marginal; negative K1 -> K2 bridges are not
+    crossed.
+
+    Each requested budget is run independently.  At every step, actions that
+    do not fit the remaining budget are filtered *before* ranking, preventing
+    an unaffordable K2 -> K4 action from blocking a beneficial K1 -> K2 action.
+    Since every accepted marginal is positive, the returned endpoint is also
+    the best prefix reached under that budget and need not spend it fully.
+    """
+
+    records = _validated_cell_records(cell_stats)
+    num_classes = _require_positive_int(num_classes, name="num_classes")
+    budgets = _validated_extra_cost_budgets(
+        extra_cost_budgets, total_cells=len(records)
+    )
+    stacks = _phase_confusion_stacks(records, num_classes)
+    baseline = _full_reference_confusion(
+        stacks[1], num_classes, reference_confusion
+    )
+    common_k1 = stacks[1].sum(axis=0, dtype=np.int64)
+
+    snapshots = []
+    for budget in budgets:
+        actions, levels, used_cost = _run_hierarchical_budget(
+            stacks, baseline, budget=budget
+        )
+        snapshot = _hierarchical_snapshot(
+            records,
+            levels,
+            num_classes=num_classes,
+            reference_confusion=baseline,
+            common_k1_confusion=common_k1,
+            requested_budget=budget,
+            actual_cost=used_cost,
+            chosen_action_count=len(actions),
+            explored_cost=used_cost,
+            explored_action_count=len(actions),
+        )
+        snapshot["actions"] = actions
+        snapshots.append(snapshot)
+
+    maximum_budget_index = max(
+        range(len(budgets)), key=lambda index: (budgets[index], -index)
+    )
+    maximum_snapshot = snapshots[maximum_budget_index]
+    return {
+        "actions": maximum_snapshot["actions"],
+        "actions_by_budget": tuple(
+            snapshot["actions"] for snapshot in snapshots
+        ),
+        "snapshots": tuple(snapshots),
+        "path_endpoint": maximum_snapshot,
+    }
+
+
+def _binary_snapshot(
+    records: Sequence[dict[str, Any]],
+    levels: np.ndarray,
+    *,
+    num_classes: int,
+    reference_confusion: np.ndarray,
+    common_k1_confusion: np.ndarray,
+    requested_budget: int,
+    actual_cost: int,
+    chosen_action_count: int,
+    explored_cost: int,
+    explored_action_count: int,
+) -> dict[str, Any]:
+    if np.any(~np.isin(levels, (1, 4))):
+        raise ValueError("binary oracle levels must be K1 or K4")
+    common = aggregate_cell_assignment(records, levels, num_classes=num_classes)
+    full_confusion = (
+        reference_confusion
+        + np.asarray(common["confusion"], dtype=np.int64)
+        - common_k1_confusion
+    )
+    selected_count = int(np.count_nonzero(levels == 4))
+    if 3 * selected_count != actual_cost:
+        raise AssertionError("binary level counts disagree with action cost")
+    return {
+        "requested_extra_proxy_cost": requested_budget,
+        "actual_extra_proxy_cost": actual_cost,
+        "chosen_action_count": chosen_action_count,
+        "explored_through_budget_cost": explored_cost,
+        "explored_through_budget_action_count": explored_action_count,
+        "levels_by_cell": levels,
+        "selected_counts": {
+            "k1": len(records) - selected_count,
+            "k4": selected_count,
+        },
+        "cost": binary_phase_cost(selected_count, len(records)),
+        "aggregate": {
+            "full_confusion": full_confusion,
+            "full_miou": mean_iou_from_confusion(full_confusion),
+            "common_support": common,
+        },
+    }
+
+
+def binary_greedy_oracle(
+    cell_stats: Sequence[dict[str, Any]],
+    extra_cost_budgets: Iterable[int],
+    *,
+    num_classes: int,
+    reference_confusion: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Build a dynamic positive-marginal K1 -> K4 greedy oracle path.
+
+    Each selected cell costs three extra phase units.  Candidate gains are
+    recomputed from the current full-image confusion after every action.
+    Selection stops when no remaining cell has a strictly positive global
+    mIoU marginal.  Each budget snapshot is the best path prefix within that
+    budget and is never forced to spend unused compute.
+    """
+
+    records = _validated_cell_records(cell_stats)
+    num_classes = _require_positive_int(num_classes, name="num_classes")
+    budgets = _validated_extra_cost_budgets(
+        extra_cost_budgets, total_cells=len(records)
+    )
+    stacks = _phase_confusion_stacks(records, num_classes)
+    baseline = _full_reference_confusion(
+        stacks[1], num_classes, reference_confusion
+    )
+    common_k1 = stacks[1].sum(axis=0, dtype=np.int64)
+    deltas = stacks[4] - stacks[1]
+
+    selected = np.zeros(len(records), dtype=bool)
+    current_confusion = baseline.copy()
+    current_miou = mean_iou_from_confusion(current_confusion)
+    actions: list[dict[str, Any]] = []
+    cumulative_costs = [0]
+    path_mious = [current_miou]
+    while np.any(~selected):
+        eligible = np.flatnonzero(~selected).astype(np.int64, copy=False)
+        candidate_mious = _batch_miou_after_deltas(
+            current_confusion, deltas[eligible]
+        )
+        gains = candidate_mious - current_miou
+        positive = gains > 0.0
+        if not np.any(positive):
+            break
+        eligible = eligible[positive]
+        candidate_mious = candidate_mious[positive]
+        gains = gains[positive]
+        gain_per_cost = gains / 3.0
+        order = np.lexsort((eligible, -gain_per_cost))
+        chosen_position = int(order[0])
+        cell_index = int(eligible[chosen_position])
+        next_miou = float(candidate_mious[chosen_position])
+        next_confusion = current_confusion + deltas[cell_index]
+        cumulative_cost = cumulative_costs[-1] + 3
+        actions.append(
+            {
+                "step": len(actions) + 1,
+                "cell_index": cell_index,
+                "from_level": 1,
+                "to_level": 4,
+                "incremental_extra_proxy_cost": 3,
+                "cumulative_extra_proxy_cost": cumulative_cost,
+                "full_miou_before": float(current_miou),
+                "full_miou_after": next_miou,
+                "full_miou_gain": float(next_miou - current_miou),
+                "full_miou_gain_per_cost": float(
+                    (next_miou - current_miou) / 3.0
+                ),
+            }
+        )
+        selected[cell_index] = True
+        current_confusion = next_confusion
+        current_miou = next_miou
+        cumulative_costs.append(cumulative_cost)
+        path_mious.append(current_miou)
+
+    cumulative_cost_array = np.asarray(cumulative_costs, dtype=np.int64)
+    path_miou_array = np.asarray(path_mious, dtype=np.float64)
+    snapshots = []
+    for budget in budgets:
+        explored_action_count = int(
+            np.searchsorted(cumulative_cost_array, budget, side="right") - 1
+        )
+        chosen_action_count = int(
+            np.argmax(path_miou_array[: explored_action_count + 1])
+        )
+        levels = _levels_after_actions(
+            len(records), actions, chosen_action_count
+        )
+        snapshots.append(
+            _binary_snapshot(
+                records,
+                levels,
+                num_classes=num_classes,
+                reference_confusion=baseline,
+                common_k1_confusion=common_k1,
+                requested_budget=budget,
+                actual_cost=int(cumulative_cost_array[chosen_action_count]),
+                chosen_action_count=chosen_action_count,
+                explored_cost=int(cumulative_cost_array[explored_action_count]),
+                explored_action_count=explored_action_count,
+            )
+        )
+
+    endpoint_levels = _levels_after_actions(len(records), actions, len(actions))
+    endpoint_cost = int(cumulative_cost_array[-1])
+    endpoint = _binary_snapshot(
+        records,
+        endpoint_levels,
+        num_classes=num_classes,
+        reference_confusion=baseline,
+        common_k1_confusion=common_k1,
+        requested_budget=3 * len(records),
+        actual_cost=endpoint_cost,
+        chosen_action_count=len(actions),
+        explored_cost=endpoint_cost,
+        explored_action_count=len(actions),
+    )
+    return {
+        "actions": tuple(actions),
+        "snapshots": tuple(snapshots),
+        "path_endpoint": endpoint,
+    }
+
+
+def _validated_group_context(
+    records: Sequence[dict[str, Any]],
+    stacks: Mapping[int, np.ndarray],
+    group_ids: Sequence[Hashable],
+    extra_cost_budget_by_group: Mapping[Hashable, int],
+    reference_confusion_by_group: Mapping[Hashable, np.ndarray] | None,
+    *,
+    num_classes: int,
+) -> tuple[
+    tuple[Hashable, ...], np.ndarray, np.ndarray, np.ndarray
+]:
+    identifiers = tuple(group_ids)
+    if len(identifiers) != len(records):
+        raise ValueError("group_ids length must match cell_stats")
+    for identifier in identifiers:
+        if not isinstance(identifier, Hashable):
+            raise TypeError("every group id must be hashable")
+    if not isinstance(extra_cost_budget_by_group, Mapping):
+        raise TypeError("extra_cost_budget_by_group must be a mapping")
+    if reference_confusion_by_group is not None and not isinstance(
+        reference_confusion_by_group, Mapping
+    ):
+        raise TypeError("reference_confusion_by_group must be a mapping")
+
+    group_order = tuple(dict.fromkeys(identifiers))
+    missing_budgets = [
+        identifier
+        for identifier in group_order
+        if identifier not in extra_cost_budget_by_group
+    ]
+    if missing_budgets:
+        raise ValueError(f"missing group budgets: {missing_budgets}")
+    if reference_confusion_by_group is not None:
+        missing_references = [
+            identifier
+            for identifier in group_order
+            if identifier not in reference_confusion_by_group
+        ]
+        if missing_references:
+            raise ValueError(f"missing group reference confusions: {missing_references}")
+
+    group_lookup = {
+        identifier: index for index, identifier in enumerate(group_order)
+    }
+    group_codes = np.asarray(
+        [group_lookup[identifier] for identifier in identifiers], dtype=np.int64
+    )
+    group_counts = np.bincount(group_codes, minlength=len(group_order))
+    caps = np.empty(len(group_order), dtype=np.int64)
+    baseline = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for group_index, identifier in enumerate(group_order):
+        caps[group_index] = _require_nonnegative_int(
+            extra_cost_budget_by_group[identifier],
+            name=f"extra cost budget for group {identifier!r}",
+        )
+        if caps[group_index] > 3 * int(group_counts[group_index]):
+            raise ValueError(
+                f"group {identifier!r} budget exceeds its full K4 cost"
+            )
+        group_cells = group_codes == group_index
+        reference = (
+            None
+            if reference_confusion_by_group is None
+            else reference_confusion_by_group[identifier]
+        )
+        baseline += _full_reference_confusion(
+            stacks[1][group_cells], num_classes, reference
+        )
+    return group_order, group_codes, caps, baseline
+
+
+def _group_usage_records(
+    group_order: Sequence[Hashable],
+    group_codes: np.ndarray,
+    caps: np.ndarray,
+    levels: np.ndarray,
+) -> tuple[dict[str, Any], ...]:
+    result = []
+    for group_index, identifier in enumerate(group_order):
+        group_levels = levels[group_codes == group_index]
+        counts = {
+            "k1": int(np.count_nonzero(group_levels == 1)),
+            "k2": int(np.count_nonzero(group_levels == 2)),
+            "k4": int(np.count_nonzero(group_levels == 4)),
+        }
+        used = counts["k2"] + 3 * counts["k4"]
+        result.append(
+            {
+                "group_id": identifier,
+                "cell_count": int(group_levels.size),
+                "budget": int(caps[group_index]),
+                "used_extra_proxy_cost": used,
+                "selected_counts": counts,
+            }
+        )
+    return tuple(result)
+
+
+def hierarchical_group_budget_oracle(
+    cell_stats: Sequence[dict[str, Any]],
+    group_ids: Sequence[Hashable],
+    extra_cost_budget_by_group: Mapping[Hashable, int],
+    *,
+    num_classes: int,
+    reference_confusion_by_group: Mapping[Hashable, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Optimize global mIoU under independent per-group hierarchical caps."""
+
+    records = _validated_cell_records(cell_stats)
+    num_classes = _require_positive_int(num_classes, name="num_classes")
+    stacks = _phase_confusion_stacks(records, num_classes)
+    group_order, group_codes, caps, baseline = _validated_group_context(
+        records,
+        stacks,
+        group_ids,
+        extra_cost_budget_by_group,
+        reference_confusion_by_group,
+        num_classes=num_classes,
+    )
+    common_k1 = stacks[1].sum(axis=0, dtype=np.int64)
+    levels = np.ones(len(records), dtype=np.int64)
+    group_used = np.zeros(len(group_order), dtype=np.int64)
+    current_confusion = baseline.copy()
+    current_miou = mean_iou_from_confusion(current_confusion)
+    actions = []
+    while True:
+        eligible = np.flatnonzero(levels < 4).astype(np.int64, copy=False)
+        if eligible.size == 0:
+            break
+        from_levels = levels[eligible]
+        to_levels = np.where(from_levels == 1, 2, 4)
+        costs = np.where(from_levels == 1, 1, 2).astype(np.int64, copy=False)
+        codes = group_codes[eligible]
+        within_cap = group_used[codes] + costs <= caps[codes]
+        if not np.any(within_cap):
+            break
+        eligible = eligible[within_cap]
+        from_levels = from_levels[within_cap]
+        to_levels = to_levels[within_cap]
+        costs = costs[within_cap]
+        codes = codes[within_cap]
+        deltas = np.empty(
+            (len(eligible), num_classes, num_classes), dtype=np.int64
+        )
+        from_k1 = from_levels == 1
+        deltas[from_k1] = stacks[2][eligible[from_k1]] - stacks[1][
+            eligible[from_k1]
+        ]
+        deltas[~from_k1] = stacks[4][eligible[~from_k1]] - stacks[2][
+            eligible[~from_k1]
+        ]
+        candidate_mious = _batch_miou_after_deltas(current_confusion, deltas)
+        gains = candidate_mious - current_miou
+        positive = gains > 0.0
+        if not np.any(positive):
+            break
+        eligible = eligible[positive]
+        from_levels = from_levels[positive]
+        to_levels = to_levels[positive]
+        costs = costs[positive]
+        codes = codes[positive]
+        deltas = deltas[positive]
+        candidate_mious = candidate_mious[positive]
+        gains = gains[positive]
+        ratios = gains / costs
+        order = np.lexsort((eligible, -ratios))
+        position = int(order[0])
+        cell_index = int(eligible[position])
+        group_index = int(codes[position])
+        cost = int(costs[position])
+        next_miou = float(candidate_mious[position])
+        actions.append(
+            {
+                "step": len(actions) + 1,
+                "cell_index": cell_index,
+                "group_id": group_order[group_index],
+                "from_level": int(from_levels[position]),
+                "to_level": int(to_levels[position]),
+                "incremental_extra_proxy_cost": cost,
+                "cumulative_extra_proxy_cost": int(group_used.sum()) + cost,
+                "group_cumulative_extra_proxy_cost": int(
+                    group_used[group_index]
+                )
+                + cost,
+                "full_miou_before": float(current_miou),
+                "full_miou_after": next_miou,
+                "full_miou_gain": float(next_miou - current_miou),
+                "full_miou_gain_per_cost": float(
+                    (next_miou - current_miou) / cost
+                ),
+            }
+        )
+        levels[cell_index] = int(to_levels[position])
+        group_used[group_index] += cost
+        current_confusion += deltas[position]
+        current_miou = next_miou
+
+    snapshot = _hierarchical_snapshot(
+        records,
+        levels,
+        num_classes=num_classes,
+        reference_confusion=baseline,
+        common_k1_confusion=common_k1,
+        requested_budget=int(caps.sum()),
+        actual_cost=int(group_used.sum()),
+        chosen_action_count=len(actions),
+        explored_cost=int(group_used.sum()),
+        explored_action_count=len(actions),
+    )
+    group_usage = _group_usage_records(
+        group_order, group_codes, caps, levels
+    )
+    if any(
+        group["used_extra_proxy_cost"] > group["budget"]
+        for group in group_usage
+    ):
+        raise AssertionError("a group exceeded its independent cost cap")
+    return {
+        "actions": tuple(actions),
+        "snapshot": snapshot,
+        "groups": group_usage,
+        "levels_by_cell": snapshot["levels_by_cell"],
+        "selected_counts": snapshot["selected_counts"],
+        "actual_extra_proxy_cost": snapshot["actual_extra_proxy_cost"],
+        "cost": snapshot["cost"],
+        "aggregate": snapshot["aggregate"],
+    }
+
+
+def binary_group_budget_oracle(
+    cell_stats: Sequence[dict[str, Any]],
+    group_ids: Sequence[Hashable],
+    extra_cost_budget_by_group: Mapping[Hashable, int],
+    *,
+    num_classes: int,
+    reference_confusion_by_group: Mapping[Hashable, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Optimize global binary K1/K4 mIoU under independent group caps."""
+
+    records = _validated_cell_records(cell_stats)
+    num_classes = _require_positive_int(num_classes, name="num_classes")
+    stacks = _phase_confusion_stacks(records, num_classes)
+    group_order, group_codes, caps, baseline = _validated_group_context(
+        records,
+        stacks,
+        group_ids,
+        extra_cost_budget_by_group,
+        reference_confusion_by_group,
+        num_classes=num_classes,
+    )
+    common_k1 = stacks[1].sum(axis=0, dtype=np.int64)
+    deltas = stacks[4] - stacks[1]
+    levels = np.ones(len(records), dtype=np.int64)
+    group_used = np.zeros(len(group_order), dtype=np.int64)
+    current_confusion = baseline.copy()
+    current_miou = mean_iou_from_confusion(current_confusion)
+    actions = []
+    while True:
+        eligible = np.flatnonzero(levels == 1).astype(np.int64, copy=False)
+        if eligible.size == 0:
+            break
+        codes = group_codes[eligible]
+        within_cap = group_used[codes] + 3 <= caps[codes]
+        if not np.any(within_cap):
+            break
+        eligible = eligible[within_cap]
+        codes = codes[within_cap]
+        candidate_mious = _batch_miou_after_deltas(
+            current_confusion, deltas[eligible]
+        )
+        gains = candidate_mious - current_miou
+        positive = gains > 0.0
+        if not np.any(positive):
+            break
+        eligible = eligible[positive]
+        codes = codes[positive]
+        candidate_mious = candidate_mious[positive]
+        gains = gains[positive]
+        order = np.lexsort((eligible, -(gains / 3.0)))
+        position = int(order[0])
+        cell_index = int(eligible[position])
+        group_index = int(codes[position])
+        next_miou = float(candidate_mious[position])
+        actions.append(
+            {
+                "step": len(actions) + 1,
+                "cell_index": cell_index,
+                "group_id": group_order[group_index],
+                "from_level": 1,
+                "to_level": 4,
+                "incremental_extra_proxy_cost": 3,
+                "cumulative_extra_proxy_cost": int(group_used.sum()) + 3,
+                "group_cumulative_extra_proxy_cost": int(
+                    group_used[group_index]
+                )
+                + 3,
+                "full_miou_before": float(current_miou),
+                "full_miou_after": next_miou,
+                "full_miou_gain": float(next_miou - current_miou),
+                "full_miou_gain_per_cost": float(
+                    (next_miou - current_miou) / 3.0
+                ),
+            }
+        )
+        levels[cell_index] = 4
+        group_used[group_index] += 3
+        current_confusion += deltas[cell_index]
+        current_miou = next_miou
+
+    snapshot = _binary_snapshot(
+        records,
+        levels,
+        num_classes=num_classes,
+        reference_confusion=baseline,
+        common_k1_confusion=common_k1,
+        requested_budget=int(caps.sum()),
+        actual_cost=int(group_used.sum()),
+        chosen_action_count=len(actions),
+        explored_cost=int(group_used.sum()),
+        explored_action_count=len(actions),
+    )
+    group_usage = _group_usage_records(
+        group_order, group_codes, caps, levels
+    )
+    if any(
+        group["used_extra_proxy_cost"] > group["budget"]
+        for group in group_usage
+    ):
+        raise AssertionError("a group exceeded its independent cost cap")
+    return {
+        "actions": tuple(actions),
+        "snapshot": snapshot,
+        "groups": group_usage,
+        "levels_by_cell": snapshot["levels_by_cell"],
+        "selected_counts": snapshot["selected_counts"],
+        "actual_extra_proxy_cost": snapshot["actual_extra_proxy_cost"],
+        "cost": snapshot["cost"],
+        "aggregate": snapshot["aggregate"],
     }
 
 

@@ -2,12 +2,15 @@
 
 This is a zero-training, post-aggregation spatial audit.  It computes the
 sealed normal view and the three non-zero 8 px phase views, reconstructs K1,
-matched-K2, legacy-K2, and K4, and asks whether the K4 gain is concentrated in
-a small number of mutually exclusive sliding-window ownership cells.
+fixed x-K2, descriptive y-K2, legacy-K2, and K4, and asks whether the dense
+phase gain is concentrated in mutually exclusive sliding-window ownership
+cells.  Two fixed hypotheses are tested: binary K1/K4 routing (A1), and a
+nested K1 -> x-K2 -> K4 route (A2).  Both must survive global-pooled and
+per-image-capped proxy budgets before Stage B is authorized.
 
-The reported ``1 + 3q`` cost is deliberately labelled a proxy.  This runner
-does not claim to execute sparse phase crops; an exact routed-window runner is
-only warranted if the fixed Stage-A gate passes.
+All costs in this file are deliberately labelled post-aggregation proxies.
+This runner does not claim to execute sparse phase crops; an exact
+routed-window simulator is only warranted if the fixed Stage-A gate passes.
 """
 
 from __future__ import annotations
@@ -60,6 +63,8 @@ from scripts.evaluate_whu_translation_consistency import (  # noqa: E402
 from scripts.phase_utility_common import (  # noqa: E402
     CellScoreVector,
     aggregate_cell_assignment,
+    binary_greedy_oracle,
+    binary_group_budget_oracle,
     binary_phase_cost,
     build_cell_ownership_bounds,
     cell_phase_statistics,
@@ -67,6 +72,9 @@ from scripts.phase_utility_common import (  # noqa: E402
     deterministic_random_indices,
     deterministic_top_q_indices,
     evaluate_phase_utility_gate,
+    hierarchical_greedy_oracle,
+    hierarchical_group_budget_oracle,
+    hierarchical_phase_cost,
     oracle_cell_miou_gain_scores,
     oracle_net_correct_scores,
     validate_cell_partition,
@@ -90,9 +98,10 @@ from utils.inference import slide_inference  # noqa: E402
 
 
 NUM_CLASSES = 7
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ARTIFACT_TYPE = "whu_phase_utility_stage_a"
 Q_VALUES = (0.0, 0.10, 0.20, 1.0 / 3.0, 0.50, 1.0)
+# Retained only for the legacy fixed-ranking regression helper below.
 DECISION_Q = 1.0 / 3.0
 RANDOM_REPLICATES = 1000
 RANDOM_SEED = 20260730
@@ -344,11 +353,102 @@ def restrict_score_to_geometry(
     return CellScoreVector(score.name, values, score.uses_ground_truth)
 
 
+def grouped_top_q_indices(
+    score: CellScoreVector,
+    q: float,
+    group_ids: np.ndarray | Sequence[int],
+    *,
+    deployment: bool,
+) -> np.ndarray:
+    """Apply the same fractional budget independently inside every image."""
+
+    groups = np.asarray(group_ids)
+    if groups.shape != score.values.shape or not np.issubdtype(
+        groups.dtype, np.integer
+    ):
+        raise TypeError("group_ids must be an integer vector matching the score")
+    selected_parts = []
+    for group in np.unique(groups):
+        indices = np.flatnonzero(groups == group).astype(np.int64, copy=False)
+        local_score = CellScoreVector(
+            score.name,
+            score.values[indices],
+            score.uses_ground_truth,
+        )
+        local_selected = deterministic_top_q_indices(
+            local_score, q, deployment=deployment
+        )
+        selected_parts.append(indices[local_selected])
+    if not selected_parts:
+        return np.empty(0, dtype=np.int64)
+    return np.sort(np.concatenate(selected_parts).astype(np.int64, copy=False))
+
+
+def grouped_singleton_miou_scores(
+    cell_stats: Sequence[dict[str, Any]],
+    group_ids: np.ndarray | Sequence[int],
+    reference_confusion_by_group: Mapping[int, np.ndarray],
+) -> CellScoreVector:
+    """Compute singleton mIoU scores against each image's full K1 confusion."""
+
+    groups = np.asarray(group_ids)
+    if groups.shape != (len(cell_stats),) or not np.issubdtype(
+        groups.dtype, np.integer
+    ):
+        raise TypeError("group_ids must be an integer vector matching cell_stats")
+    values = np.empty(len(cell_stats), dtype=np.float64)
+    for group in np.unique(groups):
+        group_value = int(group)
+        if group_value not in reference_confusion_by_group:
+            raise ValueError(f"missing reference confusion for group {group_value}")
+        indices = np.flatnonzero(groups == group).astype(np.int64, copy=False)
+        local_records = []
+        for local_index, global_index in enumerate(indices):
+            record = dict(cell_stats[int(global_index)])
+            record["cell_index"] = local_index
+            local_records.append(record)
+        local_score = oracle_cell_miou_gain_scores(
+            local_records,
+            num_classes=NUM_CLASSES,
+            reference_confusion=reference_confusion_by_group[group_value],
+        )
+        values[indices] = local_score.values
+    return CellScoreVector(
+        "oracle_k1_to_k4_singleton_per_image_miou_gain",
+        values,
+        True,
+    )
+
+
+def evaluate_grouped_score_curve(
+    cell_stats: Sequence[dict[str, Any]],
+    score: CellScoreVector,
+    group_ids: np.ndarray | Sequence[int],
+    outside_common_confusion: np.ndarray,
+    class_names: Sequence[str],
+    *,
+    deployment: bool,
+) -> list[dict[str, Any]]:
+    points = []
+    for q in Q_VALUES:
+        selected = grouped_top_q_indices(
+            score, q, group_ids, deployment=deployment
+        )
+        point = evaluate_binary_point(
+            cell_stats, selected, outside_common_confusion, class_names
+        )
+        point["requested_q"] = q
+        point["budget_scope"] = "per-image"
+        points.append(point)
+    return points
+
+
 def random_control_curve(
     cell_stats: Sequence[dict[str, Any]],
     full_k1_confusion: np.ndarray,
     *,
     eligible_mask: np.ndarray | Sequence[bool] | None,
+    group_ids: np.ndarray | Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return fixed-seed equal-count random mIoU distributions."""
 
@@ -361,17 +461,50 @@ def random_control_curve(
         ]
     )
     result = []
+    groups = None if group_ids is None else np.asarray(group_ids)
+    if groups is not None and (
+        groups.shape != (len(cell_stats),)
+        or not np.issubdtype(groups.dtype, np.integer)
+    ):
+        raise TypeError("group_ids must be an integer vector matching cell_stats")
+    eligible_array = (
+        None if eligible_mask is None else np.asarray(eligible_mask, dtype=bool)
+    )
     for q in Q_VALUES:
         values = np.empty(RANDOM_REPLICATES, dtype=np.float64)
         selected_count = None
         for replicate in range(RANDOM_REPLICATES):
-            selected = deterministic_random_indices(
-                len(cell_stats),
-                q,
-                seed=RANDOM_SEED,
-                replicate=replicate,
-                eligible_mask=eligible_mask,
-            )
+            if groups is None:
+                selected = deterministic_random_indices(
+                    len(cell_stats),
+                    q,
+                    seed=RANDOM_SEED,
+                    replicate=replicate,
+                    eligible_mask=eligible_array,
+                )
+            else:
+                selected_parts = []
+                unique_groups = np.unique(groups)
+                for group_position, group in enumerate(unique_groups):
+                    indices = np.flatnonzero(groups == group).astype(
+                        np.int64, copy=False
+                    )
+                    local_eligible = (
+                        None
+                        if eligible_array is None
+                        else eligible_array[indices]
+                    )
+                    local = deterministic_random_indices(
+                        len(indices),
+                        q,
+                        seed=RANDOM_SEED,
+                        replicate=replicate * len(unique_groups) + group_position,
+                        eligible_mask=local_eligible,
+                    )
+                    selected_parts.append(indices[local])
+                selected = np.sort(
+                    np.concatenate(selected_parts).astype(np.int64, copy=False)
+                )
             selected_count = len(selected)
             confusion = k1 + (
                 deltas[selected].sum(axis=0) if len(selected) else 0
@@ -391,6 +524,7 @@ def random_control_curve(
                     if eligible_mask is not None
                     else "all real cells"
                 ),
+                "budget_scope": "global" if groups is None else "per-image",
                 "geometry_eligible_cells": (
                     int(np.count_nonzero(eligible_mask))
                     if eligible_mask is not None
@@ -408,6 +542,158 @@ def random_control_curve(
             }
         )
     return result
+
+
+def _exact_count_random_indices(
+    total_cells: int,
+    selected_count: int,
+    *,
+    seed: int,
+    replicate: int,
+    eligible_mask: np.ndarray | None,
+) -> np.ndarray:
+    if total_cells == 0 and selected_count == 0:
+        return np.empty(0, dtype=np.int64)
+    if selected_count < 0 or selected_count > total_cells:
+        raise ValueError("selected_count must lie inside the random pool")
+    q = 1.0 if selected_count == total_cells else selected_count / total_cells
+    selected = deterministic_random_indices(
+        total_cells,
+        q,
+        seed=seed,
+        replicate=replicate,
+        eligible_mask=eligible_mask,
+    )
+    if len(selected) != selected_count:
+        raise AssertionError("exact-count random selection changed cardinality")
+    return selected
+
+
+def matched_action_random_control(
+    cell_stats: Sequence[dict[str, Any]],
+    full_k1_confusion: np.ndarray,
+    target_levels: np.ndarray | Sequence[int],
+    eligible_mask: np.ndarray | Sequence[bool],
+    group_ids: np.ndarray | Sequence[int],
+    *,
+    route_kind: str,
+) -> dict[str, Any]:
+    """Match K2-only/K4 counts globally or per image for one oracle policy."""
+
+    levels = np.asarray(target_levels, dtype=np.int64)
+    eligible = np.asarray(eligible_mask)
+    groups = np.asarray(group_ids)
+    if levels.shape != (len(cell_stats),) or np.any(~np.isin(levels, (1, 2, 4))):
+        raise ValueError("target_levels must contain one K1/K2/K4 level per cell")
+    if eligible.shape != levels.shape or eligible.dtype != np.bool_:
+        raise TypeError("eligible_mask must be a bool vector matching target_levels")
+    if groups.shape != levels.shape or not np.issubdtype(groups.dtype, np.integer):
+        raise TypeError("group_ids must be an integer vector matching target_levels")
+    if route_kind not in ("a1_binary", "a2_hierarchical_x"):
+        raise ValueError("route_kind must identify the fixed A1 or A2 action space")
+    if route_kind == "a1_binary" and np.any(levels == 2):
+        raise ValueError("A1 random control cannot receive K2 target levels")
+
+    unique_groups = np.unique(groups)
+    target_counts = {}
+    for group in unique_groups:
+        group_levels = levels[groups == group]
+        target_counts[int(group)] = {
+            "k2_only": int(np.count_nonzero(group_levels == 2)),
+            "k4": int(np.count_nonzero(group_levels == 4)),
+        }
+    common_k1 = aggregate_cell_assignment(
+        cell_stats,
+        np.ones(len(cell_stats), dtype=np.int64),
+        num_classes=NUM_CLASSES,
+    )["confusion"]
+    full_k1 = np.asarray(full_k1_confusion, dtype=np.int64)
+    outside = full_k1 - common_k1
+    if np.any(outside < 0):
+        raise ValueError("cell K1 confusion is not contained in full K1 confusion")
+    confusion_by_level = {
+        level: np.stack(
+            [
+                np.asarray(record["confusion"][f"k{level}"], dtype=np.int64)
+                for record in cell_stats
+            ],
+            axis=0,
+        )
+        for level in (1, 2, 4)
+    }
+    delta_k1_to_k2 = confusion_by_level[2] - confusion_by_level[1]
+    delta_k2_to_k4 = confusion_by_level[4] - confusion_by_level[2]
+    values = np.empty(RANDOM_REPLICATES, dtype=np.float64)
+    for replicate in range(RANDOM_REPLICATES):
+        promoted_parts = []
+        k4_parts = []
+        for group_position, group in enumerate(unique_groups):
+            indices = np.flatnonzero(groups == group).astype(np.int64, copy=False)
+            counts = target_counts[int(group)]
+            promoted_count = counts["k2_only"] + counts["k4"]
+            eligible_count = int(np.count_nonzero(eligible[indices]))
+            if promoted_count > eligible_count:
+                raise ValueError(
+                    "matched formal random cannot reproduce target action counts "
+                    "inside the public geometry-eligible pool"
+                )
+            promoted_local = _exact_count_random_indices(
+                len(indices),
+                promoted_count,
+                seed=RANDOM_SEED,
+                replicate=replicate * len(unique_groups) * 2 + group_position * 2,
+                eligible_mask=eligible[indices],
+            )
+            promoted_global = indices[promoted_local]
+            promoted_parts.append(promoted_global)
+            k4_within_promoted = _exact_count_random_indices(
+                promoted_count,
+                counts["k4"],
+                seed=RANDOM_SEED + 1,
+                replicate=(
+                    replicate * len(unique_groups) * 2 + group_position * 2 + 1
+                ),
+                eligible_mask=None,
+            )
+            k4_parts.append(promoted_global[k4_within_promoted])
+        promoted = np.concatenate(promoted_parts).astype(np.int64, copy=False)
+        k4 = np.concatenate(k4_parts).astype(np.int64, copy=False)
+        confusion = full_k1.copy()
+        if len(promoted):
+            confusion += delta_k1_to_k2[promoted].sum(axis=0, dtype=np.int64)
+        if len(k4):
+            confusion += delta_k2_to_k4[k4].sum(axis=0, dtype=np.int64)
+        values[replicate] = mean_iou_from_confusion(confusion)
+    quantiles = np.quantile(values, (0.05, 0.50, 0.95))
+    k2_or_k4 = int(np.count_nonzero(levels != 1))
+    k4_count = int(np.count_nonzero(levels == 4))
+    binary_target = route_kind == "a1_binary"
+    cost = (
+        binary_phase_cost(k4_count, len(cell_stats))
+        if binary_target
+        else hierarchical_phase_cost(k2_or_k4, k4_count, len(cell_stats))
+    )
+    return {
+        "replicates": RANDOM_REPLICATES,
+        "seed": RANDOM_SEED,
+        "route_kind": route_kind,
+        "matching": (
+            "per-group K4 counts"
+            if binary_target
+            else "per-group K2-only/K4 counts with K4 nested inside K2"
+        ),
+        "target_counts_by_group": target_counts,
+        "cost": cost,
+        "miou": {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=1)),
+            "p05": float(quantiles[0]),
+            "p50": float(quantiles[1]),
+            "p95": float(quantiles[2]),
+            "min": float(values.min()),
+            "max": float(values.max()),
+        },
+    }
 
 
 def finite_oracle_envelope(
@@ -451,7 +737,11 @@ def stage_a_decision(
     *,
     formal: bool,
 ) -> dict[str, Any]:
-    """Apply the fixed q=1/3, proxy-cost <=2x Stage-A gate."""
+    """Evaluate the legacy fixed-q A1 fixture used by regression tests.
+
+    Schema-v2 ``main`` never calls this helper: formal decisions use dynamic
+    A1/A2 greedy points and :func:`arbitrate_stage_a_routes`.
+    """
 
     if not formal:
         return {
@@ -464,6 +754,38 @@ def stage_a_decision(
         }
     mixed = _point_at_q(oracle_envelope, DECISION_Q)
     random = _point_at_q(random_curve, DECISION_Q)
+    return route_decision_from_point(
+        endpoints,
+        mixed,
+        random,
+        formal=True,
+        route_name="A1_binary_k1_k4",
+        budget_scope=mixed.get("budget_scope", "global"),
+    )
+
+
+def route_decision_from_point(
+    endpoints: Mapping[str, Any],
+    mixed: Mapping[str, Any],
+    random: Mapping[str, Any],
+    *,
+    formal: bool,
+    route_name: str,
+    budget_scope: str,
+) -> dict[str, Any]:
+    """Apply the common scientific-feasibility gate to one fixed policy."""
+
+    if not formal:
+        return {
+            "outcome": "NOT_EVALUATED_SUBSET",
+            "passed": None,
+            "route_name": route_name,
+            "budget_scope": budget_scope,
+            "reason": (
+                "Subset smoke validates execution and internal geometry only; "
+                "it cannot make the preregistered scientific decision."
+            ),
+        }
     gate = evaluate_phase_utility_gate(
         k1_miou=endpoints["k1"]["full_image"]["miou"],
         k2_miou=endpoints["matched_k2"]["full_image"]["miou"],
@@ -484,20 +806,477 @@ def stage_a_decision(
         ],
         random_p95_miou=random["miou"]["p95"],
     )
-    gate["observed"]["decision_requested_q"] = DECISION_Q
-    gate["observed"]["decision_source_ranking"] = mixed["source_ranking"]
+    gate["route_name"] = route_name
+    gate["budget_scope"] = budget_scope
+    gate["observed"]["decision_requested_q"] = mixed.get("requested_q")
+    gate["observed"]["decision_requested_cost"] = mixed.get("requested_cost")
+    gate["observed"]["decision_source_ranking"] = mixed.get(
+        "source_ranking", "constructive_greedy"
+    )
     gate["observed"]["oracle_miou"] = mixed["full_image"]["miou"]
     gate["observed"]["random_control"] = (
-        "geometry-aware equal-count random; all-window cost denominator"
+        "geometry-aware random matched to the policy's action counts, hierarchy "
+        "when applicable, and budget scope; all-window cost denominator"
     )
-    gate["outcome"] = "GO_STAGE_B" if gate["passed"] else "NO_GO_STOP_ROUTE"
+    gate["outcome"] = "PASS_FEASIBILITY" if gate["passed"] else "FAIL_FEASIBILITY"
     gate["interpretation"] = (
-        "Proceed to an exact routed-window simulator; Stage A itself is not a "
-        "deployable sparse method."
+        "This policy passes one Stage-A feasibility gate; overall A1/A2 and "
+        "global/per-image arbitration still applies."
         if gate["passed"]
-        else "Stop the current Phase-on-Demand resource route; do not train a gate."
+        else "This policy fails its Stage-A feasibility gate."
     )
     return gate
+
+
+def greedy_snapshot_point(
+    snapshot: Mapping[str, Any],
+    class_names: Sequence[str],
+    *,
+    route_name: str,
+    budget_scope: str,
+    source_ranking: str,
+) -> dict[str, Any]:
+    """Convert one common-module greedy snapshot into the runner schema."""
+
+    aggregate = snapshot["aggregate"]
+    cost = snapshot["cost"]
+    total_cells = int(cost["total_cells"])
+    if total_cells <= 0:
+        raise ValueError("greedy snapshot must cover at least one cell")
+    requested_extra = int(snapshot["requested_extra_proxy_cost"])
+    actual_extra = int(snapshot["actual_extra_proxy_cost"])
+    requested_cost = 1.0 + requested_extra / total_cells
+    if actual_extra > requested_extra:
+        raise AssertionError("greedy snapshot exceeded its requested proxy budget")
+    return {
+        "route_name": route_name,
+        "budget_scope": budget_scope,
+        "source_ranking": source_ranking,
+        "requested_cost": float(requested_cost),
+        "requested_extra_proxy_cost": requested_extra,
+        "actual_extra_proxy_cost": actual_extra,
+        "chosen_action_count": int(snapshot["chosen_action_count"]),
+        "selected_counts": dict(snapshot["selected_counts"]),
+        "levels_by_cell": np.asarray(
+            snapshot["levels_by_cell"], dtype=np.int64
+        ),
+        "cost": dict(cost),
+        "full_image": baseline_summary(
+            np.asarray(aggregate["full_confusion"], dtype=np.int64), class_names
+        ),
+        "common_support": {
+            "metrics": baseline_summary(
+                np.asarray(aggregate["common_support"]["confusion"], dtype=np.int64),
+                class_names,
+            ),
+            "regions": aggregate["common_support"]["regions"],
+        },
+    }
+
+
+def arbitrate_stage_a_routes(
+    route_decisions: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    *,
+    formal: bool,
+) -> dict[str, Any]:
+    """Apply the frozen A2-first, both-budget Stage-A arbitration rule."""
+
+    route_order = ("a2_hierarchical_x", "a1_binary")
+    for route in route_order:
+        if route not in route_decisions:
+            raise ValueError(f"missing Stage-A route decision: {route}")
+        if set(route_decisions[route]) != {"global", "per_image"}:
+            raise ValueError(f"route {route} must contain global and per_image gates")
+    pass_matrix = {
+        route: {
+            scope: route_decisions[route][scope].get("passed")
+            for scope in ("global", "per_image")
+        }
+        for route in route_order
+    }
+    if not formal:
+        return {
+            "outcome": "NOT_EVALUATED_SUBSET",
+            "passed": None,
+            "stage_b_authorized": False,
+            "selected_route": None,
+            "route_pass_matrix": pass_matrix,
+            "reason": (
+                "Subset smoke validates execution only; A1/A2 scientific "
+                "arbitration requires the sealed full test set."
+            ),
+        }
+
+    for route in route_order:
+        if all(pass_matrix[route][scope] is True for scope in ("global", "per_image")):
+            return {
+                "outcome": (
+                    "GO_STAGE_B_A2_HIERARCHICAL_X"
+                    if route == "a2_hierarchical_x"
+                    else "GO_STAGE_B_A1_BINARY"
+                ),
+                "passed": True,
+                "stage_b_authorized": True,
+                "selected_route": route,
+                "route_pass_matrix": pass_matrix,
+                "reason": (
+                    "The selected fixed action space passes both the optimistic "
+                    "global-pooled and deployability-oriented per-image-capped "
+                    "scientific-feasibility gates."
+                ),
+            }
+
+    pooled_only = [
+        route
+        for route in route_order
+        if pass_matrix[route]["global"] is True
+        and pass_matrix[route]["per_image"] is not True
+    ]
+    if pooled_only:
+        return {
+            "outcome": "POOLED_ONLY_NO_WINDOW_STAGE_B",
+            "passed": False,
+            "stage_b_authorized": False,
+            "selected_route": None,
+            "pooled_only_routes": pooled_only,
+            "route_pass_matrix": pass_matrix,
+            "reason": (
+                "At least one route works only when proxy compute may move across "
+                "images. That is evidence for dataset/image-level heterogeneity, "
+                "not for the current per-image window-routing constraint."
+            ),
+        }
+    return {
+        "outcome": "NO_GO_STOP_CURRENT_PHASE_ON_DEMAND_ROUTE",
+        "passed": False,
+        "stage_b_authorized": False,
+        "selected_route": None,
+        "route_pass_matrix": pass_matrix,
+        "reason": (
+            "Neither preregistered action space passes both Stage-A budget "
+            "scopes. Stop this ownership-cell/fixed-phase/2x route; this does "
+            "not prove every dynamic phase method impossible."
+        ),
+    }
+
+
+def _reindexed_cell_subset(
+    cell_stats: Sequence[dict[str, Any]], indices: np.ndarray
+) -> list[dict[str, Any]]:
+    result = []
+    for local_index, global_index in enumerate(indices):
+        record = dict(cell_stats[int(global_index)])
+        record["cell_index"] = local_index
+        result.append(record)
+    return result
+
+
+def _error_count(confusion: np.ndarray) -> int:
+    matrix = np.asarray(confusion, dtype=np.int64)
+    return int(matrix.sum() - np.trace(matrix))
+
+
+def _region_rate_from_totals(totals: Mapping[str, int]) -> float | None:
+    pixels = int(totals["pixels"])
+    errors = int(totals["errors"])
+    return float(errors / pixels) if pixels else None
+
+
+def fixed_policy_stability(
+    cell_stats: Sequence[dict[str, Any]],
+    levels_by_cell: np.ndarray | Sequence[int],
+    group_ids: np.ndarray | Sequence[int],
+    full_confusions_by_group: Mapping[int, Mapping[str, np.ndarray]],
+) -> dict[str, Any]:
+    """Describe per-image and fixed-policy LOO behavior without adding a gate."""
+
+    levels = np.asarray(levels_by_cell, dtype=np.int64)
+    groups = np.asarray(group_ids)
+    if levels.shape != (len(cell_stats),) or np.any(~np.isin(levels, (1, 2, 4))):
+        raise ValueError("levels_by_cell must contain one K1/K2/K4 level per cell")
+    if groups.shape != levels.shape or not np.issubdtype(groups.dtype, np.integer):
+        raise TypeError("group_ids must be an integer vector matching levels")
+
+    group_order = [int(value) for value in dict.fromkeys(groups.tolist())]
+    per_image = []
+    internal = []
+    for group in group_order:
+        if group not in full_confusions_by_group:
+            raise ValueError(f"missing full confusions for image {group}")
+        indices = np.flatnonzero(groups == group).astype(np.int64, copy=False)
+        local_records = _reindexed_cell_subset(cell_stats, indices)
+        local_levels = levels[indices]
+        assignments = {
+            "k1": np.ones(len(indices), dtype=np.int64),
+            "k2": np.full(len(indices), 2, dtype=np.int64),
+            "k4": np.full(len(indices), 4, dtype=np.int64),
+            "route": local_levels,
+        }
+        common = {
+            name: aggregate_cell_assignment(
+                local_records, assignment, num_classes=NUM_CLASSES
+            )
+            for name, assignment in assignments.items()
+        }
+        references = {
+            name: np.asarray(full_confusions_by_group[group][name], dtype=np.int64)
+            for name in ("k1", "k2", "k4")
+        }
+        route_confusion = (
+            references["k1"]
+            + np.asarray(common["route"]["confusion"], dtype=np.int64)
+            - np.asarray(common["k1"]["confusion"], dtype=np.int64)
+        )
+        if np.any(route_confusion < 0):
+            raise AssertionError("fixed route produced negative per-image confusion")
+        route_miou = mean_iou_from_confusion(route_confusion)
+        endpoint_mious = {
+            name: mean_iou_from_confusion(confusion)
+            for name, confusion in references.items()
+        }
+        selected_counts = {
+            "k1": int(np.count_nonzero(local_levels == 1)),
+            "k2": int(np.count_nonzero(local_levels == 2)),
+            "k4": int(np.count_nonzero(local_levels == 4)),
+        }
+        extra_cost = selected_counts["k2"] + 3 * selected_counts["k4"]
+        small_delta = None
+        thin_delta = None
+        for region_name in ("small", "thin"):
+            route_rate = common["route"]["regions"][region_name]["error_rate"]
+            k2_rate = common["k2"]["regions"][region_name]["error_rate"]
+            delta = (
+                None
+                if route_rate is None or k2_rate is None
+                else float(route_rate - k2_rate)
+            )
+            if region_name == "small":
+                small_delta = delta
+            else:
+                thin_delta = delta
+        per_image.append(
+            {
+                "image_index": group,
+                "cell_count": len(indices),
+                "selected_counts": selected_counts,
+                "actual_extra_proxy_cost": extra_cost,
+                "forward_equivalent_cost": float(1.0 + extra_cost / len(indices)),
+                "route_miou_percent": float(route_miou * 100.0),
+                "delta_over_k1_pp": float(
+                    (route_miou - endpoint_mious["k1"]) * 100.0
+                ),
+                "delta_over_k2x_pp": float(
+                    (route_miou - endpoint_mious["k2"]) * 100.0
+                ),
+                "delta_below_k4_pp": float(
+                    (route_miou - endpoint_mious["k4"]) * 100.0
+                ),
+                "error_pixels_delta_over_k2x": (
+                    _error_count(route_confusion) - _error_count(references["k2"])
+                ),
+                "small_error_rate_delta_over_k2x": small_delta,
+                "thin_error_rate_delta_over_k2x": thin_delta,
+            }
+        )
+        internal.append(
+            {
+                "group": group,
+                "cell_count": len(indices),
+                "extra_cost": extra_cost,
+                "route_confusion": route_confusion,
+                "references": references,
+                "route_regions": common["route"]["regions"],
+                "k2_regions": common["k2"]["regions"],
+            }
+        )
+
+    deltas_over_k2 = np.asarray(
+        [record["delta_over_k2x_pp"] for record in per_image], dtype=np.float64
+    )
+    deltas_over_k1 = np.asarray(
+        [record["delta_over_k1_pp"] for record in per_image], dtype=np.float64
+    )
+    absolute_error_changes = np.sort(
+        np.abs(
+            np.asarray(
+                [record["error_pixels_delta_over_k2x"] for record in per_image],
+                dtype=np.float64,
+            )
+        )
+    )[::-1]
+    absolute_total = float(absolute_error_changes.sum())
+    top_three_share = (
+        float(absolute_error_changes[:3].sum() / absolute_total)
+        if absolute_total
+        else 0.0
+    )
+
+    loo = []
+    if len(internal) > 1:
+        total_confusions = {
+            name: sum(
+                (
+                    item["route_confusion"]
+                    if name == "route"
+                    else item["references"][name]
+                    for item in internal
+                ),
+                start=np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64),
+            )
+            for name in ("route", "k1", "k2", "k4")
+        }
+        total_regions = {
+            source: {
+                region: {
+                    "pixels": sum(
+                        int(item[f"{source}_regions"][region]["pixels"])
+                        for item in internal
+                    ),
+                    "errors": sum(
+                        int(item[f"{source}_regions"][region]["errors"])
+                        for item in internal
+                    ),
+                }
+                for region in ("small", "thin")
+            }
+            for source in ("route", "k2")
+        }
+        total_cells = sum(item["cell_count"] for item in internal)
+        total_extra = sum(item["extra_cost"] for item in internal)
+        for removed in internal:
+            remaining_confusions = {
+                name: total_confusions[name]
+                - (
+                    removed["route_confusion"]
+                    if name == "route"
+                    else removed["references"][name]
+                )
+                for name in total_confusions
+            }
+            remaining_cells = total_cells - removed["cell_count"]
+            remaining_extra = total_extra - removed["extra_cost"]
+            mious = {
+                name: mean_iou_from_confusion(confusion)
+                for name, confusion in remaining_confusions.items()
+            }
+            positive_k4 = mious["k4"] > mious["k1"] + 1e-12
+            retention = (
+                float(
+                    (mious["route"] - mious["k1"])
+                    / (mious["k4"] - mious["k1"])
+                )
+                if positive_k4
+                else None
+            )
+            region_deltas = {}
+            for region in ("small", "thin"):
+                remaining_region = {}
+                for source in ("route", "k2"):
+                    totals = {
+                        key: total_regions[source][region][key]
+                        - int(removed[f"{source}_regions"][region][key])
+                        for key in ("pixels", "errors")
+                    }
+                    remaining_region[source] = _region_rate_from_totals(totals)
+                region_deltas[region] = (
+                    None
+                    if any(value is None for value in remaining_region.values())
+                    else float(remaining_region["route"] - remaining_region["k2"])
+                )
+            cost = float(1.0 + remaining_extra / remaining_cells)
+            checks = {
+                "positive_full_k4_gain": positive_k4,
+                "cost_within_budget": cost <= 2.0 + 1e-12,
+                "retains_k4_gain": retention is not None and retention >= 0.70 - 1e-12,
+                "outperforms_uniform_k2x": mious["route"] > mious["k2"] + 1e-12,
+                "small_not_worse_than_k2x": (
+                    region_deltas["small"] is not None
+                    and region_deltas["small"] <= 1e-12
+                ),
+                "thin_not_worse_than_k2x": (
+                    region_deltas["thin"] is not None
+                    and region_deltas["thin"] <= 1e-12
+                ),
+            }
+            loo.append(
+                {
+                    "removed_image_index": removed["group"],
+                    "fixed_policy_not_reoptimized": True,
+                    "route_miou_percent": float(mious["route"] * 100.0),
+                    "delta_over_k2x_pp": float(
+                        (mious["route"] - mious["k2"]) * 100.0
+                    ),
+                    "k4_gain_retention": retention,
+                    "forward_equivalent_cost": cost,
+                    "small_error_rate_delta_over_k2x": region_deltas["small"],
+                    "thin_error_rate_delta_over_k2x": region_deltas["thin"],
+                    "descriptive_partial_checks_without_random": checks,
+                    "descriptive_partial_checks_passed": all(checks.values()),
+                }
+            )
+
+    return {
+        "role": (
+            "descriptive stability only; it does not add a hard Stage-A gate "
+            "and does not estimate deployment generalization"
+        ),
+        "per_image": per_image,
+        "summary": {
+            "image_count": len(per_image),
+            "positive_image_count_vs_k1": int(np.count_nonzero(deltas_over_k1 > 0.0)),
+            "positive_image_count_vs_k2x": int(np.count_nonzero(deltas_over_k2 > 0.0)),
+            "median_delta_over_k1_pp": float(np.median(deltas_over_k1)),
+            "median_delta_over_k2x_pp": float(np.median(deltas_over_k2)),
+            "top_three_share_of_absolute_error_pixel_change_vs_k2x": top_three_share,
+        },
+        "leave_one_image_out_fixed_policy": loo,
+        "loo_limitation": (
+            "The random p95 control is not recomputed after removal, so these "
+            "are deterministic partial checks rather than repeated formal gates."
+            if loo
+            else "LOO is undefined for a one-image subset smoke."
+        ),
+    }
+
+
+def k2_axis_diagnostic(
+    image_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Report fixed y-K2 versus preregistered x-K2 without selecting an axis."""
+
+    rows = []
+    for image in image_records:
+        x_confusion = np.asarray(image["confusion"]["matched_k2"], dtype=np.int64)
+        y_confusion = np.asarray(
+            image["confusion"]["matched_k2_y"], dtype=np.int64
+        )
+        x_miou = mean_iou_from_confusion(x_confusion)
+        y_miou = mean_iou_from_confusion(y_confusion)
+        rows.append(
+            {
+                "image_index": int(image["loader_position"]),
+                "sample_name": image["sample_name"],
+                "k2x_miou_percent": float(x_miou * 100.0),
+                "k2y_miou_percent": float(y_miou * 100.0),
+                "k2y_minus_k2x_pp": float((y_miou - x_miou) * 100.0),
+            }
+        )
+    differences = np.asarray(
+        [row["k2y_minus_k2x_pp"] for row in rows], dtype=np.float64
+    )
+    return {
+        "role": (
+            "descriptive only; y-K2 never enters A2 actions, greedy selection, "
+            "random controls, gates, or per-cell best-axis selection"
+        ),
+        "per_image": rows,
+        "summary": {
+            "image_count": len(rows),
+            "k2y_better_image_count": int(np.count_nonzero(differences > 0.0)),
+            "k2x_better_image_count": int(np.count_nonzero(differences < 0.0)),
+            "median_k2y_minus_k2x_pp": float(np.median(differences)),
+        },
+    }
 
 
 def _reference_checks(
@@ -687,11 +1466,25 @@ def main() -> None:
 
     digests = {
         name: hashlib.sha256()
-        for name in ("label", "k1", "legacy_k2", "matched_k2", "k4")
+        for name in (
+            "label",
+            "k1",
+            "legacy_k2",
+            "matched_k2",
+            "matched_k2_y",
+            "k4",
+        )
     }
     full_confusions = {
         name: np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
-        for name in ("k1", "legacy_k2", "matched_k2", "k4")
+        for name in ("k1", "legacy_k2", "matched_k2", "matched_k2_y", "k4")
+    }
+    matched_k2_y_common = {
+        "confusion": np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64),
+        "regions": {
+            name: {"pixels": 0, "errors": 0, "error_rate": None}
+            for name in ("all", "small", "thin")
+        },
     }
     all_cell_stats: list[dict[str, Any]] = []
     score_values: dict[str, list[float]] = {
@@ -750,6 +1543,7 @@ def main() -> None:
                 baseline_scores, (0, 0), original_slice, shifted_slices
             ).clone()
             matched_k2_sum = None
+            matched_k2_y_sum = None
             legacy_k2_sum = None
             for shift in phases[1:]:
                 dy, dx = shift
@@ -788,15 +1582,29 @@ def main() -> None:
                             x_shifted_slices[shift][1],
                         ]
                     )
+                elif shift == (PHASE_OFFSET, 0):
+                    matched_k2_y_sum = (
+                        aligned_phase_crop(
+                            baseline_scores, (0, 0), original_slice, shifted_slices
+                        ).clone()
+                        + aligned
+                    )
                 del shifted_scores, aligned
-            if matched_k2_sum is None or legacy_k2_sum is None:
-                raise AssertionError("failed to construct the fixed x-phase K2")
+            if (
+                matched_k2_sum is None
+                or matched_k2_y_sum is None
+                or legacy_k2_sum is None
+            ):
+                raise AssertionError("failed to construct the fixed x/y K2 views")
 
             matched_k2_prediction = prediction_from_aligned_score_sum(
                 k1_prediction, matched_k2_sum, original_slice
             )
             legacy_k2_prediction = prediction_from_aligned_score_sum(
                 k1_prediction, legacy_k2_sum, x_original_slice
+            )
+            matched_k2_y_prediction = prediction_from_aligned_score_sum(
+                k1_prediction, matched_k2_y_sum, original_slice
             )
             k4_prediction = prediction_from_aligned_score_sum(
                 k1_prediction, k4_sum, original_slice
@@ -811,6 +1619,7 @@ def main() -> None:
                 "k1": k1_prediction,
                 "legacy_k2": legacy_k2_prediction,
                 "matched_k2": matched_k2_prediction,
+                "matched_k2_y": matched_k2_y_prediction,
                 "k4": k4_prediction,
             }
             image_confusions = {}
@@ -851,6 +1660,17 @@ def main() -> None:
                 small_mask=region_masks[SMALL_REGION],
                 thin_mask=region_masks[THIN_REGION],
             )
+            local_y_stats = cell_phase_statistics(
+                cell_bounds,
+                k1_prediction[0],
+                matched_k2_y_prediction[0],
+                k4_prediction[0],
+                label_full[0],
+                NUM_CLASSES,
+                valid_mask=common_mask,
+                small_mask=region_masks[SMALL_REGION],
+                thin_mask=region_masks[THIN_REGION],
+            )
             local_k1_levels = np.ones(len(local_stats), dtype=np.int64)
             local_k2_levels = np.full(len(local_stats), 2, dtype=np.int64)
             local_k4_levels = np.full(len(local_stats), 4, dtype=np.int64)
@@ -869,6 +1689,24 @@ def main() -> None:
                     raise AssertionError(
                         f"ownership cells do not reproduce {level_name} common confusion"
                     )
+            local_y_aggregate = aggregate_cell_assignment(
+                local_y_stats, local_k2_levels, num_classes=NUM_CLASSES
+            )
+            direct_y = confusion_from_arrays(
+                matched_k2_y_prediction[0],
+                label_full[0],
+                NUM_CLASSES,
+                mask=common_mask,
+            )
+            if not np.array_equal(local_y_aggregate["confusion"], direct_y):
+                raise AssertionError(
+                    "ownership cells do not reproduce matched y-K2 common confusion"
+                )
+            matched_k2_y_common["confusion"] += local_y_aggregate["confusion"]
+            for region_name, totals in matched_k2_y_common["regions"].items():
+                local_region = local_y_aggregate["regions"][region_name]
+                totals["pixels"] += int(local_region["pixels"])
+                totals["errors"] += int(local_region["errors"])
 
             common_logits = baseline_scores[
                 0, :, original_slice[0], original_slice[1]
@@ -969,11 +1807,14 @@ def main() -> None:
                 k1_prediction,
                 legacy_k2_prediction,
                 matched_k2_prediction,
+                matched_k2_y_prediction,
                 k4_prediction,
                 matched_k2_sum,
+                matched_k2_y_sum,
                 legacy_k2_sum,
                 k4_sum,
                 region_masks,
+                local_y_stats,
                 common_mask,
                 probabilities,
                 top_two,
@@ -1003,6 +1844,10 @@ def main() -> None:
             all_cell_stats, all_k4, num_classes=NUM_CLASSES
         ),
     }
+    for totals in matched_k2_y_common["regions"].values():
+        pixels = int(totals["pixels"])
+        errors = int(totals["errors"])
+        totals["error_rate"] = float(errors / pixels) if pixels else None
     outside_common_confusion = (
         full_confusions["k1"] - common_endpoints["k1"]["confusion"]
     )
@@ -1012,6 +1857,9 @@ def main() -> None:
         reconstructed = outside_common_confusion + common_endpoints[name]["confusion"]
         if not np.array_equal(reconstructed, full_confusions[name]):
             raise AssertionError(f"cell endpoint does not reproduce dense {name}")
+    reconstructed_y = outside_common_confusion + matched_k2_y_common["confusion"]
+    if not np.array_equal(reconstructed_y, full_confusions["matched_k2_y"]):
+        raise AssertionError("cell endpoint does not reproduce dense matched y-K2")
 
     endpoints = {
         name: _endpoint_summary(
@@ -1022,6 +1870,16 @@ def main() -> None:
     endpoints["legacy_k2"] = {
         "full_image": baseline_summary(full_confusions["legacy_k2"], cfg["labels"]),
         "role": "sealed-reference reproduction only; not used by the Stage-A gate",
+    }
+    endpoints["matched_k2_y_descriptive"] = {
+        **_endpoint_summary(
+            full_confusions["matched_k2_y"],
+            matched_k2_y_common,
+            cfg["labels"],
+        ),
+        "role": (
+            "descriptive axis diagnostic only; the preregistered hierarchy uses x-K2"
+        ),
     }
 
     reference_validation = _reference_checks(
@@ -1049,6 +1907,29 @@ def main() -> None:
             np.isfinite(np.asarray(score_values[name], dtype=np.float64)),
         ):
             raise AssertionError("K1 score maps disagree on geometry eligibility")
+    group_ids = np.asarray(
+        [int(record["image_index"]) for record in all_cell_stats], dtype=np.int64
+    )
+    group_order = [int(value) for value in dict.fromkeys(group_ids.tolist())]
+    cell_count_by_group = {
+        group: int(np.count_nonzero(group_ids == group)) for group in group_order
+    }
+    reference_k1_by_group = {
+        int(image["loader_position"]): np.asarray(
+            image["confusion"]["k1"], dtype=np.int64
+        )
+        for image in image_records
+    }
+    full_confusions_by_group = {
+        int(image["loader_position"]): {
+            "k1": np.asarray(image["confusion"]["k1"], dtype=np.int64),
+            "k2": np.asarray(
+                image["confusion"]["matched_k2"], dtype=np.int64
+            ),
+            "k4": np.asarray(image["confusion"]["k4"], dtype=np.int64),
+        }
+        for image in image_records
+    }
     raw_scores = {
         "net_correct": oracle_net_correct_scores(all_cell_stats),
         "singleton_global_miou": oracle_cell_miou_gain_scores(
@@ -1069,6 +1950,12 @@ def main() -> None:
         name: restrict_score_to_geometry(score, geometry_eligible)
         for name, score in raw_scores.items()
     }
+    scores["singleton_per_image_miou"] = restrict_score_to_geometry(
+        grouped_singleton_miou_scores(
+            all_cell_stats, group_ids, reference_k1_by_group
+        ),
+        geometry_eligible,
+    )
     oracle_curves = {
         name: evaluate_score_curve(
             all_cell_stats,
@@ -1080,6 +1967,24 @@ def main() -> None:
         for name in ("net_correct", "singleton_global_miou")
     }
     oracle_envelope = finite_oracle_envelope(oracle_curves)
+    per_image_binary_oracle_curves = {
+        "net_correct": evaluate_grouped_score_curve(
+            all_cell_stats,
+            scores["net_correct"],
+            group_ids,
+            outside_common_confusion,
+            cfg["labels"],
+            deployment=False,
+        ),
+        "singleton_per_image_miou": evaluate_grouped_score_curve(
+            all_cell_stats,
+            scores["singleton_per_image_miou"],
+            group_ids,
+            outside_common_confusion,
+            cfg["labels"],
+            deployment=False,
+        ),
+    }
     simple_curves = {
         name: evaluate_score_curve(
             all_cell_stats,
@@ -1100,12 +2005,142 @@ def main() -> None:
         full_confusions["k1"],
         eligible_mask=None,
     )
-    decision = stage_a_decision(
-        endpoints,
-        oracle_envelope,
-        geometry_random_curve,
-        formal=args.max_images is None,
+
+    total_cells = len(all_cell_stats)
+    global_extra_budget = total_cells
+    per_image_extra_budgets = dict(cell_count_by_group)
+    binary_global_run = binary_greedy_oracle(
+        all_cell_stats,
+        (global_extra_budget,),
+        num_classes=NUM_CLASSES,
+        reference_confusion=full_confusions["k1"],
     )
+    hierarchical_global_run = hierarchical_greedy_oracle(
+        all_cell_stats,
+        (global_extra_budget,),
+        num_classes=NUM_CLASSES,
+        reference_confusion=full_confusions["k1"],
+    )
+    binary_per_image_run = binary_group_budget_oracle(
+        all_cell_stats,
+        group_ids.tolist(),
+        per_image_extra_budgets,
+        num_classes=NUM_CLASSES,
+        reference_confusion_by_group=reference_k1_by_group,
+    )
+    hierarchical_per_image_run = hierarchical_group_budget_oracle(
+        all_cell_stats,
+        group_ids.tolist(),
+        per_image_extra_budgets,
+        num_classes=NUM_CLASSES,
+        reference_confusion_by_group=reference_k1_by_group,
+    )
+
+    route_points = {
+        "a1_binary": {
+            "global": greedy_snapshot_point(
+                binary_global_run["snapshots"][0],
+                cfg["labels"],
+                route_name="A1_binary_k1_k4",
+                budget_scope="global-pooled",
+                source_ranking="gt_informed_dynamic_global_miou_marginal",
+            ),
+            "per_image": greedy_snapshot_point(
+                binary_per_image_run["snapshot"],
+                cfg["labels"],
+                route_name="A1_binary_k1_k4",
+                budget_scope="per-image-capped",
+                source_ranking=(
+                    "gt_informed_dynamic_global_miou_marginal_under_per_image_caps"
+                ),
+            ),
+        },
+        "a2_hierarchical_x": {
+            "global": greedy_snapshot_point(
+                hierarchical_global_run["snapshots"][0],
+                cfg["labels"],
+                route_name="A2_hierarchical_k1_k2x_k4",
+                budget_scope="global-pooled",
+                source_ranking=(
+                    "gt_informed_dynamic_global_miou_marginal_per_proxy_cost"
+                ),
+            ),
+            "per_image": greedy_snapshot_point(
+                hierarchical_per_image_run["snapshot"],
+                cfg["labels"],
+                route_name="A2_hierarchical_k1_k2x_k4",
+                budget_scope="per-image-capped",
+                source_ranking=(
+                    "gt_informed_dynamic_global_miou_marginal_per_proxy_cost_"
+                    "under_per_image_caps"
+                ),
+            ),
+        },
+    }
+    for route_scopes in route_points.values():
+        for point in route_scopes.values():
+            levels = np.asarray(point["levels_by_cell"], dtype=np.int64)
+            if np.any((levels != 1) & (~geometry_eligible)):
+                raise AssertionError(
+                    "greedy selected a cell outside public common-support geometry"
+                )
+
+    global_random_groups = np.zeros(total_cells, dtype=np.int64)
+    route_random_controls = {}
+    for route, scopes in route_points.items():
+        route_random_controls[route] = {}
+        for scope, point in scopes.items():
+            random_groups = global_random_groups if scope == "global" else group_ids
+            control = matched_action_random_control(
+                all_cell_stats,
+                full_confusions["k1"],
+                point["levels_by_cell"],
+                geometry_eligible,
+                random_groups,
+                route_kind=route,
+            )
+            control["route_name"] = point["route_name"]
+            control["budget_scope"] = point["budget_scope"]
+            if not math.isclose(
+                control["cost"]["forward_equivalent_cost"],
+                point["cost"]["forward_equivalent_cost"],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise AssertionError(
+                    "matched random control changed the target policy proxy cost"
+                )
+            route_random_controls[route][scope] = control
+
+    formal_decision = args.max_images is None
+    route_decisions = {
+        route: {
+            scope: route_decision_from_point(
+                endpoints,
+                route_points[route][scope],
+                route_random_controls[route][scope],
+                formal=formal_decision,
+                route_name=route_points[route][scope]["route_name"],
+                budget_scope=route_points[route][scope]["budget_scope"],
+            )
+            for scope in ("global", "per_image")
+        }
+        for route in ("a1_binary", "a2_hierarchical_x")
+    }
+    decision = arbitrate_stage_a_routes(route_decisions, formal=formal_decision)
+    stability = {
+        route: {
+            scope: fixed_policy_stability(
+                all_cell_stats,
+                route_points[route][scope]["levels_by_cell"],
+                group_ids,
+                full_confusions_by_group,
+            )
+            for scope in ("global", "per_image")
+        }
+        for route in ("a1_binary", "a2_hierarchical_x")
+    }
+    axis_diagnostic = k2_axis_diagnostic(image_records)
     total_elapsed = time.perf_counter() - started
 
     compact_cells = []
@@ -1129,6 +2164,9 @@ def main() -> None:
                     "oracle_singleton_global_miou_gain": _finite_or_none(
                         singleton_values[index]
                     ),
+                    "oracle_singleton_per_image_miou_gain": _finite_or_none(
+                        scores["singleton_per_image_miou"].values[index]
+                    ),
                     "k1_entropy": _finite_or_none(score_values["entropy"][index]),
                     "k1_negative_margin": _finite_or_none(
                         score_values["negative_margin"][index]
@@ -1140,18 +2178,75 @@ def main() -> None:
             }
         )
 
+    stage_a_routes = {
+        "a1_binary": {
+            "action_space": "K1 -> K4 with incremental proxy cost +3",
+            "selection_rule": (
+                "GT-informed constructive greedy; recompute current merged full-"
+                "dataset mIoU marginal after every action; stop at no positive gain"
+            ),
+            "global": {
+                "greedy_point": route_points["a1_binary"]["global"],
+                "action_trace": binary_global_run["actions"][:
+                    route_points["a1_binary"]["global"]["chosen_action_count"]
+                ],
+                "random_control": route_random_controls["a1_binary"]["global"],
+                "gate": route_decisions["a1_binary"]["global"],
+                "stability": stability["a1_binary"]["global"],
+            },
+            "per_image": {
+                "greedy_point": route_points["a1_binary"]["per_image"],
+                "action_trace": binary_per_image_run["actions"],
+                "group_caps_and_usage": binary_per_image_run["groups"],
+                "random_control": route_random_controls["a1_binary"]["per_image"],
+                "gate": route_decisions["a1_binary"]["per_image"],
+                "stability": stability["a1_binary"]["per_image"],
+            },
+        },
+        "a2_hierarchical_x": {
+            "action_space": (
+                "K1 -> fixed x-K2 (+1) -> K4 (+2); K4 requires prior x-K2"
+            ),
+            "selection_rule": (
+                "GT-informed constructive greedy; recompute current merged full-"
+                "dataset mIoU marginal per incremental proxy cost after every "
+                "action; never cross a non-positive bridge"
+            ),
+            "global": {
+                "greedy_point": route_points["a2_hierarchical_x"]["global"],
+                "action_trace": hierarchical_global_run["actions"],
+                "random_control": route_random_controls[
+                    "a2_hierarchical_x"
+                ]["global"],
+                "gate": route_decisions["a2_hierarchical_x"]["global"],
+                "stability": stability["a2_hierarchical_x"]["global"],
+            },
+            "per_image": {
+                "greedy_point": route_points["a2_hierarchical_x"]["per_image"],
+                "action_trace": hierarchical_per_image_run["actions"],
+                "group_caps_and_usage": hierarchical_per_image_run["groups"],
+                "random_control": route_random_controls[
+                    "a2_hierarchical_x"
+                ]["per_image"],
+                "gate": route_decisions["a2_hierarchical_x"]["per_image"],
+                "stability": stability["a2_hierarchical_x"]["per_image"],
+            },
+        },
+    }
+
     output = {
         "status": "PASS",
         "status_meaning": (
-            "Execution, geometry, and endpoint checks passed. Scientific GO/NO-GO "
-            "is reported separately and is absent for subset smoke."
+            "Execution, geometry, endpoint, A1/A2 construction, and reporting "
+            "checks passed. Scientific GO/NO-GO is separate and absent for smoke."
         ),
         "artifact_type": ARTIFACT_TYPE,
         "schema_version": SCHEMA_VERSION,
         "scope": "full-test" if args.max_images is None else "subset-smoke",
         "scientific_scope": (
-            "GT-informed post-aggregation ownership-cell upper-bound audit. It "
-            "tests spatial concentration (H1), not exact sparse executability (H2)."
+            "GT-informed post-aggregation ownership-cell feasibility audit for "
+            "fixed A1/A2 action spaces. It tests spatial concentration (H1), "
+            "not exact sparse executability (H2) or router generalization (H3)."
         ),
         "full_test_length": full_test_length,
         "evaluated_images": len(loader.dataset),
@@ -1178,23 +2273,86 @@ def main() -> None:
             "stage_a_cell_ownership": (
                 "one midpoint-owned rectangle per real row-major 512/341 window"
             ),
-            "stage_a_action_space": "binary K1/K4",
-            "proxy_cost": "1 + 3 * selected_cell_fraction",
+            "stage_a_action_spaces": {
+                "a1_binary": {
+                    "levels": [1, 4],
+                    "proxy_cost": "1 + 3*q4",
+                },
+                "a2_hierarchical_x": {
+                    "levels": [1, 2, 4],
+                    "fixed_k2": "normal + x8 shifted-canvas phase",
+                    "precedence": "K1 -> K2x -> K4",
+                    "proxy_cost": "1 + q(K2-or-K4) + 2*q4",
+                },
+            },
             "proxy_cost_warning": (
                 "post-aggregation optimistic proxy, not executed crop forwards or latency"
             ),
             "q_values": list(Q_VALUES),
-            "decision_q": DECISION_Q,
+            "q_values_role": (
+                "descriptive legacy fixed-ranking A1 curves only; never the formal gate"
+            ),
+            "formal_proxy_budget": {
+                "requested_forward_equivalent_cost": 2.0,
+                "global_pooled_extra_budget": global_extra_budget,
+                "per_image_extra_budget": per_image_extra_budgets,
+                "per_image_objective": (
+                    "one merged full-dataset mIoU objective under independent image caps"
+                ),
+                "promotion_requirement": (
+                    "the same candidate action space must pass both scopes"
+                ),
+            },
+            "constructive_greedy_role": (
+                "GT-informed optimistic search heuristic, not a mathematical optimum "
+                "and not a deployable router"
+            ),
             "random_replicates": RANDOM_REPLICATES,
             "random_seed": RANDOM_SEED,
             "geometry_eligible_cells": int(np.count_nonzero(geometry_eligible)),
             "random_gate_control": (
-                "sample geometry-eligible cells first; selected count and cost "
-                "denominator retain all real windows"
+                "match K2-only/K4 action counts globally or per image, preserve "
+                "K4 nesting, sample public geometry first, and retain every real "
+                "window in the proxy-cost denominator"
             ),
             "naive_all_cell_random_role": "descriptive only; never used by the gate",
-            "matched_k2": (
-                "normal+x8 logits on exactly the sealed K4 common support"
+            "matched_k2x": (
+                "normal+x8 logits on exactly the sealed K4 common support; the "
+                "only K2 admitted to A2 and all gates"
+            ),
+            "matched_k2y": (
+                "normal+y8 free descriptive endpoint only; never used to select "
+                "an axis, rescue a gate, or alter the registered hierarchy"
+            ),
+            "candidate_priority": (
+                "A2 is selected if both scopes pass; otherwise A1 may fall back if "
+                "both scopes pass; otherwise no Stage B"
+            ),
+            "stage_a_gate_meaning": (
+                "scientific feasibility only: cost<=2x, >=70% K4-gain retention, "
+                "strictly above fixed K2x, small/thin safe, and above matched random p95"
+            ),
+            "stage_b_frozen_requirements": {
+                "implementation_trigger": "only after Stage-A authorization",
+                "exact_cost": (
+                    "deduplicated dependency closure over (image, phase, crop_id)"
+                ),
+                "random": "match exact incremental crop-forward cost",
+                "correctness": (
+                    "K1/K2x/K4 endpoints plus one fixed nontrivial middle-subset "
+                    "prediction/confusion/dependency-closure equality test"
+                ),
+                "practical_gate": (
+                    "exact overall/per-image cost<=2x, >=70% retention, >=+0.05pp "
+                    "over K2x, small/thin safe, above exact random p95, and measured "
+                    "latency below dense K4"
+                ),
+            },
+            "e0_phase_context": (
+                "341 mod 16 = 5, so ordinary overlapping E0 crops already rotate "
+                "local crop-origin patch phases; K2/K4 add shifted-canvas phase "
+                "passes beyond that implicit coverage. K1/K2/K4 count these "
+                "shifted-canvas passes, not unique ViT patch-residue classes"
             ),
         },
         "region_reporting": {
@@ -1225,12 +2383,22 @@ def main() -> None:
         "aggregate": {
             "total_cells": len(all_cell_stats),
             "endpoints": endpoints,
-            "oracle_rankings": oracle_curves,
-            "finite_oracle_envelope": oracle_envelope,
+            "descriptive_global_binary_rankings": oracle_curves,
+            "descriptive_global_finite_oracle_envelope": oracle_envelope,
+            "descriptive_per_image_binary_rankings": per_image_binary_oracle_curves,
             "simple_k1_scores": simple_curves,
-            "geometry_aware_equal_count_random": geometry_random_curve,
+            "descriptive_geometry_aware_equal_count_random": geometry_random_curve,
             "naive_all_cell_random_descriptive": naive_random_curve,
         },
+        "formal_stage_a_routes": stage_a_routes,
+        "descriptive_diagnostics": {
+            "fixed_k2_axis": axis_diagnostic,
+            "stability_note": (
+                "Per-image and fixed-policy LOO results are embedded under each "
+                "route/scope and never add an unregistered hard gate."
+            ),
+        },
+        "stage_a_route_decisions": route_decisions,
         "stage_a_decision": decision,
         "cells": compact_cells,
         "runtime": {
@@ -1252,8 +2420,18 @@ def main() -> None:
                 "matched_k2_miou_percent": endpoints["matched_k2"]["full_image"][
                     "miou_percent"
                 ],
+                "matched_k2_y_miou_percent": endpoints[
+                    "matched_k2_y_descriptive"
+                ]["full_image"]["miou_percent"],
                 "k4_miou_percent": endpoints["k4"]["full_image"]["miou_percent"],
                 "stage_a_decision": decision,
+                "route_gate_pass": {
+                    route: {
+                        scope: route_decisions[route][scope]["passed"]
+                        for scope in ("global", "per_image")
+                    }
+                    for route in ("a1_binary", "a2_hierarchical_x")
+                },
             },
             ensure_ascii=False,
             indent=2,

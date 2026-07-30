@@ -8,6 +8,8 @@ from scripts.phase_utility_common import (
     CellScoreVector,
     PhaseUtilityGateThresholds,
     aggregate_cell_assignment,
+    binary_greedy_oracle,
+    binary_group_budget_oracle,
     binary_phase_cost,
     binary_selection_curve,
     build_cell_ownership,
@@ -18,6 +20,8 @@ from scripts.phase_utility_common import (
     deterministic_top_q_indices,
     evaluate_phase_utility_gate,
     gain_retention,
+    hierarchical_greedy_oracle,
+    hierarchical_group_budget_oracle,
     hierarchical_phase_cost,
     mean_iou_from_confusion,
     oracle_cell_miou_gain_scores,
@@ -206,6 +210,309 @@ class MetricAndCellStatisticsTest(unittest.TestCase):
                 num_classes=2,
                 reference_confusion=invalid_reference,
             )
+
+
+class DynamicGreedyOracleTest(unittest.TestCase):
+    @staticmethod
+    def _binary_dynamic_fixture():
+        bounds = np.array(
+            [[0, 1, 0, 1], [0, 1, 1, 2]], dtype=np.int64
+        )
+        target = np.array([[0, 1]], dtype=np.int64)
+        k1 = np.array([[1, 0]], dtype=np.int64)
+        k2 = np.array([[0, 1]], dtype=np.int64)
+        k4 = np.array([[0, 1]], dtype=np.int64)
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        full_k1 = np.array([[8, 2], [2, 8]], dtype=np.int64)
+        return stats, full_k1
+
+    @staticmethod
+    def _hierarchical_fixture():
+        bounds = np.array(
+            [[0, 1, 0, 2], [0, 1, 2, 4]], dtype=np.int64
+        )
+        target = np.array([[0, 0, 1, 1]], dtype=np.int64)
+        k1 = np.array([[1, 1, 0, 0]], dtype=np.int64)
+        k2 = np.array([[0, 1, 1, 0]], dtype=np.int64)
+        k4 = np.array([[0, 0, 1, 1]], dtype=np.int64)
+        return cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+
+    def test_binary_oracle_recomputes_full_miou_and_obeys_budget(self):
+        stats, full_k1 = self._binary_dynamic_fixture()
+        oracle = binary_greedy_oracle(
+            stats,
+            (0, 2, 3, 6),
+            num_classes=2,
+            reference_confusion=full_k1,
+        )
+        self.assertEqual([action["cell_index"] for action in oracle["actions"]], [0, 1])
+        snapshots = oracle["snapshots"]
+        np.testing.assert_array_equal(snapshots[0]["levels_by_cell"], [1, 1])
+        np.testing.assert_array_equal(snapshots[1]["levels_by_cell"], [1, 1])
+        np.testing.assert_array_equal(snapshots[2]["levels_by_cell"], [4, 1])
+        np.testing.assert_array_equal(snapshots[3]["levels_by_cell"], [4, 4])
+        for snapshot in snapshots:
+            self.assertLessEqual(
+                snapshot["actual_extra_proxy_cost"],
+                snapshot["requested_extra_proxy_cost"],
+            )
+
+        cell_one_delta = (
+            stats[1]["confusion"]["k4"]
+            - stats[1]["confusion"]["k1"]
+        )
+        initial_cell_one_gain = (
+            mean_iou_from_confusion(full_k1 + cell_one_delta)
+            - mean_iou_from_confusion(full_k1)
+        )
+        # The second gain is evaluated after cell 0 changed the full confusion,
+        # not copied from a static singleton ranking.
+        self.assertNotAlmostEqual(
+            oracle["actions"][1]["full_miou_gain"], initial_cell_one_gain
+        )
+        expected_full = full_k1.copy()
+        for record in stats:
+            expected_full += (
+                record["confusion"]["k4"] - record["confusion"]["k1"]
+            )
+        np.testing.assert_array_equal(
+            snapshots[-1]["aggregate"]["full_confusion"], expected_full
+        )
+
+    def test_binary_oracle_stops_when_no_positive_marginal_exists(self):
+        bounds = np.array([[0, 1, 0, 1]], dtype=np.int64)
+        target = np.array([[0]], dtype=np.int64)
+        k1 = np.array([[0]], dtype=np.int64)
+        k2 = np.array([[0]], dtype=np.int64)
+        k4 = np.array([[1]], dtype=np.int64)
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        oracle = binary_greedy_oracle(stats, (3,), num_classes=2)
+        self.assertEqual(oracle["actions"], ())
+        self.assertEqual(
+            oracle["snapshots"][0]["actual_extra_proxy_cost"], 0
+        )
+        np.testing.assert_array_equal(
+            oracle["snapshots"][0]["levels_by_cell"], [1]
+        )
+
+    def test_hierarchical_path_enforces_precedence_and_reaches_endpoints(self):
+        stats = self._hierarchical_fixture()
+        oracle = hierarchical_greedy_oracle(
+            stats, tuple(range(7)), num_classes=2
+        )
+        seen_k2 = set()
+        for action in oracle["actions"]:
+            cell = action["cell_index"]
+            if action["from_level"] == 1:
+                self.assertEqual(action["to_level"], 2)
+                seen_k2.add(cell)
+            else:
+                self.assertEqual(action["from_level"], 2)
+                self.assertEqual(action["to_level"], 4)
+                self.assertIn(cell, seen_k2)
+            self.assertGreater(action["full_miou_gain"], 0.0)
+        np.testing.assert_array_equal(
+            oracle["snapshots"][0]["levels_by_cell"], [1, 1]
+        )
+        np.testing.assert_array_equal(
+            oracle["path_endpoint"]["levels_by_cell"], [4, 4]
+        )
+        for snapshot in oracle["snapshots"]:
+            self.assertLessEqual(
+                snapshot["actual_extra_proxy_cost"],
+                snapshot["requested_extra_proxy_cost"],
+            )
+        self.assertEqual(
+            oracle["snapshots"][3]["explored_through_budget_cost"], 2
+        )
+
+    def test_hierarchical_oracle_does_not_cross_nonpositive_k2_bridge(self):
+        bounds = np.array([[0, 1, 0, 1]], dtype=np.int64)
+        target = np.array([[0]], dtype=np.int64)
+        k1 = np.array([[0]], dtype=np.int64)
+        k2 = np.array([[1]], dtype=np.int64)
+        k4 = np.array([[0]], dtype=np.int64)
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        oracle = hierarchical_greedy_oracle(stats, (3,), num_classes=2)
+        self.assertEqual(oracle["actions"], ())
+        np.testing.assert_array_equal(
+            oracle["path_endpoint"]["levels_by_cell"], [1]
+        )
+
+    def test_hierarchical_budget_filters_unaffordable_action_before_ranking(self):
+        bounds = np.array(
+            [[0, 1, 0, 4], [0, 1, 4, 5]], dtype=np.int64
+        )
+        target = np.zeros((1, 5), dtype=np.int64)
+        k1 = np.ones((1, 5), dtype=np.int64)
+        k2 = np.array([[0, 1, 1, 1, 0]], dtype=np.int64)
+        k4 = np.zeros((1, 5), dtype=np.int64)
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        full_k1 = np.array([[5, 5], [0, 0]], dtype=np.int64)
+
+        global_result = hierarchical_greedy_oracle(
+            stats,
+            (2,),
+            num_classes=2,
+            reference_confusion=full_k1,
+        )
+        snapshot = global_result["snapshots"][0]
+        # After cell 0 reaches K2, its +2 K4 action has the best ratio but no
+        # longer fits.  The +1 K2 action for cell 1 must still be considered.
+        np.testing.assert_array_equal(snapshot["levels_by_cell"], [2, 2])
+        self.assertEqual(snapshot["actual_extra_proxy_cost"], 2)
+        self.assertAlmostEqual(snapshot["aggregate"]["full_miou"], 0.35)
+
+        capped = hierarchical_group_budget_oracle(
+            stats,
+            ("g", "g"),
+            {"g": 2},
+            num_classes=2,
+            reference_confusion_by_group={"g": full_k1},
+        )
+        np.testing.assert_array_equal(
+            capped["snapshot"]["levels_by_cell"],
+            snapshot["levels_by_cell"],
+        )
+        np.testing.assert_array_equal(
+            capped["snapshot"]["aggregate"]["full_confusion"],
+            snapshot["aggregate"]["full_confusion"],
+        )
+
+    def test_hierarchical_oracle_ranks_gain_per_cost_not_absolute_gain(self):
+        bounds = np.array(
+            [[0, 1, 0, 6], [0, 1, 6, 8]], dtype=np.int64
+        )
+        target = np.zeros((1, 8), dtype=np.int64)
+        k1 = np.ones((1, 8), dtype=np.int64)
+        k2 = np.array([[0, 0, 0, 1, 1, 1, 0, 0]], dtype=np.int64)
+        k4 = np.zeros((1, 8), dtype=np.int64)
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        oracle = hierarchical_greedy_oracle(
+            stats,
+            (6,),
+            num_classes=2,
+            reference_confusion=np.array([[2, 8], [0, 0]], dtype=np.int64),
+        )
+        actions = oracle["actions"]
+        self.assertEqual(
+            [
+                (action["cell_index"], action["from_level"], action["to_level"])
+                for action in actions
+            ],
+            [(0, 1, 2), (1, 1, 2), (0, 2, 4)],
+        )
+        # After action 1, cell 0's K2->K4 absolute gain is larger, but its
+        # cost-normalized gain is lower than cell 1's K1->K2 action.
+        self.assertGreater(actions[2]["full_miou_gain"], actions[1]["full_miou_gain"])
+
+    def test_group_caps_compete_on_one_global_confusion(self):
+        stats, _ = self._binary_dynamic_fixture()
+        reference_a = np.array([[4, 1], [0, 4]], dtype=np.int64)
+        reference_b = np.array([[4, 0], [1, 4]], dtype=np.int64)
+        global_reference = reference_a + reference_b
+        result = binary_group_budget_oracle(
+            stats,
+            ("a", "b"),
+            {"a": 3, "b": 0},
+            num_classes=2,
+            reference_confusion_by_group={"a": reference_a, "b": reference_b},
+        )
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["group_id"], "a")
+        self.assertAlmostEqual(
+            result["actions"][0]["full_miou_before"],
+            mean_iou_from_confusion(global_reference),
+        )
+        usage = {group["group_id"]: group for group in result["groups"]}
+        self.assertEqual(usage["a"]["used_extra_proxy_cost"], 3)
+        self.assertEqual(usage["b"]["used_extra_proxy_cost"], 0)
+        np.testing.assert_array_equal(
+            result["snapshot"]["levels_by_cell"], [4, 1]
+        )
+
+    def test_group_caps_use_global_objective_even_when_both_groups_can_act(self):
+        bounds = np.array(
+            [[0, 1, 0, 8], [0, 1, 8, 16]], dtype=np.int64
+        )
+        target = np.array(
+            [[0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1]],
+            dtype=np.int64,
+        )
+        k1 = np.array(
+            [[0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0]],
+            dtype=np.int64,
+        )
+        k4 = np.array(
+            [[1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1]],
+            dtype=np.int64,
+        )
+        stats = cell_phase_statistics(bounds, k1, k1, k4, target, 2)
+        result = binary_group_budget_oracle(
+            stats,
+            ("a", "b"),
+            {"a": 3, "b": 3},
+            num_classes=2,
+        )
+        # Both actions improve their own image in isolation, but B is harmful
+        # to the pooled confusion after A.  One global objective selects A only.
+        self.assertEqual(
+            [(action["cell_index"], action["group_id"]) for action in result["actions"]],
+            [(0, "a")],
+        )
+        np.testing.assert_array_equal(result["levels_by_cell"], [4, 1])
+        usage = {group["group_id"]: group for group in result["groups"]}
+        self.assertEqual(usage["a"]["used_extra_proxy_cost"], 3)
+        self.assertEqual(usage["b"]["used_extra_proxy_cost"], 0)
+
+    def test_group_caps_prevent_budget_borrowing_and_merge_assignments(self):
+        bounds = np.array(
+            [
+                [0, 1, 0, 1],
+                [0, 1, 1, 2],
+                [0, 1, 2, 3],
+                [0, 1, 3, 4],
+            ],
+            dtype=np.int64,
+        )
+        target = np.array([[0, 1, 0, 1]], dtype=np.int64)
+        k1 = np.array([[1, 0, 1, 0]], dtype=np.int64)
+        k2 = target.copy()
+        k4 = target.copy()
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 2)
+        result = binary_group_budget_oracle(
+            stats,
+            ("a", "a", "b", "b"),
+            {"a": 3, "b": 3},
+            num_classes=2,
+        )
+        usage = {group["group_id"]: group for group in result["groups"]}
+        self.assertEqual(usage["a"]["selected_counts"]["k4"], 1)
+        self.assertEqual(usage["b"]["selected_counts"]["k4"], 1)
+        self.assertEqual(result["snapshot"]["actual_extra_proxy_cost"], 6)
+        self.assertEqual(
+            int(np.count_nonzero(result["snapshot"]["levels_by_cell"] == 4)),
+            2,
+        )
+
+    def test_hierarchical_group_quota_is_enforced_globally(self):
+        stats = self._hierarchical_fixture()
+        result = hierarchical_group_budget_oracle(
+            stats,
+            ("a", "b"),
+            {"a": 1, "b": 1},
+            num_classes=2,
+        )
+        np.testing.assert_array_equal(
+            result["snapshot"]["levels_by_cell"], [2, 2]
+        )
+        self.assertEqual(
+            [group["used_extra_proxy_cost"] for group in result["groups"]],
+            [1, 1],
+        )
+        self.assertTrue(
+            all(action["full_miou_gain"] > 0.0 for action in result["actions"])
+        )
 
 
 class SelectionCostAndGateTest(unittest.TestCase):

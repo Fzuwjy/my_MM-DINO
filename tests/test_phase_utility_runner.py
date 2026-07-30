@@ -2,24 +2,35 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
+import scripts.evaluate_whu_phase_utility_audit as phase_utility_runner
 from scripts.evaluate_whu_phase_utility_audit import (
     DECISION_Q,
     Q_VALUES,
     _finite_or_none,
     _reference_checks,
+    arbitrate_stage_a_routes,
     atomic_write_json,
     cell_means_from_common_map,
     finite_oracle_envelope,
+    fixed_policy_stability,
+    grouped_singleton_miou_scores,
+    grouped_top_q_indices,
     load_four_phase_reference,
+    matched_action_random_control,
+    k2_axis_diagnostic,
     restrict_score_to_geometry,
+    route_decision_from_point,
     slide_window_manifest,
     stage_a_decision,
 )
 from scripts.phase_utility_common import (
     CellScoreVector,
+    aggregate_cell_assignment,
+    cell_phase_statistics,
     oracle_cell_miou_gain_scores,
 )
 from scripts.spatial_diagnostics_common import baseline_summary
@@ -128,6 +139,174 @@ class PhaseUtilityRunnerTests(unittest.TestCase):
         self.assertTrue(score.uses_ground_truth)
         self.assertGreater(score.values[0], 0.0)
 
+    def test_grouped_top_q_applies_exact_budget_inside_each_image(self):
+        score = CellScoreVector(
+            "synthetic",
+            np.array([1.0, 9.0, 8.0, 4.0, 3.0, 2.0, 1.0]),
+            False,
+        )
+        groups = np.array([7, 7, 7, 9, 9, 9, 9], dtype=np.int64)
+        selected = grouped_top_q_indices(
+            score, 0.5, groups, deployment=True
+        )
+        np.testing.assert_array_equal(selected, np.array([1, 3, 4]))
+        self.assertEqual(np.count_nonzero(groups[selected] == 7), 1)
+        self.assertEqual(np.count_nonzero(groups[selected] == 9), 2)
+
+    @staticmethod
+    def _two_group_cell_stats():
+        bounds = np.array(
+            [[0, 1, index, index + 1] for index in range(4)],
+            dtype=np.int64,
+        )
+        target = np.array([[0, 1, 0, 1]], dtype=np.int64)
+        k1 = np.array([[1, 0, 1, 0]], dtype=np.int64)
+        k4 = target.copy()
+        return cell_phase_statistics(bounds, k1, k4, k4, target, 7)
+
+    def test_grouped_singleton_scores_use_each_images_own_reference(self):
+        stats = self._two_group_cell_stats()
+        groups = np.array([7, 7, 9, 9], dtype=np.int64)
+        references = {}
+        for group, diagonal in ((7, (100, 1)), (9, (1, 100))):
+            indices = np.flatnonzero(groups == group)
+            reference = sum(
+                (stats[index]["confusion"]["k1"] for index in indices),
+                start=np.zeros((7, 7), dtype=np.int64),
+            )
+            reference[0, 0] += diagonal[0]
+            reference[1, 1] += diagonal[1]
+            references[group] = reference
+
+        actual = grouped_singleton_miou_scores(stats, groups, references)
+        expected = np.empty(4, dtype=np.float64)
+        for group in (7, 9):
+            indices = np.flatnonzero(groups == group)
+            local_stats = []
+            for local_index, global_index in enumerate(indices):
+                record = dict(stats[int(global_index)])
+                record["cell_index"] = local_index
+                local_stats.append(record)
+            local = oracle_cell_miou_gain_scores(
+                local_stats,
+                num_classes=7,
+                reference_confusion=references[group],
+            )
+            expected[indices] = local.values
+
+        np.testing.assert_allclose(actual.values, expected)
+        self.assertNotAlmostEqual(actual.values[0], actual.values[2])
+
+    def test_matched_random_preserves_group_counts_and_nests_k4(self):
+        bounds = np.array(
+            [[0, 1, index, index + 1] for index in range(6)],
+            dtype=np.int64,
+        )
+        target = np.array([[0, 1, 0, 1, 0, 1]], dtype=np.int64)
+        k1 = np.array([[1, 0, 1, 0, 1, 0]], dtype=np.int64)
+        k2 = target.copy()
+        k4 = target.copy()
+        stats = cell_phase_statistics(bounds, k1, k2, k4, target, 7)
+        full_k1 = sum(
+            (record["confusion"]["k1"] for record in stats),
+            start=np.zeros((7, 7), dtype=np.int64),
+        )
+        groups = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+        target_levels = np.array([1, 2, 4, 4, 4, 2], dtype=np.int64)
+        eligible = np.array([True, False, True, True, True, True])
+        generated_levels = []
+        real_aggregate = aggregate_cell_assignment
+        real_exact_random = phase_utility_runner._exact_count_random_indices
+
+        def recording_aggregate(cell_stats, levels, *, num_classes):
+            generated_levels.append(np.asarray(levels, dtype=np.int64).copy())
+            return real_aggregate(cell_stats, levels, num_classes=num_classes)
+
+        with patch.object(phase_utility_runner, "RANDOM_REPLICATES", 4), patch.object(
+            phase_utility_runner,
+            "aggregate_cell_assignment",
+            side_effect=recording_aggregate,
+        ), patch.object(
+            phase_utility_runner,
+            "_exact_count_random_indices",
+            wraps=real_exact_random,
+        ) as exact_random:
+            control = matched_action_random_control(
+                stats,
+                full_k1,
+                target_levels,
+                eligible,
+                groups,
+                route_kind="a2_hierarchical_x",
+            )
+
+        self.assertEqual(
+            control["target_counts_by_group"],
+            {
+                0: {"k2_only": 1, "k4": 1},
+                1: {"k2_only": 1, "k4": 2},
+            },
+        )
+        self.assertEqual(control["replicates"], 4)
+        # Only the one validation aggregation remains; replicate evaluation
+        # is vectorized from the exact promoted/K4 index sets.
+        self.assertEqual(len(generated_levels), 1)
+        np.testing.assert_array_equal(generated_levels[0], np.ones(6))
+
+        # Every group/replicate makes two selections. The second selection's
+        # pool is exactly the first selection's promoted K2-or-K4 set, which
+        # is the implementation-level guarantee that K4 is nested under K2.
+        exact_calls = exact_random.call_args_list
+        self.assertEqual(len(exact_calls), 4 * 2 * 2)
+        expected_by_group = [
+            control["target_counts_by_group"][0],
+            control["target_counts_by_group"][1],
+        ]
+        for call_index in range(0, len(exact_calls), 2):
+            promoted_call = exact_calls[call_index]
+            k4_call = exact_calls[call_index + 1]
+            expected = expected_by_group[(call_index // 2) % 2]
+            self.assertEqual(
+                promoted_call.args[1], expected["k2_only"] + expected["k4"]
+            )
+            self.assertEqual(k4_call.args[0], promoted_call.args[1])
+            self.assertEqual(k4_call.args[1], expected["k4"])
+
+    def test_matched_random_keeps_explicit_a2_provenance_without_k2_only_cells(self):
+        stats = self._two_group_cell_stats()
+        full_k1 = sum(
+            (record["confusion"]["k1"] for record in stats),
+            start=np.zeros((7, 7), dtype=np.int64),
+        )
+        with patch.object(phase_utility_runner, "RANDOM_REPLICATES", 2):
+            control = matched_action_random_control(
+                stats,
+                full_k1,
+                np.ones(len(stats), dtype=np.int64),
+                np.ones(len(stats), dtype=bool),
+                np.zeros(len(stats), dtype=np.int64),
+                route_kind="a2_hierarchical_x",
+            )
+        self.assertEqual(control["route_kind"], "a2_hierarchical_x")
+        self.assertEqual(control["cost"]["scheme"], "hierarchical_k1_k2_k4")
+
+    def test_matched_random_fails_closed_if_geometry_pool_is_too_small(self):
+        stats = self._two_group_cell_stats()
+        full_k1 = sum(
+            (record["confusion"]["k1"] for record in stats),
+            start=np.zeros((7, 7), dtype=np.int64),
+        )
+        with patch.object(phase_utility_runner, "RANDOM_REPLICATES", 1):
+            with self.assertRaisesRegex(ValueError, "geometry-eligible pool"):
+                matched_action_random_control(
+                    stats,
+                    full_k1,
+                    np.array([4, 1, 1, 1], dtype=np.int64),
+                    np.zeros(len(stats), dtype=bool),
+                    np.zeros(len(stats), dtype=np.int64),
+                    route_kind="a1_binary",
+                )
+
     def test_finite_oracle_envelope_uses_higher_observed_miou(self):
         net = []
         singleton = []
@@ -180,13 +359,116 @@ class PhaseUtilityRunnerTests(unittest.TestCase):
     def test_stage_a_decision_requires_all_fixed_gates(self):
         endpoints, oracle, random = self._decision_fixture()
         decision = stage_a_decision(endpoints, oracle, random, formal=True)
-        self.assertEqual(decision["outcome"], "GO_STAGE_B")
+        self.assertEqual(decision["outcome"], "PASS_FEASIBILITY")
         self.assertTrue(decision["checks"]["outperforms_equal_budget_random_p95"])
 
         endpoints, oracle, random = self._decision_fixture(random_p95=0.58)
         decision = stage_a_decision(endpoints, oracle, random, formal=True)
-        self.assertEqual(decision["outcome"], "NO_GO_STOP_ROUTE")
+        self.assertEqual(decision["outcome"], "FAIL_FEASIBILITY")
         self.assertFalse(decision["passed"])
+
+    def test_route_decision_reports_route_and_scope_before_arbitration(self):
+        endpoints, oracle, random = self._decision_fixture()
+        decision = route_decision_from_point(
+            endpoints,
+            oracle[0],
+            random[0],
+            formal=True,
+            route_name="A2_hierarchical_k1_k2x_k4",
+            budget_scope="per-image",
+        )
+        self.assertEqual(decision["outcome"], "PASS_FEASIBILITY")
+        self.assertTrue(decision["passed"])
+        self.assertEqual(decision["route_name"], "A2_hierarchical_k1_k2x_k4")
+        self.assertEqual(decision["budget_scope"], "per-image")
+
+    def test_stage_a_arbitration_is_a2_first_and_requires_both_scopes(self):
+        def decisions(a1_global, a1_per_image, a2_global, a2_per_image):
+            return {
+                "a1_binary": {
+                    "global": {"passed": a1_global},
+                    "per_image": {"passed": a1_per_image},
+                },
+                "a2_hierarchical_x": {
+                    "global": {"passed": a2_global},
+                    "per_image": {"passed": a2_per_image},
+                },
+            }
+
+        both_pass = arbitrate_stage_a_routes(
+            decisions(True, True, True, True), formal=True
+        )
+        self.assertEqual(both_pass["selected_route"], "a2_hierarchical_x")
+        self.assertEqual(both_pass["outcome"], "GO_STAGE_B_A2_HIERARCHICAL_X")
+
+        fallback = arbitrate_stage_a_routes(
+            decisions(True, True, False, False), formal=True
+        )
+        self.assertEqual(fallback["selected_route"], "a1_binary")
+        self.assertEqual(fallback["outcome"], "GO_STAGE_B_A1_BINARY")
+
+        pooled_only = arbitrate_stage_a_routes(
+            decisions(True, False, False, False), formal=True
+        )
+        self.assertEqual(
+            pooled_only["outcome"], "POOLED_ONLY_NO_WINDOW_STAGE_B"
+        )
+        self.assertFalse(pooled_only["stage_b_authorized"])
+
+        stopped = arbitrate_stage_a_routes(
+            decisions(False, True, False, False), formal=True
+        )
+        self.assertEqual(
+            stopped["outcome"], "NO_GO_STOP_CURRENT_PHASE_ON_DEMAND_ROUTE"
+        )
+        self.assertFalse(stopped["stage_b_authorized"])
+
+    def test_fixed_policy_stability_is_descriptive_and_uses_fixed_loo_policy(self):
+        stats = self._two_group_cell_stats()
+        groups = np.array([7, 7, 9, 9], dtype=np.int64)
+        levels = np.array([1, 4, 1, 4], dtype=np.int64)
+        full_by_group = {}
+        for group in (7, 9):
+            indices = np.flatnonzero(groups == group)
+            full_by_group[group] = {
+                level: sum(
+                    (stats[index]["confusion"][level] for index in indices),
+                    start=np.zeros((7, 7), dtype=np.int64),
+                )
+                for level in ("k1", "k2", "k4")
+            }
+        result = fixed_policy_stability(stats, levels, groups, full_by_group)
+        self.assertIn("descriptive stability only", result["role"])
+        self.assertEqual(result["summary"]["image_count"], 2)
+        self.assertEqual(len(result["per_image"]), 2)
+        self.assertEqual(len(result["leave_one_image_out_fixed_policy"]), 2)
+        self.assertTrue(
+            all(
+                row["fixed_policy_not_reoptimized"]
+                for row in result["leave_one_image_out_fixed_policy"]
+            )
+        )
+
+    def test_k2y_axis_diagnostic_never_selects_an_axis(self):
+        x = np.zeros((7, 7), dtype=np.int64)
+        y = np.zeros((7, 7), dtype=np.int64)
+        x[0, 0], x[0, 1] = 9, 1
+        y[0, 0], y[0, 1] = 10, 0
+        result = k2_axis_diagnostic(
+            [
+                {
+                    "loader_position": 0,
+                    "sample_name": "synthetic",
+                    "confusion": {
+                        "matched_k2": x.tolist(),
+                        "matched_k2_y": y.tolist(),
+                    },
+                }
+            ]
+        )
+        self.assertIn("never enters A2", result["role"])
+        self.assertEqual(result["summary"]["k2y_better_image_count"], 1)
+        self.assertGreater(result["per_image"][0]["k2y_minus_k2x_pp"], 0.0)
 
     def test_subset_never_makes_scientific_decision(self):
         decision = stage_a_decision({}, [], [], formal=False)
