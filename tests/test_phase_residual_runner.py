@@ -16,6 +16,7 @@ from scripts.run_whu_phase_distillation import SmallArrayCache, canonical_json_s
 from scripts.run_whu_phase_residual_probe import (
     companion_crops_for_batch,
     final_resource_decision,
+    full_label_to_numpy,
     magnitude_statistics,
     validate_fixed_batch_identity,
     validate_reference_objective,
@@ -23,6 +24,18 @@ from scripts.run_whu_phase_residual_probe import (
 
 
 class PhaseResidualRunnerTests(unittest.TestCase):
+    def test_full_label_accepts_direct_numpy_and_collated_tensor(self):
+        label = np.array([[0, 1], [7, 2]], dtype=np.int32)
+        expected = label.astype(np.int64)
+        numpy_result = full_label_to_numpy(label)
+        tensor_result = full_label_to_numpy(torch.from_numpy(label))
+        np.testing.assert_array_equal(numpy_result, expected)
+        np.testing.assert_array_equal(tensor_result, expected)
+        self.assertTrue(numpy_result.flags.c_contiguous)
+        self.assertEqual(numpy_result.dtype, np.int64)
+        with self.assertRaises(TypeError):
+            full_label_to_numpy(label.astype(np.float32))
+
     def test_magnitude_statistics_report_rms_without_selecting_scale(self):
         values = torch.tensor(
             [[[[3.0, 0.0]], [[4.0, 0.0]]]], dtype=torch.float32

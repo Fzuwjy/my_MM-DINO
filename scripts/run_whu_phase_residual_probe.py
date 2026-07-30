@@ -621,6 +621,18 @@ def _common_structure_crop(
     return (crop & np.uint8(1)) != 0, (crop & np.uint8(2)) != 0
 
 
+def full_label_to_numpy(label: torch.Tensor | np.ndarray) -> np.ndarray:
+    """Normalize direct-dataset or DataLoader labels to contiguous int64 HW."""
+
+    if isinstance(label, torch.Tensor):
+        value = label.detach().cpu().numpy()
+    else:
+        value = np.asarray(label)
+    if value.ndim != 2 or not np.issubdtype(value.dtype, np.integer):
+        raise TypeError("full-image WHU label must be a 2-D integer array")
+    return np.ascontiguousarray(value.astype(np.int64, copy=False))
+
+
 def exact_full_slide_evaluation(
     *,
     phase_record: PhaseImageRecord,
@@ -640,13 +652,13 @@ def exact_full_slide_evaluation(
         phase_record.sample_name
     ):
         raise RuntimeError("full-slide source image differs from the sealed cache")
-    optical, sar, label_tensor = full_dataset[phase_record.index]
-    if optical.ndim != 3 or sar.ndim != 3 or label_tensor.ndim != 2:
+    optical, sar, label_value = full_dataset[phase_record.index]
+    if optical.ndim != 3 or sar.ndim != 3:
         raise RuntimeError("unexpected full-image WHU tensor ranks")
-    full_shape = tuple(int(value) for value in label_tensor.shape)
+    label_full = full_label_to_numpy(label_value)
+    full_shape = tuple(int(value) for value in label_full.shape)
     if full_shape != tuple(phase_record.full_shape_hw):
         raise RuntimeError("full-slide label shape differs from the cache")
-    label_full = np.ascontiguousarray(label_tensor.numpy().astype(np.int64, copy=False))
     if label_sha256(label_full) != phase_record.label_sha256:
         raise RuntimeError("full-slide decoded label hash differs from the cache")
 
