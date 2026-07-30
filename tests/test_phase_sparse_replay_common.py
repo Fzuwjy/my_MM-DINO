@@ -226,6 +226,33 @@ class AlignmentAndMaskTest(unittest.TestCase):
         np.testing.assert_array_equal(k2["logits"][0, 1:5, 4:6], 1)
         np.testing.assert_array_equal(k2["logits"][0, 1:5, 1:4], 0)
 
+    def test_composition_can_skip_only_diagnostic_digests(self):
+        geometry = _two_window_geometry()
+        normal = np.zeros((2, 6, 8), dtype=np.float32)
+        phases = {
+            "x8": self._constant_accumulation(1),
+            "y8": self._constant_accumulation(10),
+            "xy8": self._constant_accumulation(100),
+        }
+        reference = compose_policy_logits(normal, phases, [1, 4], geometry, 0)
+        unhashed = compose_policy_logits(
+            normal,
+            phases,
+            [1, 4],
+            geometry,
+            0,
+            include_digests=False,
+        )
+
+        self.assertNotIn("logits_sha256", unhashed)
+        self.assertNotIn("prediction_sha256", unhashed)
+        np.testing.assert_array_equal(unhashed["logits"], reference["logits"])
+        np.testing.assert_array_equal(
+            unhashed["prediction"], reference["prediction"]
+        )
+        np.testing.assert_array_equal(unhashed["level_map"], reference["level_map"])
+        self.assertEqual(unhashed["phase_audit"], reference["phase_audit"])
+
     def test_composition_rejects_nonfinite_or_malformed_accumulations(self):
         geometry = _two_window_geometry()
         normal = np.zeros((2, 6, 8), dtype=np.float32)

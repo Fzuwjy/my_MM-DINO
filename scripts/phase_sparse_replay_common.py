@@ -520,8 +520,17 @@ def compose_policy_logits(
     levels_by_cell: Sequence[int] | np.ndarray,
     geometry: Mapping[str, Any],
     image_index: int,
+    *,
+    include_digests: bool = True,
 ) -> dict[str, Any]:
-    """Inverse-align phase means and apply the frozen ownership action mask."""
+    """Inverse-align phase means and apply the frozen ownership action mask.
+
+    ``include_digests=False`` skips only the diagnostic SHA256 passes over the
+    already materialized arrays.  The logits, prediction, ownership map, and
+    phase audit are otherwise produced by the identical code path.  This is
+    useful for latency measurement, where hashing must remain outside the
+    timed inference boundary.
+    """
 
     image_index = _validated_image_index(geometry, image_index)
     levels = validate_levels(levels_by_cell, geometry)
@@ -578,14 +587,16 @@ def compose_policy_logits(
             "added": bool(np.any(required)),
         }
     prediction = np.ascontiguousarray(output.argmax(axis=0).astype(np.int64))
-    return {
+    result = {
         "logits": output,
         "prediction": prediction,
         "level_map": level_map,
         "phase_audit": phase_audit,
-        "logits_sha256": array_sha256(output),
-        "prediction_sha256": array_sha256(prediction),
     }
+    if include_digests:
+        result["logits_sha256"] = array_sha256(output)
+        result["prediction_sha256"] = array_sha256(prediction)
+    return result
 
 
 def frozen_middle_levels(
