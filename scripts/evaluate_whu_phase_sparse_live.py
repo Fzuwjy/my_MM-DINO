@@ -280,7 +280,7 @@ def _anchor_summary(
     }
 
 
-def _expected_first_image_confusion(
+def _expected_image_confusion(
     stage_a: Mapping[str, Any],
     geometry: Mapping[str, Any],
     levels: np.ndarray,
@@ -381,7 +381,7 @@ def _policy_correctness(
     prediction_sha_equal = (
         sparse_output["prediction_sha256"] == dense_output["prediction_sha256"]
     )
-    expected_confusion = _expected_first_image_confusion(
+    expected_confusion = _expected_image_confusion(
         stage_a, geometry, levels, image_index
     )
     dense_confusion = confusion_from_arrays(
