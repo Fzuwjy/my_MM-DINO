@@ -16,6 +16,7 @@ routed-window simulator is only warranted if the fixed Stage-A gate passes.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -98,7 +99,7 @@ from utils.inference import slide_inference  # noqa: E402
 
 
 NUM_CLASSES = 7
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ARTIFACT_TYPE = "whu_phase_utility_stage_a"
 Q_VALUES = (0.0, 0.10, 0.20, 1.0 / 3.0, 0.50, 1.0)
 # Retained only for the legacy fixed-ranking regression helper below.
@@ -285,6 +286,34 @@ def _endpoint_summary(
             "regions": common_aggregate["regions"],
         },
     }
+
+
+def split_spatial_region_metadata(
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate invariant mask definitions from image-dependent diagnostics.
+
+    ``build_spatial_region_masks`` reports the per-image number of semantic
+    boundary anchors beside the invariant boundary definition.  Comparing the
+    complete metadata across images therefore rejects valid datasets.  The
+    dataset-level artifact stores only invariant definitions, while the anchor
+    count remains auditable on its own image record.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("spatial region metadata must be a mapping")
+    definitions = copy.deepcopy(dict(metadata))
+    boundary = definitions.get("boundary")
+    if not isinstance(boundary, dict) or "anchor_pixels" not in boundary:
+        raise ValueError("spatial boundary metadata lacks anchor_pixels")
+    anchor_pixels = boundary.pop("anchor_pixels")
+    if isinstance(anchor_pixels, (bool, np.bool_)) or not isinstance(
+        anchor_pixels, (int, np.integer)
+    ):
+        raise TypeError("boundary anchor_pixels must be an integer")
+    if int(anchor_pixels) < 0:
+        raise ValueError("boundary anchor_pixels must be non-negative")
+    return definitions, {"boundary_anchor_pixels": int(anchor_pixels)}
 
 
 def evaluate_binary_point(
@@ -1632,7 +1661,7 @@ def main() -> None:
                 digests[name].update(prediction.tobytes())
             digests["label"].update(label_full.tobytes())
 
-            region_masks, current_region_definitions = build_spatial_region_masks(
+            region_masks, current_region_metadata = build_spatial_region_masks(
                 label_full[0],
                 NUM_CLASSES,
                 boundary_radii=(0, 1, 2, 4, 8),
@@ -1643,10 +1672,15 @@ def main() -> None:
                 union_component_area=256,
                 union_component_thickness=4,
             )
+            current_region_definitions, image_region_metadata = (
+                split_spatial_region_metadata(current_region_metadata)
+            )
             if region_definitions is None:
                 region_definitions = current_region_definitions
             elif region_definitions != current_region_definitions:
-                raise AssertionError("spatial region definitions changed between images")
+                raise AssertionError(
+                    "invariant spatial region definitions changed between images"
+                )
             common_mask = np.zeros(shape, dtype=bool)
             common_mask[original_slice] = True
             local_stats = cell_phase_statistics(
@@ -1775,6 +1809,7 @@ def main() -> None:
                             & (label_full[0] < NUM_CLASSES)
                         )
                     ),
+                    "region_metadata": image_region_metadata,
                     "prediction_sha256": {
                         name: hashlib.sha256(prediction.tobytes()).hexdigest()
                         for name, prediction in predictions.items()

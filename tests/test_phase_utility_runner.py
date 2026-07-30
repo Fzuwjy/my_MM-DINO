@@ -25,6 +25,7 @@ from scripts.evaluate_whu_phase_utility_audit import (
     restrict_score_to_geometry,
     route_decision_from_point,
     slide_window_manifest,
+    split_spatial_region_metadata,
     stage_a_decision,
 )
 from scripts.phase_utility_common import (
@@ -37,6 +38,47 @@ from scripts.spatial_diagnostics_common import baseline_summary
 
 
 class PhaseUtilityRunnerTests(unittest.TestCase):
+    def test_spatial_region_metadata_splits_dynamic_anchor_count(self):
+        first = {
+            "boundary": {"anchor_pixels": 12, "definition": "fixed"},
+            "components": {"connectivity": 8},
+            "mixed_patch": {"patch_size": 16},
+            "actionable_union_sources": ["boundary_le_0px"],
+        }
+        second = {
+            **first,
+            "boundary": {"anchor_pixels": 37, "definition": "fixed"},
+        }
+        first_definitions, first_image = split_spatial_region_metadata(first)
+        second_definitions, second_image = split_spatial_region_metadata(second)
+        self.assertEqual(first_definitions, second_definitions)
+        self.assertEqual(first_image, {"boundary_anchor_pixels": 12})
+        self.assertEqual(second_image, {"boundary_anchor_pixels": 37})
+        self.assertEqual(first["boundary"]["anchor_pixels"], 12)
+        self.assertNotIn("anchor_pixels", first_definitions["boundary"])
+
+    def test_actual_region_definitions_are_invariant_across_targets(self):
+        uniform = np.zeros((8, 8), dtype=np.int64)
+        divided = uniform.copy()
+        divided[:, 4:] = 1
+        _, uniform_metadata = phase_utility_runner.build_spatial_region_masks(
+            uniform, 7
+        )
+        _, divided_metadata = phase_utility_runner.build_spatial_region_masks(
+            divided, 7
+        )
+        uniform_definitions, uniform_image = split_spatial_region_metadata(
+            uniform_metadata
+        )
+        divided_definitions, divided_image = split_spatial_region_metadata(
+            divided_metadata
+        )
+        self.assertEqual(uniform_definitions, divided_definitions)
+        self.assertNotEqual(
+            uniform_image["boundary_anchor_pixels"],
+            divided_image["boundary_anchor_pixels"],
+        )
+
     def test_nonfinite_empty_cell_score_serializes_as_null(self):
         self.assertIsNone(_finite_or_none(-np.inf))
         self.assertEqual(_finite_or_none(1.25), 1.25)
