@@ -26,7 +26,9 @@ from scripts.run_whu_phase_distillation import (
     epoch_artifact_paths,
     expected_teacher_bounds,
     initialize_or_resume_output,
+    kd_capacity_decision,
     normalize_common_optical,
+    objective_gradient_diagnostics,
     publish_epoch_commit,
     rebuild_metric_indexes,
     load_paired_checkpoint,
@@ -217,6 +219,48 @@ class PhaseDistillationRunnerTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(small, encoded[2:6, 3:7] & 1 != 0)
         np.testing.assert_array_equal(thin, encoded[2:6, 3:7] & 2 != 0)
+
+    def test_kd_capacity_decision_uses_last_ten_median_thresholds(self):
+        self.assertEqual(
+            kd_capacity_decision(1.0, [0.49] * 10)["outcome"],
+            "CLEAR_CAPACITY",
+        )
+        self.assertEqual(
+            kd_capacity_decision(1.0, [0.70] * 10)["outcome"],
+            "WEAK_CAPACITY",
+        )
+        self.assertEqual(
+            kd_capacity_decision(1.0, [0.90] * 10)["outcome"],
+            "NO_DEMONSTRATED_CAPACITY",
+        )
+
+    def test_initial_gradient_diagnostic_separates_zero_head_and_upstream(self):
+        torch.manual_seed(3)
+        branch = PhaseCorrectionBranch(
+            in_channels=4, hidden_channels=4, num_classes=2
+        )
+        base = torch.randn(1, 2, 8, 8)
+        teacher = base.clone()
+        teacher[:, 0] += 0.5
+        prepared = {
+            "base_logits": base,
+            "p2": torch.randn(1, 4, 4, 4),
+            "labels": torch.randint(0, 2, (1, 8, 8)),
+            "teacher_logits": teacher,
+            "kd_mask": torch.ones(1, 8, 8, dtype=torch.bool),
+        }
+        result = objective_gradient_diagnostics(
+            branch,
+            prepared,
+            torch.nn.CrossEntropyLoss(),
+        )
+        self.assertGreater(result["groups"]["output_head"]["supervised_norm"], 0.0)
+        self.assertGreater(result["groups"]["output_head"]["kd_norm"], 0.0)
+        self.assertEqual(result["groups"]["upstream"]["supervised_norm"], 0.0)
+        self.assertEqual(result["groups"]["upstream"]["kd_norm"], 0.0)
+        cosine = result["groups"]["all"]["cosine"]
+        self.assertGreaterEqual(cosine, -1.0)
+        self.assertLessEqual(cosine, 1.0)
 
     @staticmethod
     def _differences(pair, absolute, small=0.0, thin=0.0):

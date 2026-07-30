@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import random
+import statistics
 import subprocess
 import sys
 import time
@@ -1784,6 +1785,7 @@ def build_scientific_protocol(
 ) -> dict[str, Any]:
     return {
         "name": "WHU paired single-phase phase-distillation V1",
+        "execution_mode": args.mode,
         "evidence_scope": (
             "Exploratory test-selected method screen for deciding whether the route "
             "deserves more resources; not unbiased paper-level evidence."
@@ -1842,10 +1844,33 @@ def build_scientific_protocol(
         },
         "students": {
             "E0": "frozen once; eval for every forward; shared base logits and P2",
-            "R0": "zero-initialized correction branch + released CE+Dice",
-            "R1": "identical correction branch + released CE+Dice + masked phase KL",
-            "comparison": "R1-R0, with a separate R1-E0 absolute gate",
+            "R0": (
+                "combined diagnostic branch: released CE+Dice + masked phase KL"
+                if args.mode == "objective"
+                else "zero-initialized correction branch + released CE+Dice"
+            ),
+            "R1": (
+                "KD-only diagnostic branch from the identical initialization"
+                if args.mode == "objective"
+                else "identical correction branch + released CE+Dice + masked phase KL"
+            ),
+            "comparison": (
+                "KD-only capacity versus the unchanged combined objective"
+                if args.mode == "objective"
+                else "R1-R0, with a separate R1-E0 absolute gate"
+            ),
             "initial_branch": dict(initial_branch),
+            "mode_specific_arm_mapping": (
+                {
+                    "R0_slot": "combined CE+Dice+KD diagnostic arm",
+                    "R1_slot": "KD-only capacity diagnostic arm",
+                }
+                if args.mode == "objective"
+                else {
+                    "R0_slot": "R0 supervised-only arm",
+                    "R1_slot": "R1 supervised-plus-KD arm",
+                }
+            ),
         },
         "optimization": {
             "optimizer": "AdamW",
@@ -1887,7 +1912,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--structure-mask-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--mode", choices=("formal", "smoke", "overfit"), default="formal"
+        "--mode",
+        choices=("formal", "smoke", "overfit", "objective"),
+        default="formal",
     )
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--epochs", type=int, default=PROTOCOL_EPOCHS)
@@ -1948,6 +1975,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--smoke-steps must be within 1..5")
     if args.overfit_steps <= 0:
         parser.error("--overfit-steps must be positive")
+    if args.mode == "objective" and args.overfit_steps < 10:
+        parser.error("objective mode requires at least 10 steps")
     return args
 
 
@@ -2079,6 +2108,157 @@ def checkpoint_epoch_from_path(path: Path) -> int:
     return int(value)
 
 
+def objective_gradient_diagnostics(
+    branch: nn.Module,
+    prepared: Mapping[str, torch.Tensor],
+    supervised_loss: nn.Module,
+) -> dict[str, Any]:
+    """Measure supervision/KD gradient scale and alignment on one fixed state."""
+
+    branch.train()
+    parameters = tuple(branch.named_parameters())
+    logits = correction_logits(
+        prepared["base_logits"], prepared["p2"], branch
+    )
+    supervised = supervised_loss(logits, prepared["labels"])
+    kd = masked_kl_divergence(
+        logits,
+        prepared["teacher_logits"],
+        prepared["kd_mask"],
+        temperature=KD_TEMPERATURE,
+    )
+    tensors = tuple(parameter for _, parameter in parameters)
+    supervised_gradients = torch.autograd.grad(
+        supervised,
+        tensors,
+        retain_graph=True,
+        allow_unused=False,
+    )
+    kd_gradients = torch.autograd.grad(
+        kd,
+        tensors,
+        allow_unused=False,
+    )
+
+    def group_stats(group: str) -> dict[str, Any]:
+        selected: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for (name, _), supervised_gradient, kd_gradient in zip(
+            parameters, supervised_gradients, kd_gradients, strict=True
+        ):
+            is_output = name.startswith("output_projection.")
+            if group == "output_head" and not is_output:
+                continue
+            if group == "upstream" and is_output:
+                continue
+            if supervised_gradient is None or kd_gradient is None:
+                raise AssertionError(f"gradient graph is disconnected at {name}")
+            selected.append(
+                (
+                    supervised_gradient.detach().float().reshape(-1),
+                    kd_gradient.detach().float().reshape(-1),
+                )
+            )
+        supervised_sq = sum(
+            float((supervised_gradient * supervised_gradient).sum())
+            for supervised_gradient, _ in selected
+        )
+        kd_sq = sum(
+            float((kd_gradient * kd_gradient).sum())
+            for _, kd_gradient in selected
+        )
+        dot = sum(
+            float((supervised_gradient * kd_gradient).sum())
+            for supervised_gradient, kd_gradient in selected
+        )
+        supervised_norm = math.sqrt(max(supervised_sq, 0.0))
+        kd_norm = math.sqrt(max(kd_sq, 0.0))
+        denominator = supervised_norm * kd_norm
+        combined_dot_kd = dot + KD_WEIGHT * kd_sq
+        return {
+            "supervised_norm": supervised_norm,
+            "kd_norm": kd_norm,
+            "kd_over_supervised_norm": (
+                kd_norm / supervised_norm if supervised_norm > 0.0 else None
+            ),
+            "lambda_equal_norm": (
+                supervised_norm / kd_norm if kd_norm > 0.0 else None
+            ),
+            "cosine": dot / denominator if denominator > 0.0 else None,
+            "supervised_dot_kd": dot,
+            "euclidean_combined_dot_kd_at_lambda_1": combined_dot_kd,
+            "first_order_euclidean_step_reduces_kd": combined_dot_kd > 0.0,
+            "parameter_values": int(sum(pair[0].numel() for pair in selected)),
+        }
+
+    result = {
+        "supervised_loss": float(supervised.detach()),
+        "kd_loss": float(kd.detach()),
+        "groups": {
+            group: group_stats(group)
+            for group in ("all", "output_head", "upstream")
+        },
+    }
+    del logits, supervised, kd, supervised_gradients, kd_gradients
+    return result
+
+
+def objective_loss_snapshot(
+    branch: nn.Module,
+    prepared: Mapping[str, torch.Tensor],
+    supervised_loss: nn.Module,
+) -> dict[str, float]:
+    branch.eval()
+    with torch.no_grad():
+        logits = correction_logits(
+            prepared["base_logits"], prepared["p2"], branch
+        )
+        supervised = supervised_loss(logits, prepared["labels"])
+        kd = masked_kl_divergence(
+            logits,
+            prepared["teacher_logits"],
+            prepared["kd_mask"],
+            temperature=KD_TEMPERATURE,
+        )
+    return {
+        "supervised": float(supervised),
+        "kd": float(kd),
+        "combined": float(supervised + KD_WEIGHT * kd),
+    }
+
+
+def kd_capacity_decision(initial_kd: float, last_ten_kd: Sequence[float]) -> dict[str, Any]:
+    if not math.isfinite(initial_kd) or initial_kd <= 0.0:
+        raise ValueError("initial KD must be positive and finite")
+    if not last_ten_kd or any(
+        not math.isfinite(float(value)) or float(value) < 0.0
+        for value in last_ten_kd
+    ):
+        raise ValueError("last-ten KD values must be finite and non-negative")
+    median = float(statistics.median(float(value) for value in last_ten_kd))
+    reduction = 1.0 - median / float(initial_kd)
+    if reduction >= 0.50:
+        outcome = "CLEAR_CAPACITY"
+    elif reduction >= 0.20:
+        outcome = "WEAK_CAPACITY"
+    else:
+        outcome = "NO_DEMONSTRATED_CAPACITY"
+    return {
+        "outcome": outcome,
+        "initial_kd": float(initial_kd),
+        "last_ten_median_kd": median,
+        "reduction_fraction": reduction,
+        "reduction_percent": reduction * 100.0,
+        "thresholds": {
+            "weak_capacity_minimum_reduction_percent": 20.0,
+            "clear_capacity_minimum_reduction_percent": 50.0,
+            "nature": (
+                "pre-registered resource-screen heuristics for this fixed batch, "
+                "optimizer, and 100-step budget; not a universal capacity theorem"
+            ),
+        },
+    }
+
+
 def run_diagnostic_mode(
     args: argparse.Namespace,
     *,
@@ -2151,22 +2331,27 @@ def run_diagnostic_mode(
     total_kd_pixels = sum(int(record["kd_pixels"]) for record in step_records)
     if total_kd_pixels <= 0:
         raise RuntimeError("diagnostic batches contain zero teacher-gain pixels")
-    capacity = None
+    joint_objective_check = None
     if args.mode == "overfit":
-        capacity = {
+        last_ten_median = float(statistics.median(kd_values[-10:]))
+        joint_objective_check = {
             "initial_kd": kd_values[0],
             "final_kd": kd_values[-1],
             "minimum_kd": min(kd_values),
             "final_below_initial": kd_values[-1] < kd_values[0],
+            "last_ten_median_kd": last_ten_median,
+            "last_ten_median_below_initial": last_ten_median < kd_values[0],
+            "interpretation": (
+                "This is CE+Dice+KD joint-objective behavior, not a branch-capacity "
+                "test. Use objective mode for a separate KD-only capacity arm."
+            ),
         }
-        if not capacity["final_below_initial"]:
-            raise RuntimeError(f"fixed-batch capacity check did not reduce KD: {capacity}")
     result = {
         "status": "PASS",
         "mode": args.mode,
         "steps": steps,
         "mask_statistics": serialize_mask_counters(counters, cfg["labels"]),
-        "capacity_check": capacity,
+        "joint_objective_check": joint_objective_check,
         "runtime": {
             "elapsed_seconds": time.perf_counter() - started,
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3,
@@ -2174,6 +2359,190 @@ def run_diagnostic_mode(
         },
     }
     del fixed_prepared
+    return result
+
+
+def run_objective_diagnostic(
+    args: argparse.Namespace,
+    *,
+    dataset: WHUPhaseCropDataset,
+    loader: DataLoader,
+    extractor: FrozenE0P2Extractor,
+    combined_branch: nn.Module,
+    kd_only_branch: nn.Module,
+    combined_optimizer: torch.optim.Optimizer,
+    kd_only_optimizer: torch.optim.Optimizer,
+    supervised_loss: nn.Module,
+    device: torch.device,
+    cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Separate branch capacity from CE+Dice/KD scale and conflict."""
+
+    dataset.set_epoch(0)
+    fixed_batch = next(iter(loader))
+    prepared = prepare_training_batch(
+        fixed_batch,
+        extractor=extractor,
+        device=device,
+    )
+    if int(prepared["kd_mask"].sum()) <= 0:
+        raise RuntimeError("objective diagnostic fixed batch has zero KD pixels")
+    if branch_metadata(combined_branch) != branch_metadata(kd_only_branch):
+        raise AssertionError("objective diagnostic branches do not start identically")
+
+    counters = empty_mask_counters()
+    count_mask_statistics(
+        counters,
+        labels=prepared["labels"],
+        base_logits=prepared["base_logits"],
+        teacher_logits=prepared["teacher_logits"],
+        gain=prepared["gain"],
+        small=prepared["small"],
+        thin=prepared["thin"],
+    )
+    initial_combined = objective_loss_snapshot(
+        combined_branch, prepared, supervised_loss
+    )
+    initial_kd_only = objective_loss_snapshot(
+        kd_only_branch, prepared, supervised_loss
+    )
+    if initial_combined != initial_kd_only:
+        raise AssertionError("objective diagnostic initial losses differ")
+    gradient_probes = {
+        "step_0": {
+            "updates_completed": 0,
+            "combined_branch": objective_gradient_diagnostics(
+                combined_branch, prepared, supervised_loss
+            ),
+            "kd_only_branch": objective_gradient_diagnostics(
+                kd_only_branch, prepared, supervised_loss
+            ),
+        }
+    }
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    records: list[dict[str, Any]] = []
+    for step in range(1, args.overfit_steps + 1):
+        combined_branch.train()
+        kd_only_branch.train()
+        combined_optimizer.zero_grad(set_to_none=True)
+        kd_only_optimizer.zero_grad(set_to_none=True)
+
+        combined_logits = correction_logits(
+            prepared["base_logits"], prepared["p2"], combined_branch
+        )
+        combined_supervised = supervised_loss(
+            combined_logits, prepared["labels"]
+        )
+        combined_kd = masked_kl_divergence(
+            combined_logits,
+            prepared["teacher_logits"],
+            prepared["kd_mask"],
+            temperature=KD_TEMPERATURE,
+        )
+        combined_total = combined_supervised + KD_WEIGHT * combined_kd
+        if not torch.isfinite(combined_total):
+            raise RuntimeError("non-finite combined objective diagnostic loss")
+        combined_total.backward()
+        combined_optimizer.step()
+
+        kd_only_logits = correction_logits(
+            prepared["base_logits"], prepared["p2"], kd_only_branch
+        )
+        kd_only_kd = masked_kl_divergence(
+            kd_only_logits,
+            prepared["teacher_logits"],
+            prepared["kd_mask"],
+            temperature=KD_TEMPERATURE,
+        )
+        if not torch.isfinite(kd_only_kd):
+            raise RuntimeError("non-finite KD-only objective diagnostic loss")
+        kd_only_kd.backward()
+        kd_only_optimizer.step()
+
+        combined_after = objective_loss_snapshot(
+            combined_branch, prepared, supervised_loss
+        )
+        kd_only_after = objective_loss_snapshot(
+            kd_only_branch, prepared, supervised_loss
+        )
+        record = {
+            "step": step,
+            "combined_branch": combined_after,
+            "kd_only_branch": kd_only_after,
+        }
+        if step == 1:
+            record["batch"] = batch_input_hashes(fixed_batch)
+        records.append(record)
+        append_jsonl(args.output_dir / "objective_steps.jsonl", record)
+        if step in (1, 10, args.overfit_steps):
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+        if step == 10:
+            gradient_probes["step_10"] = {
+                "updates_completed": 10,
+                "combined_branch": objective_gradient_diagnostics(
+                    combined_branch, prepared, supervised_loss
+                ),
+                "kd_only_branch": objective_gradient_diagnostics(
+                    kd_only_branch, prepared, supervised_loss
+                ),
+            }
+
+    torch.cuda.synchronize(device)
+    kd_only_values = [
+        float(record["kd_only_branch"]["kd"]) for record in records
+    ]
+    combined_values = [
+        float(record["combined_branch"]["kd"]) for record in records
+    ]
+    decision = kd_capacity_decision(
+        float(initial_kd_only["kd"]),
+        kd_only_values[-10:],
+    )
+    result = {
+        "status": "PASS",
+        "mode": "objective",
+        "steps": args.overfit_steps,
+        "scientific_question": (
+            "Does the fixed P2 branch have KD capacity independently of the "
+            "released CE+Dice objective, and how do the two gradients interact?"
+        ),
+        "fixed_variables": {
+            "same_cached_batch": True,
+            "same_zero_initialization": True,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "temperature": KD_TEMPERATURE,
+            "lambda_in_combined_branch": KD_WEIGHT,
+            "hyperparameter_sweep": False,
+        },
+        "initial": {
+            "combined_branch": initial_combined,
+            "kd_only_branch": initial_kd_only,
+        },
+        "capacity_decision": decision,
+        "combined_kd_behavior": {
+            "final_kd": combined_values[-1],
+            "minimum_kd": min(combined_values),
+            "minimum_step": combined_values.index(min(combined_values)) + 1,
+            "last_ten_median_kd": float(statistics.median(combined_values[-10:])),
+        },
+        "kd_only_behavior": {
+            "final_kd": kd_only_values[-1],
+            "minimum_kd": min(kd_only_values),
+            "minimum_step": kd_only_values.index(min(kd_only_values)) + 1,
+        },
+        "gradient_probes": gradient_probes,
+        "mask_statistics": serialize_mask_counters(counters, cfg["labels"]),
+        "runtime": {
+            "elapsed_seconds": time.perf_counter() - started,
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 1024**3,
+        },
+    }
+    del prepared
     return result
 
 
@@ -2526,6 +2895,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             expected_e0_state=e0_before,
         )
         summary_path = args.output_dir / f"stage_e{args.stop_after_epoch}_summary.json"
+    elif args.mode == "objective":
+        result = run_objective_diagnostic(
+            args,
+            dataset=dataset,
+            loader=loader,
+            extractor=extractor,
+            combined_branch=r0_branch,
+            kd_only_branch=r1_branch,
+            combined_optimizer=optimizer0,
+            kd_only_optimizer=optimizer1,
+            supervised_loss=cfg["loss_fn"],
+            device=device,
+            cfg=cfg,
+        )
+        summary_path = args.output_dir / "objective_summary.json"
     else:
         result = run_diagnostic_mode(
             args,
