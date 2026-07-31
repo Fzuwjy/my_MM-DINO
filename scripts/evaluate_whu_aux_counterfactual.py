@@ -277,6 +277,7 @@ def main() -> None:
     del checkpoint
 
     released_weight_summary = modality_weight_summary(model.adapter)
+    reference_feature_off_weights = None
     effective_weight_summary = (
         released_weight_summary if inference_num_modalities > 1 else None
     )
@@ -290,6 +291,10 @@ def main() -> None:
             auxiliary_scale=auxiliary_scale,
         )
     if args.condition == "rgb-only-fusion-preserved":
+        reference_feature_off_weights = modality_weight_summary(
+            model.adapter,
+            auxiliary_scale=0.0,
+        )
         model.decoder = FusionPreservingSingleInputDecoder(
             model.decoder,
             num_modalities=2,
@@ -346,6 +351,12 @@ def main() -> None:
         "auxiliary_scale": auxiliary_scale,
         "released_adapter_weights": released_weight_summary,
         "effective_adapter_weights": effective_weight_summary,
+        "equivalent_reference_condition": (
+            "aux-feature-off"
+            if args.condition == "rgb-only-fusion-preserved"
+            else None
+        ),
+        "reference_feature_off_weights": reference_feature_off_weights,
         "evaluation_function": "tasks/segmentation/train_multi.py:test",
         "evaluation_inference_batch_size": RELEASED_INFERENCE_BATCH_SIZE,
         **{name: float(value) for name, value in metrics.items()},

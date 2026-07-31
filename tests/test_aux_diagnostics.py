@@ -237,6 +237,9 @@ class AuxDiagnosticsTest(unittest.TestCase):
         )(rgb_only)
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
+        with self.assertRaisesRegex(ValueError, "exactly two modalities"):
+            FusionPreservingSingleInputDecoder(decoder, num_modalities=3)
+
     def test_checkpoint_profiles_lock_our_two_multimodal_runs(self):
         self.assertEqual(
             MODEL_PROFILES["vitl-lora"],

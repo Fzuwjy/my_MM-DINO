@@ -104,6 +104,8 @@ def main() -> None:
     )
     rgb_multi, sar, label_multi = multimodal_dataset[0]
     rgb_only, label_rgb_only = rgb_only_dataset[0]
+    if getattr(rgb_only_dataset, "sar_files", None) not in (None, []):
+        raise AssertionError("RGB-only dataset still contains SAR file paths")
     if not torch.equal(rgb_multi, rgb_only):
         raise AssertionError("Multimodal and RGB-only dataset RGB tensors differ")
     if not np.array_equal(np.asarray(label_multi), np.asarray(label_rgb_only)):
@@ -115,6 +117,8 @@ def main() -> None:
     width -= width % 16
     rgb = rgb_multi[:, :height, :width].unsqueeze(0).cuda()
     auxiliary = sar[:, :height, :width].unsqueeze(0).cuda()
+    if not bool(torch.isfinite(rgb).all()) or not bool(torch.isfinite(auxiliary).all()):
+        raise AssertionError("Smoke inputs must be finite")
 
     model = cfg["model"].cuda()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -126,17 +130,47 @@ def main() -> None:
 
     released_adapter = model.adapter
     released_decoder = model.decoder
+    if bool(getattr(released_adapter, "use_naf", False)):
+        raise AssertionError("Fusion equivalence has not been proven for NAF adapters")
+
+    backbone_calls: list[torch.Tensor] = []
+    released_get_intermediate_layers = model.backbone.get_intermediate_layers
+
+    def counted_get_intermediate_layers(input_tensor, *args, **kwargs):
+        backbone_calls.append(input_tensor.detach().clone())
+        return released_get_intermediate_layers(input_tensor, *args, **kwargs)
+
+    model.backbone.get_intermediate_layers = counted_get_intermediate_layers
     with torch.no_grad():
         model.adapter = ScaledSampleAdapter(
             released_adapter, auxiliary_scale=0.0
         )
         feature_off_logits = model(rgb, auxiliary)
+        feature_off_backbone_calls = len(backbone_calls)
 
         model.adapter = released_adapter
         model.decoder = FusionPreservingSingleInputDecoder(
             released_decoder, num_modalities=2
         )
+        backbone_calls.clear()
         fusion_preserved_logits = model(rgb)
+        fusion_preserved_backbone_calls = len(backbone_calls)
+
+    if feature_off_backbone_calls != 2:
+        raise AssertionError(
+            f"Feature-off reference used {feature_off_backbone_calls} backbone calls"
+        )
+    if fusion_preserved_backbone_calls != 1:
+        raise AssertionError(
+            "Fusion-preserved path must use exactly one backbone call, got "
+            f"{fusion_preserved_backbone_calls}"
+        )
+    if not torch.equal(backbone_calls[0], rgb):
+        raise AssertionError("Fusion-preserved backbone input is not the RGB tensor")
+    if not bool(torch.isfinite(feature_off_logits).all()) or not bool(
+        torch.isfinite(fusion_preserved_logits).all()
+    ):
+        raise AssertionError("Smoke logits must be finite")
 
     difference = (feature_off_logits - fusion_preserved_logits).abs()
     exact_logits = bool(torch.equal(feature_off_logits, fusion_preserved_logits))
@@ -159,6 +193,8 @@ def main() -> None:
         "max_abs_logit_difference": float(difference.max().item()),
         "mean_abs_logit_difference": float(difference.mean().item()),
         "exact_argmax_predictions": exact_predictions,
+        "feature_off_backbone_calls": feature_off_backbone_calls,
+        "fusion_preserved_backbone_calls": fusion_preserved_backbone_calls,
         "sar_loaded_for_reference_only": True,
         "sar_encoded_by_fusion_preserved_path": False,
     }

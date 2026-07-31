@@ -470,8 +470,13 @@ class FusionPreservingSingleInputDecoder(nn.Module):
 
     def __init__(self, delegate: nn.Module, *, num_modalities: int):
         super().__init__()
-        if num_modalities < 2:
-            raise ValueError("Fusion preservation requires a multimodal Decoder")
+        if num_modalities != 2:
+            raise ValueError(
+                "Fusion preservation is proven only for exactly two modalities"
+            )
+        delegate_modalities = getattr(delegate, "num_modalities", None)
+        if delegate_modalities is not None and int(delegate_modalities) != 2:
+            raise ValueError("Delegate Decoder is not the trained two-slot path")
         self.delegate = delegate
         self.num_modalities = int(num_modalities)
 
