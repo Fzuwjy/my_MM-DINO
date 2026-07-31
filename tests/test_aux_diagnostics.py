@@ -17,6 +17,7 @@ from scripts.aux_diagnostics_common import (
     modality_weight_summary,
 )
 from scripts.evaluate_whu_aux_counterfactual import (
+    MODEL_PROFILES,
     _condition_auxiliary_scale,
     _condition_input_modalities,
 )
@@ -200,6 +201,24 @@ class AuxDiagnosticsTest(unittest.TestCase):
             aux_weight_scale = None
 
         self.assertIsNone(_condition_auxiliary_scale(Args()))
+
+    def test_checkpoint_profiles_lock_our_two_multimodal_runs(self):
+        self.assertEqual(
+            MODEL_PROFILES["vitl-lora"],
+            {
+                "backbone_type": "dinov3_vitl16",
+                "use_lora": True,
+                "lora_rank": 3,
+            },
+        )
+        self.assertEqual(
+            MODEL_PROFILES["vits-frozen"],
+            {
+                "backbone_type": "dinov3_vits16",
+                "use_lora": False,
+                "lora_rank": None,
+            },
+        )
 
     def test_released_transforms_share_geometry_and_preserve_label_interpolation(self):
         source = (

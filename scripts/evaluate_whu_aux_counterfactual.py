@@ -33,6 +33,18 @@ from scripts.aux_diagnostics_common import (
 SEED = 42
 RELEASED_CONFIG_BATCH_SIZE = 8
 RELEASED_INFERENCE_BATCH_SIZE = 32
+MODEL_PROFILES = {
+    "vitl-lora": {
+        "backbone_type": "dinov3_vitl16",
+        "use_lora": True,
+        "lora_rank": 3,
+    },
+    "vits-frozen": {
+        "backbone_type": "dinov3_vits16",
+        "use_lora": False,
+        "lora_rank": None,
+    },
+}
 CONDITIONS = (
     "normal",
     "rgb-only-native",
@@ -73,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--condition", choices=CONDITIONS, required=True)
+    parser.add_argument(
+        "--model-profile",
+        choices=tuple(MODEL_PROFILES),
+        default="vitl-lora",
+        help="Locked architecture profile matching the evaluated checkpoint",
+    )
     parser.add_argument("--aux-weight-scale", type=float)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
@@ -156,6 +174,7 @@ def main() -> None:
     args = parse_args()
     auxiliary_scale = _condition_auxiliary_scale(args)
     inference_num_modalities = _condition_input_modalities(args.condition)
+    model_profile = MODEL_PROFILES[args.model_profile]
     checkpoint_path = args.checkpoint_path.expanduser().resolve()
     output_path = args.output_path.expanduser().resolve()
     if not checkpoint_path.is_file():
@@ -189,9 +208,9 @@ def main() -> None:
         "DINOv3",
         "WHU",
         num_modalities=2,
-        use_lora=True,
-        r=3,
-        backbone_type="dinov3_vitl16",
+        use_lora=model_profile["use_lora"],
+        r=model_profile["lora_rank"],
+        backbone_type=model_profile["backbone_type"],
     )
     if cfg.get("batch_size") != RELEASED_CONFIG_BATCH_SIZE:
         raise RuntimeError(
@@ -205,7 +224,7 @@ def main() -> None:
         window_size=cfg["window_size"],
         model_name="DINOv3",
         modality="multi" if inference_num_modalities > 1 else None,
-        backbone_type="dinov3_vitl16",
+        backbone_type=model_profile["backbone_type"],
     )
     if args.condition in ("aux-mean", "aux-shuffle"):
         shuffle_group_keys = (
@@ -273,6 +292,7 @@ def main() -> None:
     official_trainer.NUM_MODALITIES = inference_num_modalities
 
     print(f"checkpoint={checkpoint_path}")
+    print(f"model_profile={args.model_profile}")
     print(f"condition={args.condition}")
     print(f"inference_num_modalities={inference_num_modalities}")
     print("evaluation_function=train_multi.test")
@@ -295,12 +315,13 @@ def main() -> None:
         "checkpoint_bytes": checkpoint_path.stat().st_size,
         "model_name": "DINOv3",
         "dataset_name": "WHU",
+        "model_profile": args.model_profile,
         "num_modalities": 2,
         "checkpoint_num_modalities": 2,
         "inference_num_modalities": inference_num_modalities,
-        "backbone_type": "dinov3_vitl16",
-        "use_lora": True,
-        "lora_rank": 3,
+        "backbone_type": model_profile["backbone_type"],
+        "use_lora": model_profile["use_lora"],
+        "lora_rank": model_profile["lora_rank"],
         "condition": args.condition,
         "seed": args.seed,
         "dataset_condition": condition_metadata,

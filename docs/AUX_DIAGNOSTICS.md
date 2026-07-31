@@ -114,6 +114,20 @@ torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_aux_counterfactual
   --output-path /root/autodl-tmp/mm-dino/outputs/aux-diagnostics/whu_rgb_only_native.json
 ```
 
+The same audit can reuse our faithful frozen ViT-S epoch-45 checkpoint by
+changing only the locked model profile, checkpoint, and output path:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_aux_counterfactual.py \
+  --model-profile vits-frozen \
+  --checkpoint-path /root/autodl-tmp/mm-dino/outputs/faithful-whu-author-protocol/DINOv3/WHU_20260727_221644/DINOv3_WHU_e45_mIoU54.15.pth \
+  --condition rgb-only-native \
+  --output-path /root/autodl-tmp/mm-dino/outputs/aux-diagnostics/whu_vits_rgb_only_native.json
+```
+
 This is a missing-modality inference baseline, not an independently trained
 RGB-only model.  It differs from `aux-feature-off`: the latter keeps the
 multimodal Decoder/SE-fusion execution and removes SAR only at fusion, whereas
