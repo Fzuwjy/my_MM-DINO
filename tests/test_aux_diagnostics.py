@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from scripts.aux_diagnostics_common import (
     AuxiliaryConditionDataset,
+    FusionPreservingSingleInputDecoder,
     ScaledSampleAdapter,
     array_summary,
     edge_alignment_summary,
@@ -58,6 +59,14 @@ class ReferenceAdapter(nn.Module):
         )
 
     def forward(self, *features_list, patch_h=None, patch_w=None):
+        if len(features_list) == 1:
+            outputs = []
+            for layer_index, feature in enumerate(features_list[0]):
+                feature = feature.permute(0, 2, 1).reshape(
+                    feature.shape[0], feature.shape[-1], patch_h, patch_w
+                )
+                outputs.append(self.projects[layer_index](feature))
+            return outputs
         outputs = [[] for _ in features_list]
         for layer_index, modality_features in enumerate(zip(*features_list)):
             processed = []
@@ -79,6 +88,11 @@ class ReferenceAdapter(nn.Module):
             for output in outputs:
                 output.append(fused)
         return outputs
+
+
+class SumDecoder(nn.Module):
+    def forward(self, *modalities):
+        return sum(modality[0] for modality in modalities)
 
 
 class AuxDiagnosticsTest(unittest.TestCase):
@@ -194,6 +208,9 @@ class AuxDiagnosticsTest(unittest.TestCase):
 
     def test_native_rgb_only_condition_uses_one_inference_modality(self):
         self.assertEqual(_condition_input_modalities("rgb-only-native"), 1)
+        self.assertEqual(
+            _condition_input_modalities("rgb-only-fusion-preserved"), 1
+        )
         self.assertEqual(_condition_input_modalities("normal"), 2)
 
         class Args:
@@ -201,6 +218,24 @@ class AuxDiagnosticsTest(unittest.TestCase):
             aux_weight_scale = None
 
         self.assertIsNone(_condition_auxiliary_scale(Args()))
+
+    def test_rgb_only_fusion_preserved_matches_feature_off_endpoint(self):
+        torch.manual_seed(13)
+        adapter = ReferenceAdapter()
+        rgb = [torch.randn(1, 4, 2)]
+        auxiliary = [torch.randn(1, 4, 2)]
+
+        feature_off = ScaledSampleAdapter(adapter, auxiliary_scale=0.0)(
+            rgb, auxiliary, patch_h=2, patch_w=2
+        )
+        rgb_only = adapter(rgb, patch_h=2, patch_w=2)
+
+        decoder = SumDecoder()
+        expected = decoder(*feature_off)
+        actual = FusionPreservingSingleInputDecoder(
+            decoder, num_modalities=2
+        )(rgb_only)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
     def test_checkpoint_profiles_lock_our_two_multimodal_runs(self):
         self.assertEqual(

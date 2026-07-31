@@ -23,6 +23,9 @@ The conditions have distinct meanings:
 - `rgb-only-native`: loads the multimodal checkpoint unchanged but calls
   `model(rgb)` through its released single-input path.  It does not load or
   encode SAR and it bypasses the multimodal SE-fusion path;
+- `rgb-only-fusion-preserved`: also loads and encodes RGB only, but duplicates
+  the projected RGB pyramid into the trained multimodal Decoder slots.  It is
+  designed to be logit-equivalent to `aux-feature-off` without computing SAR;
 - `aux-feature-off`: sets the Aux global fusion scale to zero and renormalizes
   RGB, rather than feeding an arbitrary zero-valued sensor image;
 - `aux-weight-scale`: scans simple global Aux reweighting as a sanity control.
@@ -133,6 +136,24 @@ RGB-only model.  It differs from `aux-feature-off`: the latter keeps the
 multimodal Decoder/SE-fusion execution and removes SAR only at fusion, whereas
 `rgb-only-native` skips the SAR backbone and exercises the released single-input
 Adapter/Decoder branch.
+
+Use `--condition rgb-only-fusion-preserved` when the scientific question is
+"remove SAR while keeping the trained multimodal fusion/Decoder endpoint
+unchanged."  This condition must pass the real-checkpoint logit-equivalence
+smoke before a full result is interpreted.
+
+Real-checkpoint equivalence smoke:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+cd /root/my_MM-DINO-multitrain-unimodal
+python scripts/smoke_whu_rgb_only_fusion_equivalence.py \
+  --model-profile vitl-lora \
+  --checkpoint-path /root/autodl-tmp/mm-dino/outputs/faithful-whu-author-protocol/DINOv3/WHU_20260728_021847/DINOv3_WHU_e45_mIoU55.58.pth \
+  --output-path /root/autodl-tmp/mm-dino/outputs/aux-diagnostics/smoke_vitl_rgb_only_fusion_equivalence.json
+```
 
 Use the same command with `--condition aux-mean` and
 `--condition aux-shuffle`, changing the output filename each time.  Global

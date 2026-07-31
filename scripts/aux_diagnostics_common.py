@@ -456,3 +456,29 @@ class ScaledSampleAdapter(nn.Module):
             for output in outputs:
                 output.append(fused)
         return outputs
+
+
+class FusionPreservingSingleInputDecoder(nn.Module):
+    """Route one RGB feature pyramid through the trained multimodal Decoder.
+
+    The released multimodal SampleAdapter writes the same fused feature pyramid
+    into every output slot.  With the auxiliary fusion weight set to zero and
+    RGB renormalized to one, both slots therefore contain exactly the RGB-only
+    projected pyramid.  This wrapper reproduces that downstream call while
+    allowing the outer model to encode only RGB once.
+    """
+
+    def __init__(self, delegate: nn.Module, *, num_modalities: int):
+        super().__init__()
+        if num_modalities < 2:
+            raise ValueError("Fusion preservation requires a multimodal Decoder")
+        self.delegate = delegate
+        self.num_modalities = int(num_modalities)
+
+    def forward(self, *modalities: Sequence[torch.Tensor]) -> Any:
+        if len(modalities) != 1:
+            raise ValueError(
+                "Fusion-preserved RGB-only inference expects exactly one "
+                f"feature pyramid, got {len(modalities)}"
+            )
+        return self.delegate(*([modalities[0]] * self.num_modalities))

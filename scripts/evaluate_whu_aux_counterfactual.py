@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.aux_diagnostics_common import (
     AuxiliaryConditionDataset,
+    FusionPreservingSingleInputDecoder,
     ScaledSampleAdapter,
     modality_weight_summary,
 )
@@ -48,6 +49,7 @@ MODEL_PROFILES = {
 CONDITIONS = (
     "normal",
     "rgb-only-native",
+    "rgb-only-fusion-preserved",
     "aux-mean",
     "aux-shuffle",
     "aux-feature-off",
@@ -64,7 +66,15 @@ def _condition_input_modalities(condition: str) -> int:
     single-input Adapter/Decoder behavior instead of the multimodal SE fusion.
     """
 
-    return 1 if condition == "rgb-only-native" else 2
+    return 1 if condition.startswith("rgb-only-") else 2
+
+
+def _condition_decoder_path(condition: str) -> str:
+    if condition == "rgb-only-native":
+        return "native-single-input"
+    if condition == "rgb-only-fusion-preserved":
+        return "trained-multimodal-fusion"
+    return "trained-multimodal-fusion"
 
 
 def seed_model_initialization(seed: int) -> None:
@@ -279,6 +289,11 @@ def main() -> None:
             model.adapter,
             auxiliary_scale=auxiliary_scale,
         )
+    if args.condition == "rgb-only-fusion-preserved":
+        model.decoder = FusionPreservingSingleInputDecoder(
+            model.decoder,
+            num_modalities=2,
+        )
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -295,6 +310,7 @@ def main() -> None:
     print(f"model_profile={args.model_profile}")
     print(f"condition={args.condition}")
     print(f"inference_num_modalities={inference_num_modalities}")
+    print(f"decoder_path={_condition_decoder_path(args.condition)}")
     print("evaluation_function=train_multi.test")
     print(f"evaluation_inference_batch_size={RELEASED_INFERENCE_BATCH_SIZE}")
     print(json.dumps({"effective_weights": effective_weight_summary}, indent=2))
@@ -319,6 +335,8 @@ def main() -> None:
         "num_modalities": 2,
         "checkpoint_num_modalities": 2,
         "inference_num_modalities": inference_num_modalities,
+        "sar_backbone_executed": inference_num_modalities > 1,
+        "decoder_path": _condition_decoder_path(args.condition),
         "backbone_type": model_profile["backbone_type"],
         "use_lora": model_profile["use_lora"],
         "lora_rank": model_profile["lora_rank"],
