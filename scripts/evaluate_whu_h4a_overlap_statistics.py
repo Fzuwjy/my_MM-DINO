@@ -451,6 +451,11 @@ def _image_result(
             )
             for name in SCORE_NAMES
         }
+        report_only_top10 = finite_or_none(
+            summaries["report_only"][
+                "overlap_jsd_normalized_top10pct_mean"
+            ][local_index]
+        )
         cell_records.append(
             {
                 "cell_index": int(cell["cell_index"]),
@@ -467,6 +472,10 @@ def _image_result(
                         else None
                     )
                     for name in SCORE_NAMES
+                },
+                "report_only": {
+                    "overlap_jsd_normalized_top10pct_mean": report_only_top10,
+                    "role": summaries["report_only"]["role"],
                 },
             }
         )
@@ -633,6 +642,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "4*q*(1-q) for per-crop semantic-boundary votes, cell mean "
                 "where at least two crop-interior boundary observations exist"
             ),
+        },
+        "report_only": {
+            "overlap_jsd_normalized_top10pct_mean": (
+                "cell upper 10% mean on the normalized JSD map; frozen dilution "
+                "diagnostic only and forbidden from H4-A ranking/selection"
+            )
         },
         "residue_role": (
             "origin modulo 16 is stored as mechanism metadata, not screened as "

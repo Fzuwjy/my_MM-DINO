@@ -29,6 +29,14 @@ SCORE_NAMES = (
     "boundary_response_disagreement",
 )
 
+RESPONSE_SCORE_NAMES = (
+    "k1_minus_k2_entropy",
+    "k2_minus_k1_margin",
+    "k1_kx_jsd_normalized",
+    "k1_kx_argmax_flip_rate",
+    "k1_k2_argmax_flip_rate",
+)
+
 
 def array_sha256(array: np.ndarray) -> str:
     """Hash a contiguous array using the same byte-level convention as Stage A."""
@@ -145,6 +153,199 @@ def _masked_cell_reduction(
                 np.mean(score[local][local_mask], dtype=np.float64)
             )
     return means, counts, areas
+
+
+def _masked_cell_top_fraction_mean(
+    values: np.ndarray,
+    valid: np.ndarray,
+    cell_bounds: np.ndarray,
+    common_bounds: tuple[int, int, int, int],
+    *,
+    fraction: float,
+) -> np.ndarray:
+    """Return a report-only upper-tail mean for every ownership rectangle."""
+
+    if not 0.0 < float(fraction) <= 1.0:
+        raise ValueError("fraction must lie in (0,1]")
+    score = np.asarray(values)
+    mask = np.asarray(valid)
+    bounds = np.asarray(cell_bounds)
+    cy0, cy1, cx0, cx1 = common_bounds
+    if score.shape != mask.shape or mask.dtype != np.bool_:
+        raise ValueError("tail score and bool mask must have identical shapes")
+    result = np.full(len(bounds), np.nan, dtype=np.float64)
+    for index, raw in enumerate(bounds):
+        y0, y1, x0, x1 = (int(item) for item in raw)
+        iy0, iy1 = max(y0, cy0), min(y1, cy1)
+        ix0, ix1 = max(x0, cx0), min(x1, cx1)
+        if iy0 >= iy1 or ix0 >= ix1:
+            continue
+        local = (
+            slice(iy0 - cy0, iy1 - cy0),
+            slice(ix0 - cx0, ix1 - cx0),
+        )
+        selected = score[local][mask[local]]
+        if not len(selected):
+            continue
+        count = max(1, int(math.ceil(len(selected) * float(fraction))))
+        split = len(selected) - count
+        upper = np.partition(selected, split)[split:]
+        result[index] = float(np.mean(upper, dtype=np.float64))
+    return result
+
+
+def _entropy(probabilities: np.ndarray) -> np.ndarray:
+    return -(
+        probabilities
+        * np.log(np.clip(probabilities, np.float32(1e-12), None))
+    ).sum(axis=0, dtype=np.float32)
+
+
+def _margin(probabilities: np.ndarray) -> np.ndarray:
+    partitioned = np.partition(probabilities, -2, axis=0)
+    return (
+        partitioned[-1].astype(np.float32, copy=False)
+        - partitioned[-2].astype(np.float32, copy=False)
+    )
+
+
+def phase_response_cell_summaries(
+    k1_logits: np.ndarray,
+    kx_logits: np.ndarray,
+    cell_bounds: np.ndarray,
+    common_bounds: Sequence[int],
+) -> dict[str, Any]:
+    """Reduce frozen K1/x8/K2 response maps over ownership cells.
+
+    ``K2`` follows the released arithmetic mean of aligned float32 logits.
+    Entropy and margin are computed after softmax of that mean.  JSD and class
+    flips are response-strength diagnostics only; the signed entropy change is
+    the preregistered H4-B primary direction.
+    """
+
+    first = np.asarray(k1_logits)
+    shifted = np.asarray(kx_logits)
+    if first.dtype != np.float32 or shifted.dtype != np.float32:
+        raise TypeError("aligned K1/x8 logits must be float32")
+    if first.shape != shifted.shape or first.ndim != 3:
+        raise ValueError("aligned K1/x8 logits must share [class,height,width]")
+    cy0, cy1, cx0, cx1 = _bounds4(common_bounds, name="common bounds")
+    if first.shape[1:] != (cy1 - cy0, cx1 - cx0):
+        raise ValueError("aligned logits shape differs from common bounds")
+
+    p1 = stable_softmax(first)
+    px = stable_softmax(shifted)
+    k2_logits = np.asarray((first + shifted) * np.float32(0.5), dtype=np.float32)
+    p2 = stable_softmax(k2_logits)
+    entropy1 = _entropy(p1)
+    entropyx = _entropy(px)
+    entropy2 = _entropy(p2)
+    mixture = np.asarray((p1 + px) * np.float32(0.5), dtype=np.float32)
+    jsd = np.maximum(
+        _entropy(mixture) - np.float32(0.5) * (entropy1 + entropyx), 0.0
+    ) / np.float32(math.log(2.0))
+    np.clip(jsd, 0.0, 1.0, out=jsd)
+    prediction1 = first.argmax(axis=0)
+    predictionx = shifted.argmax(axis=0)
+    prediction2 = k2_logits.argmax(axis=0)
+    maps = {
+        RESPONSE_SCORE_NAMES[0]: entropy1 - entropy2,
+        RESPONSE_SCORE_NAMES[1]: _margin(p2) - _margin(p1),
+        RESPONSE_SCORE_NAMES[2]: jsd,
+        RESPONSE_SCORE_NAMES[3]: (prediction1 != predictionx).astype(np.float32),
+        RESPONSE_SCORE_NAMES[4]: (prediction1 != prediction2).astype(np.float32),
+    }
+    valid = np.ones(first.shape[1:], dtype=np.bool_)
+    means = {}
+    counts = None
+    areas = None
+    for name, values in maps.items():
+        score_means, score_counts, score_areas = _masked_cell_reduction(
+            np.asarray(values, dtype=np.float32),
+            valid,
+            np.asarray(cell_bounds),
+            (cy0, cy1, cx0, cx1),
+        )
+        means[name] = score_means
+        if counts is None:
+            counts, areas = score_counts, score_areas
+        elif not np.array_equal(counts, score_counts) or not np.array_equal(
+            areas, score_areas
+        ):
+            raise AssertionError("phase-response cell supports differ by score")
+    return {
+        "score_means": means,
+        "valid_pixels": counts,
+        "common_intersection_pixels": areas,
+        "map_diagnostics": {
+            name: {
+                "minimum": float(np.min(values)),
+                "maximum": float(np.max(values)),
+                "mean": float(np.mean(values, dtype=np.float64)),
+            }
+            for name, values in maps.items()
+        },
+    }
+
+
+class LogitSlideAccumulator:
+    """Minimal float32 sum/count accumulator for one shifted-canvas phase."""
+
+    def __init__(self, image_shape: Sequence[int], num_classes: int) -> None:
+        if len(image_shape) != 2:
+            raise ValueError("image_shape must contain height,width")
+        self.height, self.width = (int(value) for value in image_shape)
+        self.num_classes = int(num_classes)
+        if min(self.height, self.width) <= 0 or self.num_classes < 2:
+            raise ValueError("image shape and class count must be positive")
+        self.logit_sum = np.zeros(
+            (self.num_classes, self.height, self.width), dtype=np.float32
+        )
+        self.crop_count = np.zeros((self.height, self.width), dtype=np.uint8)
+        self.windows: list[tuple[int, int, int, int]] = []
+
+    def add_crop(self, logits: np.ndarray, window: Sequence[int]) -> None:
+        y0, y1, x0, x1 = _bounds4(window, name="crop window")
+        if y1 > self.height or x1 > self.width:
+            raise ValueError("crop window exceeds the image")
+        values = np.asarray(logits)
+        expected = (self.num_classes, y1 - y0, x1 - x0)
+        if values.dtype != np.float32 or values.shape != expected:
+            raise ValueError("shifted crop logits must preserve float32 shape")
+        if not np.all(np.isfinite(values)):
+            raise FloatingPointError("shifted crop logits contain non-finite values")
+        region = (slice(y0, y1), slice(x0, x1))
+        self.logit_sum[:, region[0], region[1]] += values
+        self.crop_count[region] += 1
+        self.windows.append((y0, y1, x0, x1))
+
+    def add_batch(
+        self, logits: np.ndarray, windows: Sequence[Sequence[int]]
+    ) -> None:
+        values = np.asarray(logits)
+        if values.ndim != 4 or len(values) != len(windows):
+            raise ValueError("shifted batch and windows have different shapes")
+        for crop, window in zip(values, windows, strict=True):
+            self.add_crop(crop, window)
+
+    def normalized_logits(self, bounds: Sequence[int]) -> np.ndarray:
+        y0, y1, x0, x1 = _bounds4(bounds, name="normalization bounds")
+        if y1 > self.height or x1 > self.width:
+            raise ValueError("normalization bounds exceed the image")
+        count = self.crop_count[y0:y1, x0:x1]
+        if np.any(count == 0):
+            raise AssertionError("requested shifted support contains uncovered pixels")
+        result = np.array(
+            self.logit_sum[:, y0:y1, x0:x1],
+            dtype=np.float32,
+            copy=True,
+            order="C",
+        )
+        result /= count[None]
+        return result
+
+    def storage_nbytes(self) -> int:
+        return int(self.logit_sum.nbytes + self.crop_count.nbytes)
 
 
 class OverlapDisagreementAccumulator:
@@ -332,6 +533,14 @@ class OverlapDisagreementAccumulator:
             score_counts[name] = counts
             score_areas[name] = areas
 
+        jsd_top10 = _masked_cell_top_fraction_mean(
+            jsd_normalized,
+            overlap_valid,
+            np.asarray(cell_bounds),
+            (cy0, cy1, cx0, cx1),
+            fraction=0.10,
+        )
+
         common_histogram = {
             str(value): int(np.count_nonzero(count == value))
             for value in sorted(int(item) for item in np.unique(count))
@@ -340,6 +549,13 @@ class OverlapDisagreementAccumulator:
             "score_means": score_means,
             "score_valid_pixels": score_counts,
             "score_common_intersection_pixels": score_areas,
+            "report_only": {
+                "overlap_jsd_normalized_top10pct_mean": jsd_top10,
+                "role": (
+                    "frozen dilution diagnostic only; never used for ranking, "
+                    "q selection, random control, or H4-A Go/No-Go"
+                ),
+            },
             "coverage": {
                 "common_pixels": int(count.size),
                 "overlap_pixels": int(np.count_nonzero(overlap_valid)),

@@ -2,7 +2,8 @@
 
 The full-test score artifact is joined to the sealed Stage-A cells by immutable
 cell indices.  Each of the three frozen response scores is screened separately;
-the primary normalized overlap JSD alone controls the H4-A/H4-B decision.
+the primary normalized overlap JSD alone controls H4-A.  H4-B is an independent
+K2-observed screen and remains pre-authorized regardless of this result.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from scripts.phase_overlap_common import SCORE_NAMES  # noqa: E402
 SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "whu_h4a_k1_overlap_disagreement_screen"
 EXPECTED_SCORE_TYPE = "whu_h4a_k1_overlap_disagreement"
+EXPECTED_COMBINED_SCORE_TYPE = "whu_h4ab_k1_x8_response_statistics"
 SCORE_SPECS = (
     ("overlap_jsd", SCORE_NAMES[0]),
     ("argmax_vote_disagreement", SCORE_NAMES[1]),
@@ -124,12 +126,16 @@ def _join_scores(
     *,
     stage_a_sha: str,
 ) -> dict[str, Any]:
+    artifact_type = statistics.get("artifact_type")
+    combined = artifact_type == EXPECTED_COMBINED_SCORE_TYPE
     checks = {
-        "artifact_type": statistics.get("artifact_type") == EXPECTED_SCORE_TYPE,
+        "artifact_type": artifact_type
+        in (EXPECTED_SCORE_TYPE, EXPECTED_COMBINED_SCORE_TYPE),
         "schema_version": statistics.get("schema_version") == 1,
         "status": statistics.get("status") == "PASS",
         "scope": statistics.get("scope") == "full-test",
-        "execution_mode": statistics.get("execution_mode") == "live-k1",
+        "execution_mode": statistics.get("execution_mode")
+        == ("live-k1-x8" if combined else "live-k1"),
         "complete": statistics.get("evaluated_images")
         == statistics.get("full_test_length")
         == len(stage_a["images"]),
@@ -191,6 +197,169 @@ def _join_scores(
         joined_cells.append(copied)
     joined["cells"] = joined_cells
     return joined
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    raw = np.asarray(values, dtype=np.float64)
+    order = np.argsort(raw, kind="mergesort")
+    ranks = np.empty(len(raw), dtype=np.float64)
+    start = 0
+    while start < len(raw):
+        stop = start + 1
+        while stop < len(raw) and raw[order[stop]] == raw[order[start]]:
+            stop += 1
+        ranks[order[start:stop]] = 0.5 * (start + stop - 1) + 1.0
+        start = stop
+    return ranks
+
+
+def _spearman(first: np.ndarray, second: np.ndarray) -> float | None:
+    x = _average_ranks(np.asarray(first, dtype=np.float64))
+    y = _average_ranks(np.asarray(second, dtype=np.float64))
+    if len(x) < 2 or np.std(x) == 0 or np.std(y) == 0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _report_only_mechanism_diagnostics(
+    joined: Mapping[str, Any],
+    statistics: Mapping[str, Any],
+    geometry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe signal/utility coupling without affecting any H4-A action."""
+
+    eligible = np.asarray(geometry["eligible"], dtype=np.bool_)
+    mean_jsd = np.asarray(
+        [
+            (
+                float(cell["scores"][SCORE_SPECS[0][1]])
+                if eligible[index]
+                else np.nan
+            )
+            for index, cell in enumerate(joined["cells"])
+        ],
+        dtype=np.float64,
+    )
+    utility = np.asarray(
+        [
+            (
+                float(cell["scores"]["oracle_singleton_global_miou_gain"])
+                if eligible[index]
+                else np.nan
+            )
+            for index, cell in enumerate(joined["cells"])
+        ],
+        dtype=np.float64,
+    )
+    score_cells = statistics.get("cells", [])
+    if len(score_cells) != len(joined["cells"]):
+        raise ValueError("mechanism diagnostic cell count differs")
+    top10 = np.asarray(
+        [
+            (
+                float(
+                    cell.get("report_only", {}).get(
+                        "overlap_jsd_normalized_top10pct_mean"
+                    )
+                )
+                if eligible[index]
+                and cell.get("report_only", {}).get(
+                    "overlap_jsd_normalized_top10pct_mean"
+                )
+                is not None
+                else np.nan
+            )
+            for index, cell in enumerate(score_cells)
+        ],
+        dtype=np.float64,
+    )
+    valid = eligible & np.isfinite(mean_jsd) & np.isfinite(utility)
+    if not np.any(valid):
+        raise ValueError("H4-A mechanism diagnostics have no eligible values")
+    baseline_positive = float(np.mean(utility[valid] > 0))
+    q_records = []
+    for q in Q_VALUES:
+        selected: list[int] = []
+        for raw_indices in geometry["cells_by_image"]:
+            indices = np.asarray(raw_indices, dtype=np.int64)
+            candidates = indices[eligible[indices]]
+            count = int(np.floor(float(q) * len(candidates)))
+            ranked = sorted(
+                candidates.tolist(), key=lambda index: (-mean_jsd[index], index)
+            )
+            selected.extend(ranked[:count])
+        selected_array = np.asarray(selected, dtype=np.int64)
+        positive_rate = (
+            float(np.mean(utility[selected_array] > 0)) if len(selected_array) else None
+        )
+        paired = [
+            score_cells[index].get("evaluation_only_k1_to_k2")
+            for index in selected
+        ]
+        paired_available = bool(paired) and all(
+            isinstance(value, Mapping) for value in paired
+        )
+        fixed = (
+            sum(int(value["fixed_k1_errors"]) for value in paired)
+            if paired_available
+            else None
+        )
+        broken = (
+            sum(int(value["broken_k1_correct"]) for value in paired)
+            if paired_available
+            else None
+        )
+        directional = fixed + broken if paired_available else None
+        q_records.append(
+            {
+                "q": float(q),
+                "selected_cells": len(selected),
+                "positive_utility_rate": positive_rate,
+                "positive_utility_enrichment_over_all": (
+                    float(positive_rate / baseline_positive)
+                    if positive_rate is not None and baseline_positive > 0
+                    else None
+                ),
+                "paired_fix_break": (
+                    {
+                        "fixed_k1_errors": fixed,
+                        "broken_k1_correct": broken,
+                        "net_correct": sum(
+                            int(value["net_correct"]) for value in paired
+                        ),
+                        "fixed_share_among_directional_changes": (
+                            float(fixed / directional) if directional else None
+                        ),
+                        "broken_share_among_directional_changes": (
+                            float(broken / directional) if directional else None
+                        ),
+                        "fixed_to_broken_ratio": (
+                            float(fixed / broken) if broken else None
+                        ),
+                    }
+                    if paired_available
+                    else None
+                ),
+            }
+        )
+    top_valid = valid & np.isfinite(top10)
+    return {
+        "role": (
+            "report-only mechanism audit; never used for ranking, q selection, "
+            "random control, gate thresholds, or route rescue"
+        ),
+        "eligible_cells": int(np.count_nonzero(valid)),
+        "positive_singleton_utility_rate_all": baseline_positive,
+        "spearman_mean_jsd_vs_signed_singleton_utility": _spearman(
+            mean_jsd[valid], utility[valid]
+        ),
+        "spearman_top10pct_mean_jsd_vs_signed_singleton_utility": (
+            _spearman(top10[top_valid], utility[top_valid])
+            if np.any(top_valid)
+            else None
+        ),
+        "fixed_q_enrichment_and_fix_break": q_records,
+    }
 
 
 def _endpoint_metrics(stage_a: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -390,7 +559,7 @@ def _primary_decision(primary: Mapping[str, Any]) -> dict[str, Any]:
     elif strong_passed:
         outcome = "PROVISIONAL_GO_H4A_ONE_LIVE_STRUCTURE_LATENCY_CONFIRMATION"
     elif mechanism_passed:
-        outcome = "GO_H4B_RESPONSE_MECHANISM_SIGNAL_ONLY"
+        outcome = "KEEP_H4A_MECHANISM_SIGNAL_RUN_INDEPENDENT_H4B"
     else:
         outcome = "STOP_H4A_K1_OVERLAP_RESPONSE_NO_SIGNAL"
     return {
@@ -399,9 +568,8 @@ def _primary_decision(primary: Mapping[str, Any]) -> dict[str, Any]:
         "strong_known_gate_passed": strong_passed if formal else None,
         "mechanism_signal_gate_passed": mechanism_passed,
         "h4a_confirmed": False,
-        "h4b_implementation_authorized": bool(
-            formal and (strong_passed or mechanism_passed)
-        ),
+        "h4b_independent_screen_pre_authorized": True,
+        "h4b_implementation_authorized": True,
         "live_h4a_structure_latency_authorized": bool(formal and strong_passed),
         "mechanism_checks": mechanism_checks,
         "mechanism_observed": {
@@ -441,12 +609,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         stage_b0_sha256=stage_b0_sha,
     )
     statistics = _read_json(args.overlap_statistics_json)
+    statistics_runner = (
+        REPO_ROOT / "scripts" / "evaluate_whu_h4ab_response_statistics.py"
+        if statistics.get("artifact_type") == EXPECTED_COMBINED_SCORE_TYPE
+        else REPO_ROOT / "scripts" / "evaluate_whu_h4a_overlap_statistics.py"
+    )
     joined = _join_scores(
         stage_a, statistics, stage_a_sha=stage_a_sha
     )
     geometry = build_phase_closure_geometry(joined["images"], joined["cells"])
     eligible = np.asarray(geometry["eligible"], dtype=bool)
     endpoints = _endpoint_metrics(joined)
+    mechanism_diagnostics = _report_only_mechanism_diagnostics(
+        joined, statistics, geometry
+    )
 
     results = []
     for score_spec in SCORE_SPECS:
@@ -472,13 +648,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     elif decision["h4b_implementation_authorized"]:
         next_step = (
-            "Implement only H4-B K2-observed response statistics and discrete K1/K2 "
-            "arbitration; do not train a utility head yet."
+            "Run the independently pre-authorized, frozen H4-B K2-observed screen. "
+            "H4-A controls only whether K1-only overlap routing remains active."
         )
     elif decision["scientific_decision_evaluated"]:
         next_step = (
-            "Stop K1-only overlap routing; do not train a K1 utility head or let "
-            "secondary scores rescue the failed primary screen."
+            "Stop K1-only overlap routing, but still run the independently "
+            "pre-authorized frozen H4-B screen; do not train a K1 utility head."
         )
     else:
         next_step = "Rerun the frozen 1,000-replicate random control before deciding."
@@ -574,6 +750,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         "endpoint_validation": endpoints,
         "independent_score_screens": results,
+        "report_only_mechanism_diagnostics": mechanism_diagnostics,
         "h4a_decision": decision,
         "next_step": next_step,
         "explicit_non_claims": [
@@ -586,9 +763,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "reproducibility": {
             "git_revision": _git_revision(),
             "runner_sha256": file_sha256(Path(__file__)),
-            "statistics_runner_sha256": file_sha256(
-                REPO_ROOT / "scripts" / "evaluate_whu_h4a_overlap_statistics.py"
-            ),
+            "statistics_runner_path": str(statistics_runner.relative_to(REPO_ROOT)),
+            "statistics_runner_sha256": file_sha256(statistics_runner),
             "statistics_common_sha256": file_sha256(
                 REPO_ROOT / "scripts" / "phase_overlap_common.py"
             ),

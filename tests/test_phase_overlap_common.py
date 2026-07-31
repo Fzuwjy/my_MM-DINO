@@ -7,8 +7,12 @@ import unittest
 import numpy as np
 
 from scripts.phase_overlap_common import (
+    RESPONSE_SCORE_NAMES,
     SCORE_NAMES,
+    LogitSlideAccumulator,
     OverlapDisagreementAccumulator,
+    _masked_cell_top_fraction_mean,
+    phase_response_cell_summaries,
     semantic_boundary_observations,
     stable_softmax,
 )
@@ -146,6 +150,97 @@ class OverlapAccumulatorTests(unittest.TestCase):
             accumulator.add_crop(
                 np.zeros((2, 2, 2), dtype=np.float32), (0, 3, 0, 3)
             )
+
+    def test_report_only_top_fraction_mean_is_not_the_cell_mean(self):
+        values = np.arange(10, dtype=np.float32)[None]
+        valid = np.ones(values.shape, dtype=np.bool_)
+        result = _masked_cell_top_fraction_mean(
+            values,
+            valid,
+            np.asarray([[10, 11, 20, 30]], dtype=np.int64),
+            (10, 11, 20, 30),
+            fraction=0.10,
+        )
+        self.assertEqual(result.tolist(), [9.0])
+
+
+class PhaseResponseTests(unittest.TestCase):
+    def test_identical_k1_and_x8_has_no_temperature_gain(self):
+        logits = np.asarray(
+            [
+                [[1.0, 0.5], [0.1, 2.0]],
+                [[0.0, 0.2], [0.3, -1.0]],
+            ],
+            dtype=np.float32,
+        )
+        result = phase_response_cell_summaries(
+            logits,
+            logits.copy(),
+            np.asarray([[10, 12, 20, 22]], dtype=np.int64),
+            (10, 12, 20, 22),
+        )
+        for name in RESPONSE_SCORE_NAMES:
+            self.assertAlmostEqual(result["score_means"][name][0], 0.0, places=7)
+
+    def test_signed_entropy_and_margin_follow_k2_confidence_change(self):
+        weak = np.zeros((2, 2, 2), dtype=np.float32)
+        weak[0] = 0.2
+        stronger_same_class = np.zeros_like(weak)
+        stronger_same_class[0] = 2.0
+        positive = phase_response_cell_summaries(
+            weak,
+            stronger_same_class,
+            np.asarray([[0, 2, 0, 2]], dtype=np.int64),
+            (0, 2, 0, 2),
+        )
+        self.assertGreater(positive["score_means"][RESPONSE_SCORE_NAMES[0]][0], 0)
+        self.assertGreater(positive["score_means"][RESPONSE_SCORE_NAMES[1]][0], 0)
+
+        strong = stronger_same_class
+        opposite = np.zeros_like(strong)
+        opposite[1] = 2.0
+        negative = phase_response_cell_summaries(
+            strong,
+            opposite,
+            np.asarray([[0, 2, 0, 2]], dtype=np.int64),
+            (0, 2, 0, 2),
+        )
+        self.assertLess(negative["score_means"][RESPONSE_SCORE_NAMES[0]][0], 0)
+        self.assertLess(negative["score_means"][RESPONSE_SCORE_NAMES[1]][0], 0)
+
+    def test_partial_cell_is_reduced_only_on_common_intersection(self):
+        first = np.zeros((2, 2, 2), dtype=np.float32)
+        shifted = np.zeros_like(first)
+        shifted[0, 0, 0] = 3.0
+        result = phase_response_cell_summaries(
+            first,
+            shifted,
+            np.asarray([[9, 11, 19, 21]], dtype=np.int64),
+            (10, 12, 20, 22),
+        )
+        self.assertEqual(result["valid_pixels"].tolist(), [1])
+        self.assertEqual(result["common_intersection_pixels"].tolist(), [1])
+
+    def test_k2_endpoint_argmax_is_invariant_to_arithmetic_mean(self):
+        rng = np.random.default_rng(7)
+        first = rng.normal(size=(3, 4, 5)).astype(np.float32)
+        shifted = rng.normal(size=(3, 4, 5)).astype(np.float32)
+        np.testing.assert_array_equal(
+            (first + shifted).argmax(axis=0),
+            ((first + shifted) * np.float32(0.5)).argmax(axis=0),
+        )
+
+
+class LogitSlideAccumulatorTests(unittest.TestCase):
+    def test_sparse_crops_normalize_only_requested_covered_support(self):
+        accumulator = LogitSlideAccumulator((2, 3), 2)
+        crop = np.ones((2, 2, 2), dtype=np.float32)
+        crop[1] *= 3
+        accumulator.add_crop(crop, (0, 2, 1, 3))
+        normalized = accumulator.normalized_logits((0, 2, 1, 3))
+        np.testing.assert_array_equal(normalized, crop)
+        with self.assertRaisesRegex(AssertionError, "uncovered"):
+            accumulator.normalized_logits((0, 2, 0, 3))
 
 
 if __name__ == "__main__":
