@@ -193,3 +193,9 @@ multimodal reproduction command.
 - A low Aux-only score does not rule out conditional complementarity.
 - No method implementation begins until the input audit and counterfactual
   evidence select H1, H2, both, or neither.
+- `opt-only-feature-zero`: computes both inputs but replaces the projected SAR
+  feature with exact zero immediately before the released SampleAdapter
+  weighted sum.  Original weights, denominator, duplicated Decoder slots, and
+  multimodal SEFusion path are unchanged;
+- `sar-only-feature-zero`: the symmetric intervention, replacing projected OPT
+  features with zero while preserving the same two-input execution path;

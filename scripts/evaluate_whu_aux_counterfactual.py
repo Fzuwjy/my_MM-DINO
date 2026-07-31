@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.aux_diagnostics_common import (
     AuxiliaryConditionDataset,
+    FeatureZeroSampleAdapter,
     FusionPreservingSingleInputDecoder,
     ScaledSampleAdapter,
     modality_weight_summary,
@@ -48,6 +49,8 @@ MODEL_PROFILES = {
 }
 CONDITIONS = (
     "normal",
+    "opt-only-feature-zero",
+    "sar-only-feature-zero",
     "rgb-only-native",
     "rgb-only-fusion-preserved",
     "aux-mean",
@@ -55,6 +58,10 @@ CONDITIONS = (
     "aux-feature-off",
     "aux-weight-scale",
 )
+FEATURE_ZERO_CONDITIONS = {
+    "opt-only-feature-zero": 1,
+    "sar-only-feature-zero": 0,
+}
 
 
 def _condition_input_modalities(condition: str) -> int:
@@ -299,6 +306,12 @@ def main() -> None:
             model.decoder,
             num_modalities=2,
         )
+    zero_modality_index = FEATURE_ZERO_CONDITIONS.get(args.condition)
+    if zero_modality_index is not None:
+        model.adapter = FeatureZeroSampleAdapter(
+            model.adapter,
+            zero_modality_index=zero_modality_index,
+        )
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -342,6 +355,44 @@ def main() -> None:
         "inference_num_modalities": inference_num_modalities,
         "sar_backbone_executed": inference_num_modalities > 1,
         "decoder_path": _condition_decoder_path(args.condition),
+        "feature_zero_intervention": (
+            {
+                "mask_location": (
+                    "sample-adapter-post-projection-pre-weighted-sum"
+                ),
+                "zeroed_modality": (
+                    "optical" if zero_modality_index == 0 else "sar"
+                ),
+                "kept_modality": (
+                    "sar" if zero_modality_index == 0 else "optical"
+                ),
+                "weights_renormalized_after_zero": False,
+                "original_weight_denominator_preserved": True,
+                "original_normalized_weights": released_weight_summary[
+                    "effective_normalized"
+                ],
+                "feature_gate": (
+                    [0.0, 1.0]
+                    if zero_modality_index == 0
+                    else [1.0, 0.0]
+                ),
+                "effective_multipliers": (
+                    [
+                        0.0,
+                        released_weight_summary["effective_normalized"][1],
+                    ]
+                    if zero_modality_index == 0
+                    else [
+                        released_weight_summary["effective_normalized"][0],
+                        0.0,
+                    ]
+                ),
+                "two_input_backbone_path_preserved": True,
+                "two_slot_decoder_path_preserved": True,
+            }
+            if zero_modality_index is not None
+            else None
+        ),
         "backbone_type": model_profile["backbone_type"],
         "use_lora": model_profile["use_lora"],
         "lora_rank": model_profile["lora_rank"],

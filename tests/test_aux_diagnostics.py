@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from scripts.aux_diagnostics_common import (
     AuxiliaryConditionDataset,
+    FeatureZeroSampleAdapter,
     FusionPreservingSingleInputDecoder,
     ScaledSampleAdapter,
     array_summary,
@@ -176,6 +177,47 @@ class AuxDiagnosticsTest(unittest.TestCase):
         )
         torch.testing.assert_close(actual[0][0], expected)
         torch.testing.assert_close(actual[1][0], expected)
+
+    def test_feature_zero_preserves_original_weights_and_two_output_slots(self):
+        torch.manual_seed(11)
+        adapter = ReferenceAdapter()
+        rgb = [torch.randn(1, 4, 2)]
+        auxiliary = [torch.randn(1, 4, 2)]
+
+        rgb_processed = adapter.projects[0](
+            rgb[0].permute(0, 2, 1).reshape(1, 2, 2, 2)
+        )
+        sar_processed = adapter.projects[0](
+            auxiliary[0].permute(0, 2, 1).reshape(1, 2, 2, 2)
+        )
+        weights = [
+            torch.sigmoid(adapter.modality_weights[f"weight_modality_{index}"])
+            for index in range(2)
+        ]
+        normalized = [weight / sum(weights) for weight in weights]
+
+        opt_only = FeatureZeroSampleAdapter(
+            adapter, zero_modality_index=1
+        )(rgb, auxiliary, patch_h=2, patch_w=2)
+        sar_only = FeatureZeroSampleAdapter(
+            adapter, zero_modality_index=0
+        )(rgb, auxiliary, patch_h=2, patch_w=2)
+        normal = adapter(rgb, auxiliary, patch_h=2, patch_w=2)
+
+        expected_opt = normalized[0] * rgb_processed
+        expected_sar = normalized[1] * sar_processed
+        for output in opt_only:
+            torch.testing.assert_close(output[0], expected_opt, rtol=0.0, atol=0.0)
+        for output in sar_only:
+            torch.testing.assert_close(output[0], expected_sar, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(opt_only[0][0], opt_only[1][0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(sar_only[0][0], sar_only[1][0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            normal[0][0],
+            opt_only[0][0] + sar_only[0][0],
+            rtol=0.0,
+            atol=0.0,
+        )
 
     def test_modality_weight_summary_applies_aux_scale_before_normalization(self):
         adapter = ReferenceAdapter()

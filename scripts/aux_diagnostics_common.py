@@ -458,6 +458,85 @@ class ScaledSampleAdapter(nn.Module):
         return outputs
 
 
+class FeatureZeroSampleAdapter(nn.Module):
+    """Zero one processed modality feature without changing fusion weights.
+
+    The intervention is applied after the released per-layer projection and
+    resize, immediately before the original normalized weighted sum.  Both
+    backbones still run, the learned modality-weight denominator is unchanged,
+    and the fused result is still copied into both multimodal Decoder slots.
+    """
+
+    def __init__(
+        self, delegate: nn.Module, *, zero_modality_index: int | None
+    ):
+        super().__init__()
+        if int(getattr(delegate, "num_modalities")) != 2:
+            raise ValueError("Feature-zero audit requires a two-modality adapter")
+        if zero_modality_index not in (None, 0, 1):
+            raise ValueError(
+                "zero_modality_index must be None, 0 (OPT), or 1 (SAR)"
+            )
+        if bool(getattr(delegate, "use_naf", False)):
+            raise ValueError("Feature-zero audit is not defined for NAF adapters")
+        self.delegate = delegate
+        self.zero_modality_index = zero_modality_index
+        self.num_modalities = 2
+
+    def forward(
+        self,
+        *features_list: Sequence[torch.Tensor],
+        patch_h: int | None = None,
+        patch_w: int | None = None,
+        guidance: torch.Tensor | None = None,
+    ) -> Any:
+        if len(features_list) != 2:
+            raise ValueError(
+                "Feature-zero audit preserves the two-input path, got "
+                f"{len(features_list)} feature sets"
+            )
+        if patch_h is None or patch_w is None:
+            raise ValueError("patch_h and patch_w are required")
+
+        outputs: list[list[torch.Tensor]] = [[], []]
+        for layer_index, modality_features in enumerate(zip(*features_list)):
+            processed = []
+            for feature in modality_features:
+                feature = feature.permute(0, 2, 1).reshape(
+                    feature.shape[0], feature.shape[-1], patch_h, patch_w
+                )
+                feature = self.delegate.projects[layer_index](feature)
+                feature = self.delegate.resize_layers[layer_index](feature)
+                processed.append(feature)
+
+            if self.zero_modality_index is not None:
+                processed[self.zero_modality_index] = torch.zeros_like(
+                    processed[self.zero_modality_index]
+                )
+            # Preserve the released implementation's per-output recomputation.
+            for output_index, _ in enumerate(processed):
+                weights = [
+                    torch.sigmoid(
+                        self.delegate.modality_weights[
+                            f"weight_modality_{index}"
+                        ]
+                    )
+                    for index in range(2)
+                ]
+                total_weight = sum(weights)
+                normalized_weights = [
+                    weight / total_weight for weight in weights
+                ]
+                fused = sum(
+                    weight * feature
+                    for weight, feature in zip(
+                        normalized_weights, processed, strict=True
+                    )
+                )
+                outputs[output_index].append(fused)
+        return outputs
+
+
 class FusionPreservingSingleInputDecoder(nn.Module):
     """Route one RGB feature pyramid through the trained multimodal Decoder.
 
