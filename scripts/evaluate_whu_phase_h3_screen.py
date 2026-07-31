@@ -179,12 +179,14 @@ def _confusion(value: Any, *, name: str, num_classes: int) -> np.ndarray:
 
 
 def _score_arrays(
-    cells: Sequence[Mapping[str, Any]], eligible: np.ndarray
+    cells: Sequence[Mapping[str, Any]],
+    eligible: np.ndarray,
+    score_specs: Sequence[tuple[str, str]] = SCORE_SPECS,
 ) -> dict[str, np.ndarray]:
     if eligible.shape != (len(cells),) or eligible.dtype != np.bool_:
         raise TypeError("eligible must be a bool vector matching cells")
     result = {}
-    for public_name, cell_key in SCORE_SPECS:
+    for public_name, cell_key in score_specs:
         values = np.full(len(cells), -np.inf, dtype=np.float64)
         for index, (cell, is_eligible) in enumerate(
             zip(cells, eligible, strict=True)
@@ -273,13 +275,14 @@ def cross_fit_policy(
     score_arrays: Mapping[str, np.ndarray],
     *,
     batch_size: int,
+    score_specs: Sequence[tuple[str, str]] = SCORE_SPECS,
 ) -> dict[str, Any]:
     """Select one frozen score/q on 19 images and apply it to the held-out image."""
 
     image_count = len(stage_a["images"])
     all_image_indices = tuple(range(image_count))
     candidates = []
-    for score_order, (score_name, _) in enumerate(SCORE_SPECS):
+    for score_order, (score_name, _) in enumerate(score_specs):
         score_values = score_arrays[score_name]
         for q in Q_VALUES:
             policy = score_ranked_k2_levels(score_values, q, geometry)
