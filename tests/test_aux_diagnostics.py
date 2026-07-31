@@ -16,7 +16,10 @@ from scripts.aux_diagnostics_common import (
     grouped_derangement,
     modality_weight_summary,
 )
-from scripts.evaluate_whu_aux_counterfactual import _condition_auxiliary_scale
+from scripts.evaluate_whu_aux_counterfactual import (
+    _condition_auxiliary_scale,
+    _condition_input_modalities,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +190,16 @@ class AuxDiagnosticsTest(unittest.TestCase):
         Args.condition = "aux-weight-scale"
         Args.aux_weight_scale = 2.0
         self.assertEqual(_condition_auxiliary_scale(Args()), 2.0)
+
+    def test_native_rgb_only_condition_uses_one_inference_modality(self):
+        self.assertEqual(_condition_input_modalities("rgb-only-native"), 1)
+        self.assertEqual(_condition_input_modalities("normal"), 2)
+
+        class Args:
+            condition = "rgb-only-native"
+            aux_weight_scale = None
+
+        self.assertIsNone(_condition_auxiliary_scale(Args()))
 
     def test_released_transforms_share_geometry_and_preserve_label_interpolation(self):
         source = (

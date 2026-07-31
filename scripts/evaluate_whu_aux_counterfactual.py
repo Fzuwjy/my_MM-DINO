@@ -35,11 +35,24 @@ RELEASED_CONFIG_BATCH_SIZE = 8
 RELEASED_INFERENCE_BATCH_SIZE = 32
 CONDITIONS = (
     "normal",
+    "rgb-only-native",
     "aux-mean",
     "aux-shuffle",
     "aux-feature-off",
     "aux-weight-scale",
 )
+
+
+def _condition_input_modalities(condition: str) -> int:
+    """Return the number of sensor inputs used by the inference call.
+
+    ``rgb-only-native`` keeps the two-modality checkpoint architecture intact,
+    but calls its released one-input forward path.  This skips SAR loading and
+    backbone encoding, and it also intentionally exercises the model's native
+    single-input Adapter/Decoder behavior instead of the multimodal SE fusion.
+    """
+
+    return 1 if condition == "rgb-only-native" else 2
 
 
 def seed_model_initialization(seed: int) -> None:
@@ -142,6 +155,7 @@ def _whu_shuffle_group_keys(dataset: Any) -> list[str]:
 def main() -> None:
     args = parse_args()
     auxiliary_scale = _condition_auxiliary_scale(args)
+    inference_num_modalities = _condition_input_modalities(args.condition)
     checkpoint_path = args.checkpoint_path.expanduser().resolve()
     output_path = args.output_path.expanduser().resolve()
     if not checkpoint_path.is_file():
@@ -190,7 +204,7 @@ def main() -> None:
         "test",
         window_size=cfg["window_size"],
         model_name="DINOv3",
-        modality="multi",
+        modality="multi" if inference_num_modalities > 1 else None,
         backbone_type="dinov3_vitl16",
     )
     if args.condition in ("aux-mean", "aux-shuffle"):
@@ -234,7 +248,9 @@ def main() -> None:
     del checkpoint
 
     released_weight_summary = modality_weight_summary(model.adapter)
-    effective_weight_summary = released_weight_summary
+    effective_weight_summary = (
+        released_weight_summary if inference_num_modalities > 1 else None
+    )
     if auxiliary_scale is not None:
         effective_weight_summary = modality_weight_summary(
             model.adapter,
@@ -254,10 +270,11 @@ def main() -> None:
 
     official_trainer.MODEL_NAME = "DINOv3"
     official_trainer.DATASET_NAME = "WHU"
-    official_trainer.NUM_MODALITIES = 2
+    official_trainer.NUM_MODALITIES = inference_num_modalities
 
     print(f"checkpoint={checkpoint_path}")
     print(f"condition={args.condition}")
+    print(f"inference_num_modalities={inference_num_modalities}")
     print("evaluation_function=train_multi.test")
     print(f"evaluation_inference_batch_size={RELEASED_INFERENCE_BATCH_SIZE}")
     print(json.dumps({"effective_weights": effective_weight_summary}, indent=2))
@@ -279,6 +296,8 @@ def main() -> None:
         "model_name": "DINOv3",
         "dataset_name": "WHU",
         "num_modalities": 2,
+        "checkpoint_num_modalities": 2,
+        "inference_num_modalities": inference_num_modalities,
         "backbone_type": "dinov3_vitl16",
         "use_lora": True,
         "lora_rank": 3,

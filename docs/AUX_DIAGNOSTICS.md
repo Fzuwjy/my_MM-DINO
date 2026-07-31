@@ -20,6 +20,9 @@ The conditions have distinct meanings:
 - `aux-mean`: removes spatial Aux structure while retaining each image's mean;
 - `aux-shuffle`: uses a deterministic cross-image derangement within native
   spatial-size groups, so the intervention adds no resize or crop policy;
+- `rgb-only-native`: loads the multimodal checkpoint unchanged but calls
+  `model(rgb)` through its released single-input path.  It does not load or
+  encode SAR and it bypasses the multimodal SE-fusion path;
 - `aux-feature-off`: sets the Aux global fusion scale to zero and renormalizes
   RGB, rather than feeding an arbitrary zero-valued sensor image;
 - `aux-weight-scale`: scans simple global Aux reweighting as a sanity control.
@@ -98,6 +101,24 @@ torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_aux_counterfactual
   --condition aux-feature-off \
   --output-path /root/autodl-tmp/mm-dino/outputs/aux-diagnostics/whu_aux_feature_off.json
 ```
+
+The direct multi-train/RGB-only-test condition uses the same command with:
+
+```bash
+cd /root/my_MM-DINO
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate mm-dino
+torchrun --standalone --nproc_per_node=1 scripts/evaluate_whu_aux_counterfactual.py \
+  --checkpoint-path /root/autodl-tmp/mm-dino/outputs/faithful-whu-author-protocol/DINOv3/WHU_20260728_021847/DINOv3_WHU_e45_mIoU55.58.pth \
+  --condition rgb-only-native \
+  --output-path /root/autodl-tmp/mm-dino/outputs/aux-diagnostics/whu_rgb_only_native.json
+```
+
+This is a missing-modality inference baseline, not an independently trained
+RGB-only model.  It differs from `aux-feature-off`: the latter keeps the
+multimodal Decoder/SE-fusion execution and removes SAR only at fusion, whereas
+`rgb-only-native` skips the SAR backbone and exercises the released single-input
+Adapter/Decoder branch.
 
 Use the same command with `--condition aux-mean` and
 `--condition aux-shuffle`, changing the output filename each time.  Global
