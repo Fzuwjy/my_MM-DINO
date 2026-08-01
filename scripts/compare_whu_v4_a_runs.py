@@ -20,8 +20,11 @@ from scripts.run_whu_v4_a_screen import (
 )
 
 
-EXTEND_E15_THRESHOLD_PP = 0.05
-NONINFERIOR_TOLERANCE_PP = -0.05
+A_POSITIVE_MIN_PP = 0.05
+A_STRONG_POSITIVE_MIN_PP = 0.20
+A_NEGATIVE_MAX_PP = -0.05
+A_TRAJECTORY_TOLERANCE_PP = 0.03
+A_DECISION_RULE_VERSION = "v4_a_baseline_selection_v2"
 FAITHFUL_HISTORICAL_BEST_MIOU_PERCENT = 54.145880
 
 
@@ -202,25 +205,51 @@ def decision(scope: str, results: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             "outcome": "FAIL_A_VARIANT_NOT_EXERCISED",
             "scientific_decision": "CHECK_PADDING_SAMPLING_AND_RUNNER",
         }
-    rising = 10 not in by_epoch or delta15 > float(
-        by_epoch[10]["candidate_minus_official_pp"]
-    )
-    if delta15 >= EXTEND_E15_THRESHOLD_PP and rising:
-        outcome = "PASS_A_E15_EXTEND_TO_E30"
-        action = "EXTEND_ONCE_TO_E30"
-    elif delta15 >= NONINFERIOR_TOLERANCE_PP:
-        outcome = "STOP_A_LOW_OR_FLAT_GAIN"
-        action = "DO_NOT_FORCE_R_MASK_IGNORE_AS_METHOD_BASE"
+
+    if delta15 < A_NEGATIVE_MAX_PP:
+        effect_band = "NEGATIVE"
+    elif delta15 < A_POSITIVE_MIN_PP:
+        effect_band = "NEUTRAL"
+    elif delta15 < A_STRONG_POSITIVE_MIN_PP:
+        effect_band = "POSITIVE"
     else:
-        outcome = "STOP_A_NEGATIVE"
+        effect_band = "STRONG_POSITIVE"
+
+    delta10_to15 = None
+    if 10 not in by_epoch:
+        trajectory = "UNKNOWN"
+    else:
+        delta10_to15 = delta15 - float(
+            by_epoch[10]["candidate_minus_official_pp"]
+        )
+        if delta10_to15 > A_TRAJECTORY_TOLERANCE_PP:
+            trajectory = "RISING"
+        elif delta10_to15 < -A_TRAJECTORY_TOLERANCE_PP:
+            trajectory = "DECLINING"
+        else:
+            trajectory = "STABLE"
+
+    if delta15 >= A_POSITIVE_MIN_PP:
+        action = "SELECT_R_MASK_IGNORE_AS_E15_C_SCREEN_BASE"
+    else:
         action = "KEEP_R_OFFICIAL_AS_METHOD_BASE"
     return {
-        "outcome": outcome,
+        "outcome": f"A_E15_{effect_band}_{trajectory}",
         "scientific_decision": action,
+        "decision_rule_version": A_DECISION_RULE_VERSION,
         "delta15_pp": delta15,
-        "e15_threshold_pp": EXTEND_E15_THRESHOLD_PP,
-        "rising_from_e10": rising,
-        "noninferior_tolerance_pp": NONINFERIOR_TOLERANCE_PP,
+        "effect_band": effect_band,
+        "trajectory": trajectory,
+        "delta10_to15_pp": delta10_to15,
+        "positive_min_pp": A_POSITIVE_MIN_PP,
+        "strong_positive_min_pp": A_STRONG_POSITIVE_MIN_PP,
+        "negative_max_pp": A_NEGATIVE_MAX_PP,
+        "trajectory_tolerance_pp": A_TRAJECTORY_TOLERANCE_PP,
+        "durability": "E30_E50_UNKNOWN",
+        "interpretation": (
+            "A selects the same-horizon clean baseline; it does not promote a method "
+            "or count toward the C effect. Effect magnitude and trajectory are separate."
+        ),
     }
 
 

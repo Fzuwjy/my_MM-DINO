@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -13,6 +16,7 @@ from scripts.compare_whu_v4_a_runs import (
     paired_bootstrap_ci,
     validate_protocol_pair,
 )
+from scripts.adjudicate_whu_v4_a_comparison import adjudicate
 from scripts.run_whu_v4_a_screen import (
     PROTOCOL_EPOCHS,
     batch_pair_fingerprint,
@@ -78,7 +82,7 @@ class V4ARunnerContractTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "protocol differs"):
             validate_protocol_pair(official, candidate)
 
-    def test_e15_practical_gate_does_not_promote_tiny_positive(self):
+    def test_a_baseline_decision_separates_effect_size_from_trajectory(self):
         weak = decision(
             "formal-screen",
             [
@@ -94,7 +98,10 @@ class V4ARunnerContractTest(unittest.TestCase):
                 },
             ],
         )
-        self.assertEqual(weak["outcome"], "STOP_A_LOW_OR_FLAT_GAIN")
+        self.assertEqual(weak["outcome"], "A_E15_NEUTRAL_STABLE")
+        self.assertEqual(
+            weak["scientific_decision"], "KEEP_R_OFFICIAL_AS_METHOD_BASE"
+        )
 
         useful = decision(
             "formal-screen",
@@ -106,12 +113,67 @@ class V4ARunnerContractTest(unittest.TestCase):
                 },
                 {
                     "epoch": 15,
-                    "candidate_minus_official_pp": 0.06,
+                    "candidate_minus_official_pp": 0.08,
                     "raw_label_stream_changed": True,
                 },
             ],
         )
-        self.assertEqual(useful["outcome"], "PASS_A_E15_EXTEND_TO_E30")
+        self.assertEqual(useful["outcome"], "A_E15_POSITIVE_RISING")
+        self.assertEqual(
+            useful["scientific_decision"],
+            "SELECT_R_MASK_IGNORE_AS_E15_C_SCREEN_BASE",
+        )
+
+        strong_declining = decision(
+            "formal-screen",
+            [
+                {
+                    "epoch": 10,
+                    "candidate_minus_official_pp": 1.0374378332,
+                    "raw_label_stream_changed": True,
+                },
+                {
+                    "epoch": 15,
+                    "candidate_minus_official_pp": 0.9405603020,
+                    "raw_label_stream_changed": True,
+                },
+            ],
+        )
+        self.assertEqual(
+            strong_declining["outcome"], "A_E15_STRONG_POSITIVE_DECLINING"
+        )
+        self.assertEqual(strong_declining["durability"], "E30_E50_UNKNOWN")
+
+    def test_adjudication_preserves_original_outcome_and_source_hash(self):
+        source = {
+            "status": "PASS",
+            "artifact_type": "whu_v4_a_paired_comparison",
+            "scope": "formal-screen",
+            "outcome": "STOP_A_LOW_OR_FLAT_GAIN",
+            "scientific_decision": "DO_NOT_FORCE_R_MASK_IGNORE_AS_METHOD_BASE",
+            "epochs": [
+                {
+                    "epoch": 10,
+                    "candidate_minus_official_pp": 1.0,
+                    "raw_label_stream_changed": True,
+                },
+                {
+                    "epoch": 15,
+                    "candidate_minus_official_pp": 0.9,
+                    "raw_label_stream_changed": True,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "comparison.json"
+            path.write_text(json.dumps(source), encoding="utf-8")
+            result = adjudicate(path)
+        self.assertEqual(result["source"]["outcome"], "STOP_A_LOW_OR_FLAT_GAIN")
+        self.assertEqual(len(result["source"]["sha256"]), 64)
+        self.assertEqual(
+            result["corrected"]["outcome"],
+            "A_E15_STRONG_POSITIVE_DECLINING",
+        )
 
     def test_bootstrap_recomputes_pooled_confusion(self):
         official = np.stack(
