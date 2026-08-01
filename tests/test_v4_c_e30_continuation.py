@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -18,8 +19,12 @@ from scripts.run_whu_v4_c_e30_continuation import (
     CANDIDATE_VARIANT,
     CLEAN_VARIANT,
     CONTINUATION_MODE,
+    FORMAL_EVALUATION_EPOCHS,
+    OFFICIAL_VARIANT,
+    build_loaders,
     load_sealed_source,
     load_training_state,
+    parse_args,
     restore_rng_state,
     rng_state_fingerprints,
     validate_completed_clean_continuation,
@@ -41,8 +46,8 @@ def _source_protocol(variant: str = CLEAN_VARIANT) -> dict:
         "scheduler_horizon_epochs": 50,
         "stop_after_epoch": 15,
         "evaluation_epochs": [5, 10, 15],
-        "mask_padding_ignore": True,
-        "mask_fill": 7,
+        "mask_padding_ignore": variant != OFFICIAL_VARIANT,
+        "mask_fill": 0 if variant == OFFICIAL_VARIANT else 7,
         "aux_fill": 0,
         "train_batch_size_per_gpu": 8,
         "train_workers": 4,
@@ -51,6 +56,14 @@ def _source_protocol(variant: str = CLEAN_VARIANT) -> dict:
         "max_test_images": None,
         "scope": "formal-screen",
         "git_commit": "sealed-source-commit",
+        "initial_model_state_sha256": "shared-initial-state",
+        "train_dataset_length": 3200,
+        "full_test_length": 20,
+        "evaluated_test_length": 20,
+        "loss_change": "none",
+        "soft_ce_residual_confound": (
+            "ignore positions are zeroed before a mean over all pixels"
+        ),
     }
     if variant == CANDIDATE_VARIANT:
         protocol.update(
@@ -147,13 +160,13 @@ def _write_sealed_source(
     return source, summary
 
 
-def _trace() -> list[dict]:
+def _trace(*, raw_label: str = "raw-label") -> list[dict]:
     return [
         {
             "pair_sha256": "pair",
             "optical_sha256": "optical",
             "sar_sha256": "sar",
-            "raw_label_sha256": "raw-label",
+            "raw_label_sha256": raw_label,
             "normalized_label_sha256": "normalized-label",
         }
     ]
@@ -165,10 +178,23 @@ def _pair_protocol(variant: str) -> dict:
         "continuation_mode": CONTINUATION_MODE,
         "variant": variant,
         "source_epoch": 15,
+        "first_continuation_epoch": 16,
         "target_epoch": 30,
         "stop_after_epoch": 16,
         "evaluation_epochs": [16],
         "not_equivalent_to_uninterrupted": True,
+        "persistent_worker_state_restored": False,
+        "three_arm_policy": "official_clean_C_all_required",
+        "official_arm_execution_policy": "unconditional",
+        "scientific_scope": (
+            "three-arm E15-to-E30 epoch-boundary restart kill test with "
+            "E20/E25/E30 shape readings; not an uninterrupted E30 result"
+        ),
+        "model_name": "DINOv3",
+        "dataset_name": "WHU",
+        "num_modalities": 2,
+        "backbone_type": "dinov3_vits16",
+        "use_lora": False,
         "seed": 42,
         "scheduler_horizon_epochs": 50,
         "train_batch_size_per_gpu": 8,
@@ -248,6 +274,12 @@ class V4CE30ContinuationTest(unittest.TestCase):
         validate_source_protocol(
             _source_protocol(), variant=CLEAN_VARIANT, smoke=False
         )
+        official = _source_protocol(OFFICIAL_VARIANT)
+        validate_source_protocol(
+            official, variant=OFFICIAL_VARIANT, smoke=False
+        )
+        self.assertFalse(official["mask_padding_ignore"])
+        self.assertEqual(official["mask_fill"], 0)
         candidate = _source_protocol(CANDIDATE_VARIANT)
         validate_source_protocol(
             candidate, variant=CANDIDATE_VARIANT, smoke=False
@@ -258,6 +290,20 @@ class V4CE30ContinuationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "protocol differs"):
             validate_source_protocol(
                 drift, variant=CANDIDATE_VARIANT, smoke=False
+            )
+
+        official_drift = deepcopy(official)
+        official_drift["mask_padding_ignore"] = True
+        with self.assertRaisesRegex(RuntimeError, "protocol differs"):
+            validate_source_protocol(
+                official_drift, variant=OFFICIAL_VARIANT, smoke=False
+            )
+
+        epoch_drift = deepcopy(official)
+        epoch_drift["evaluation_epochs"] = [15]
+        with self.assertRaisesRegex(RuntimeError, "protocol differs"):
+            validate_source_protocol(
+                epoch_drift, variant=OFFICIAL_VARIANT, smoke=False
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -289,6 +335,89 @@ class V4CE30ContinuationTest(unittest.TestCase):
                         load_sealed_source(
                             source, variant=CLEAN_VARIANT, smoke=False
                         )
+
+    def test_three_arm_cli_and_formal_evaluation_schedule_are_frozen(self):
+        self.assertEqual(FORMAL_EVALUATION_EPOCHS, (20, 25, 30))
+        clean = parse_args(
+            [
+                "--variant",
+                CLEAN_VARIANT,
+                "--source-dir",
+                "clean-source",
+                "--output-dir",
+                "clean-output",
+            ]
+        )
+        self.assertIsNone(clean.paired_clean_dir)
+        for variant in (OFFICIAL_VARIANT, CANDIDATE_VARIANT):
+            parsed = parse_args(
+                [
+                    "--variant",
+                    variant,
+                    "--source-dir",
+                    f"{variant}-source",
+                    "--paired-clean-dir",
+                    "clean-output",
+                    "--output-dir",
+                    f"{variant}-output",
+                ]
+            )
+            self.assertEqual(parsed.paired_clean_dir, Path("clean-output"))
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    [
+                        "--variant",
+                        variant,
+                        "--source-dir",
+                        f"{variant}-source",
+                        "--output-dir",
+                        f"{variant}-output",
+                    ]
+                )
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--variant",
+                    CLEAN_VARIANT,
+                    "--source-dir",
+                    "clean-source",
+                    "--paired-clean-dir",
+                    "clean-output",
+                    "--output-dir",
+                    "bad-clean-output",
+                ]
+            )
+
+    def test_loader_maps_official_to_zero_padding_and_C_to_clean_padding(self):
+        sentinel = object()
+        with patch(
+            "scripts.run_whu_v4_c_e30_continuation.a_runner.build_loaders",
+            return_value=sentinel,
+        ) as delegated:
+            actual = build_loaders(
+                variant=OFFICIAL_VARIANT,
+                source_protocol={"seed": 42},
+                cfg={},
+                num_workers=4,
+                max_test_images=None,
+            )
+        self.assertIs(actual, sentinel)
+        args = delegated.call_args.args[0]
+        self.assertEqual(args.variant, OFFICIAL_VARIANT)
+        self.assertEqual(args.seed, 42)
+
+        with patch(
+            "scripts.run_whu_v4_c_e30_continuation.a_runner.build_loaders",
+            return_value=sentinel,
+        ) as delegated:
+            build_loaders(
+                variant=CANDIDATE_VARIANT,
+                source_protocol={"seed": 42},
+                cfg={},
+                num_workers=4,
+                max_test_images=None,
+            )
+        self.assertEqual(delegated.call_args.args[0].variant, CLEAN_VARIANT)
 
     def test_candidate_source_binds_the_exact_clean_e15_lineage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -343,6 +472,151 @@ class V4CE30ContinuationTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "bindings changed"):
                 load_sealed_source(
                     candidate, variant=CANDIDATE_VARIANT, smoke=False
+                )
+
+    def test_official_binds_clean_but_accepts_intentional_raw_label_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean_source, _ = _write_sealed_source(
+                root, directory_name="clean-source"
+            )
+            official_source, _ = _write_sealed_source(
+                root,
+                protocol=_source_protocol(OFFICIAL_VARIANT),
+                directory_name="official-source",
+            )
+            clean_loaded = load_sealed_source(
+                clean_source, variant=CLEAN_VARIANT, smoke=False
+            )
+            official_loaded = load_sealed_source(
+                official_source, variant=OFFICIAL_VARIANT, smoke=False
+            )
+            clean_seals = clean_loaded[4]
+            fingerprints = clean_seals["restart_rng_fingerprints"]
+            self.assertEqual(
+                fingerprints,
+                official_loaded[4]["restart_rng_fingerprints"],
+            )
+
+            clean_continuation = root / "clean-continuation"
+            clean_continuation.mkdir()
+            clean_protocol = _pair_protocol(CLEAN_VARIANT)
+            clean_protocol.update(
+                {
+                    "restart_rng_fingerprints": fingerprints,
+                    "source_dir_resolved": str(clean_source.resolve()),
+                    "source_protocol_sha256": file_sha256(
+                        clean_source / "protocol.json"
+                    ),
+                    "source_git_commit": _source_protocol()["git_commit"],
+                    "source_checkpoint_sha256": file_sha256(
+                        clean_source / "checkpoint_e15.pth"
+                    ),
+                    "source_evaluation_sha256": file_sha256(
+                        clean_source / "evaluation_e15.json"
+                    ),
+                }
+            )
+            (clean_continuation / "protocol.json").write_text(
+                json.dumps(clean_protocol), encoding="utf-8"
+            )
+            (clean_continuation / "summary.json").write_text(
+                json.dumps({"status": "PASS", "variant": CLEAN_VARIANT}),
+                encoding="utf-8",
+            )
+            clean_training = {
+                "paired_data_sha256": "normalized-pair",
+                "raw_label_sha256": "clean-ignore-labels",
+                "first_batch_trace": _trace(raw_label="clean-ignore-label"),
+            }
+            (clean_continuation / "train_e16.json").write_text(
+                json.dumps(clean_training), encoding="utf-8"
+            )
+            (clean_continuation / "evaluation_e16.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            official_protocol = _pair_protocol(OFFICIAL_VARIANT)
+            validate_completed_clean_continuation(
+                clean_continuation,
+                protocol=official_protocol,
+                restart_rng_fingerprints=official_loaded[4][
+                    "restart_rng_fingerprints"
+                ],
+                source_protocol=official_loaded[0],
+            )
+            official_training = {
+                "paired_data_sha256": "normalized-pair",
+                "raw_label_sha256": "official-zero-labels",
+                "first_batch_trace": _trace(raw_label="official-zero-label"),
+            }
+            audit = validate_epoch_pair(
+                official_training,
+                clean_continuation / "train_e16.json",
+                expected_trace_count=1,
+                variant=OFFICIAL_VARIANT,
+            )
+            self.assertFalse(audit["raw_label_sha256_equal"])
+            self.assertFalse(audit["first_batch_trace_equal"])
+            self.assertTrue(audit["first_batch_trace_pair_fields_equal"])
+            self.assertEqual(
+                audit["raw_label_relation"],
+                "intentional_official_vs_ignore_padding_difference",
+            )
+
+            changed_normalized = deepcopy(official_training)
+            changed_normalized["first_batch_trace"][0][
+                "normalized_label_sha256"
+            ] = "different"
+            with self.assertRaisesRegex(RuntimeError, "pairing differs"):
+                validate_epoch_pair(
+                    changed_normalized,
+                    clean_continuation / "train_e16.json",
+                    expected_trace_count=1,
+                    variant=OFFICIAL_VARIANT,
+                )
+
+            clean_formal = deepcopy(clean_training)
+            clean_formal["first_batch_trace"] = [
+                {**_trace(raw_label=f"clean-{index}")[0], "batch": index}
+                for index in range(1, 11)
+            ]
+            (clean_continuation / "train_e16.json").write_text(
+                json.dumps(clean_formal), encoding="utf-8"
+            )
+            official_formal = deepcopy(clean_formal)
+            official_formal["raw_label_sha256"] = "official-zero-labels"
+            for index, item in enumerate(
+                official_formal["first_batch_trace"], start=1
+            ):
+                item["raw_label_sha256"] = f"official-{index}"
+            validate_epoch_pair(
+                official_formal,
+                clean_continuation / "train_e16.json",
+                expected_trace_count=10,
+                variant=OFFICIAL_VARIANT,
+            )
+            official_formal["raw_label_sha256"] = clean_formal[
+                "raw_label_sha256"
+            ]
+            with self.assertRaisesRegex(RuntimeError, "pairing differs"):
+                validate_epoch_pair(
+                    official_formal,
+                    clean_continuation / "train_e16.json",
+                    expected_trace_count=10,
+                    variant=OFFICIAL_VARIANT,
+                )
+
+            drifted_official = deepcopy(official_loaded[0])
+            drifted_official["initial_model_state_sha256"] = "different-init"
+            with self.assertRaisesRegex(RuntimeError, "not paired"):
+                validate_completed_clean_continuation(
+                    clean_continuation,
+                    protocol=official_protocol,
+                    restart_rng_fingerprints=official_loaded[4][
+                        "restart_rng_fingerprints"
+                    ],
+                    source_protocol=drifted_official,
                 )
 
     def test_clean_candidate_pairing_rejects_rng_hash_or_epoch_data_drift(self):

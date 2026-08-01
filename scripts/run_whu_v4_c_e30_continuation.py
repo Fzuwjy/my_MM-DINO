@@ -1,15 +1,16 @@
-"""Run the low-cost V4-C E15->E30 epoch-boundary paired restart screen.
+"""Run the V4 E15->E30 three-arm epoch-boundary restart kill test.
 
 This runner intentionally does *not* claim to reproduce an uninterrupted E30
-trajectory.  It restores all state present in the sealed E15 checkpoints, but
-the original persistent DataLoader workers, their RNG state, cache, prefetch,
-and iterator state cannot be recovered.  Clean and C therefore start fresh
-workers from the same restored loader-generator state at the E16 boundary.
+trajectory.  It restores all state present in each arm's sealed E15 checkpoint,
+but the original persistent DataLoader workers, their RNG state, cache,
+prefetch, and iterator state cannot be recovered.  The official, clean, and C
+arms therefore start fresh workers from matched restored loader-generator state
+at the E16 boundary.
 
-Run the clean arm first.  The C arm then binds to that completed continuation
-and checks every E16..E30 data stream online.  Only C-minus-clean is decided at
-this stage; the official continuation is deliberately deferred until the
-incremental E30 gate passes.
+Run the clean arm first.  Both official and C then bind to that completed clean
+continuation and audit every E16..E30 data stream online.  The official arm is
+unconditional: it is not gated on C-minus-clean.  Formal runs evaluate E20,
+E25, and E30 so the comparison can distinguish persistence from decay.
 """
 
 from __future__ import annotations
@@ -45,15 +46,17 @@ from scripts.whu_label_dtype_compat import (  # noqa: E402
 from utils.utils import set_seed  # noqa: E402
 
 
+OFFICIAL_VARIANT = "official"
 CLEAN_VARIANT = "mask-ignore"
 CANDIDATE_VARIANT = c_runner.CANDIDATE_VARIANT
-VARIANTS = (CLEAN_VARIANT, CANDIDATE_VARIANT)
+VARIANTS = (OFFICIAL_VARIANT, CLEAN_VARIANT, CANDIDATE_VARIANT)
 SOURCE_EPOCH = 15
 TARGET_EPOCH = 30
 FIRST_CONTINUATION_EPOCH = SOURCE_EPOCH + 1
 PROTOCOL_EPOCHS = a_runner.PROTOCOL_EPOCHS
-CONTINUATION_MODE = "epoch_boundary_paired_restart_screen"
-ARTIFACT_TYPE = "whu_v4_c_epoch_boundary_restart"
+CONTINUATION_MODE = "epoch_boundary_paired_restart_kill_test"
+ARTIFACT_TYPE = "whu_v4_three_arm_epoch_boundary_restart"
+FORMAL_EVALUATION_EPOCHS = (20, 25, 30)
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
@@ -193,12 +196,20 @@ SOURCE_PROTOCOL_FIELDS = (
     "max_test_images",
     "scope",
     "git_commit",
+    "initial_model_state_sha256",
+    "train_dataset_length",
+    "full_test_length",
+    "evaluated_test_length",
+    "loss_change",
+    "soft_ce_residual_confound",
 )
 
 
 def validate_source_protocol(
     protocol: Mapping[str, Any], *, variant: str, smoke: bool
 ) -> None:
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown continuation variant: {variant}")
     if protocol.get("variant") != variant:
         raise RuntimeError(
             f"source variant differs: {protocol.get('variant')} != {variant}"
@@ -212,8 +223,10 @@ def validate_source_protocol(
         "seed": 42,
         "scheduler_horizon_epochs": PROTOCOL_EPOCHS,
         "stop_after_epoch": SOURCE_EPOCH,
-        "mask_padding_ignore": True,
-        "mask_fill": a_runner.IGNORE_INDEX,
+        "mask_padding_ignore": variant != OFFICIAL_VARIANT,
+        "mask_fill": (
+            0 if variant == OFFICIAL_VARIANT else a_runner.IGNORE_INDEX
+        ),
         "aux_fill": 0,
         "train_batch_size_per_gpu": 8,
         "train_workers": 4,
@@ -227,11 +240,9 @@ def validate_source_protocol(
         for field, expected_value in expected.items()
         if protocol.get(field) != expected_value
     }
-    if SOURCE_EPOCH not in [
-        int(value) for value in protocol.get("evaluation_epochs", [])
-    ]:
+    if protocol.get("evaluation_epochs") != [5, 10, 15]:
         mismatches["evaluation_epochs"] = (
-            f"contains {SOURCE_EPOCH}",
+            [5, 10, 15],
             protocol.get("evaluation_epochs"),
         )
     if variant == CANDIDATE_VARIANT:
@@ -372,7 +383,7 @@ def build_training_state(
     *, variant: str, source_protocol: Mapping[str, Any]
 ) -> tuple[Mapping[str, Any], torch.nn.Module, torch.optim.Optimizer, Any]:
     seed = int(source_protocol["seed"])
-    if variant == CLEAN_VARIANT:
+    if variant in (OFFICIAL_VARIANT, CLEAN_VARIANT):
         return a_runner.build_training_state(SimpleNamespace(seed=seed))
     set_seed(seed)
     args = SimpleNamespace(
@@ -388,13 +399,18 @@ def build_training_state(
 
 def build_loaders(
     *,
+    variant: str,
     source_protocol: Mapping[str, Any],
     cfg: Mapping[str, Any],
     num_workers: int,
     max_test_images: int | None,
 ):
+    data_variant = (
+        OFFICIAL_VARIANT if variant == OFFICIAL_VARIANT else CLEAN_VARIANT
+    )
     args = SimpleNamespace(
-        variant=CLEAN_VARIANT,
+        # The C model intentionally shares the clean mask-ignore data path.
+        variant=data_variant,
         seed=int(source_protocol["seed"]),
         num_workers=num_workers,
         max_test_images=max_test_images,
@@ -459,8 +475,20 @@ PAIR_PROTOCOL_FIELDS = (
     "artifact_type",
     "continuation_mode",
     "source_epoch",
+    "first_continuation_epoch",
     "target_epoch",
+    "stop_after_epoch",
+    "evaluation_epochs",
     "not_equivalent_to_uninterrupted",
+    "persistent_worker_state_restored",
+    "three_arm_policy",
+    "official_arm_execution_policy",
+    "scientific_scope",
+    "model_name",
+    "dataset_name",
+    "num_modalities",
+    "backbone_type",
+    "use_lora",
     "seed",
     "scheduler_horizon_epochs",
     "train_batch_size_per_gpu",
@@ -472,13 +500,40 @@ PAIR_PROTOCOL_FIELDS = (
     "git_commit",
 )
 
+OFFICIAL_CLEAN_SOURCE_COMMON_FIELDS = (
+    "model_name",
+    "dataset_name",
+    "num_modalities",
+    "backbone_type",
+    "use_lora",
+    "seed",
+    "scheduler_horizon_epochs",
+    "stop_after_epoch",
+    "evaluation_epochs",
+    "aux_fill",
+    "train_batch_size_per_gpu",
+    "train_workers",
+    "inference_batch_size",
+    "max_train_batches",
+    "max_test_images",
+    "scope",
+    "git_commit",
+    "initial_model_state_sha256",
+    "train_dataset_length",
+    "full_test_length",
+    "evaluated_test_length",
+    "loss_change",
+    "soft_ce_residual_confound",
+)
+
 
 def validate_completed_clean_continuation(
     clean_dir: Path,
     *,
     protocol: Mapping[str, Any],
     restart_rng_fingerprints: Mapping[str, Any],
-    candidate_clean_lineage: Mapping[str, Any],
+    candidate_clean_lineage: Mapping[str, Any] | None = None,
+    source_protocol: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_protocol = read_json_object(clean_dir / "protocol.json")
     clean_summary = read_json_object(clean_dir / "summary.json")
@@ -496,33 +551,102 @@ def validate_completed_clean_continuation(
     if clean_protocol.get("restart_rng_fingerprints") != dict(
         restart_rng_fingerprints
     ):
-        raise RuntimeError("clean/C source checkpoint RNG states differ")
-    lineage_checks = {
-        "source_dir_resolved": candidate_clean_lineage.get(
-            "clean_reference_dir"
-        ),
-        "source_protocol_sha256": candidate_clean_lineage.get(
-            "clean_reference_protocol_sha256"
-        ),
-        "source_git_commit": candidate_clean_lineage.get(
-            "clean_reference_git_commit"
-        ),
-        "source_checkpoint_sha256": candidate_clean_lineage.get(
-            "clean_reference_checkpoint_sha256"
-        ),
-        "source_evaluation_sha256": candidate_clean_lineage.get(
-            "clean_reference_evaluation_sha256"
-        ),
-    }
-    lineage_mismatches = {
-        field: (expected, clean_protocol.get(field))
-        for field, expected in lineage_checks.items()
-        if expected is None or clean_protocol.get(field) != expected
-    }
-    if lineage_mismatches:
+        raise RuntimeError("paired source checkpoint RNG states differ")
+    variant = protocol.get("variant")
+    if variant == CANDIDATE_VARIANT:
+        if not isinstance(candidate_clean_lineage, Mapping):
+            raise RuntimeError("C continuation lacks its sealed clean lineage")
+        lineage_checks = {
+            "source_dir_resolved": candidate_clean_lineage.get(
+                "clean_reference_dir"
+            ),
+            "source_protocol_sha256": candidate_clean_lineage.get(
+                "clean_reference_protocol_sha256"
+            ),
+            "source_git_commit": candidate_clean_lineage.get(
+                "clean_reference_git_commit"
+            ),
+            "source_checkpoint_sha256": candidate_clean_lineage.get(
+                "clean_reference_checkpoint_sha256"
+            ),
+            "source_evaluation_sha256": candidate_clean_lineage.get(
+                "clean_reference_evaluation_sha256"
+            ),
+        }
+        lineage_mismatches = {
+            field: (expected, clean_protocol.get(field))
+            for field, expected in lineage_checks.items()
+            if expected is None or clean_protocol.get(field) != expected
+        }
+        if lineage_mismatches:
+            raise RuntimeError(
+                "paired clean continuation is not the C source's sealed clean "
+                f"lineage: {lineage_mismatches}"
+            )
+    elif variant == OFFICIAL_VARIANT:
+        if not isinstance(source_protocol, Mapping):
+            raise RuntimeError("official continuation lacks its source protocol")
+        validate_source_protocol(
+            source_protocol, variant=OFFICIAL_VARIANT, smoke=False
+        )
+        clean_source_dir = _resolved_path(
+            clean_protocol.get("source_dir_resolved"),
+            field="paired clean source_dir_resolved",
+        )
+        clean_source_protocol = read_json_object(
+            clean_source_dir / "protocol.json"
+        )
+        validate_source_protocol(
+            clean_source_protocol, variant=CLEAN_VARIANT, smoke=False
+        )
+        clean_source_seals = _sealed_e15_artifacts(clean_source_dir)
+        seal_expectations = {
+            "source_protocol_sha256": clean_source_seals[
+                "clean_reference_protocol_sha256"
+            ],
+            "source_git_commit": clean_source_seals[
+                "clean_reference_git_commit"
+            ],
+            "source_checkpoint_sha256": clean_source_seals[
+                "clean_reference_checkpoint_sha256"
+            ],
+            "source_evaluation_sha256": clean_source_seals[
+                "clean_reference_evaluation_sha256"
+            ],
+        }
+        seal_mismatches = {
+            field: (expected, clean_protocol.get(field))
+            for field, expected in seal_expectations.items()
+            if clean_protocol.get(field) != expected
+        }
+        if seal_mismatches:
+            raise RuntimeError(
+                "paired clean continuation source seals differ: "
+                f"{seal_mismatches}"
+            )
+        missing_common_fields = [
+            field
+            for field in OFFICIAL_CLEAN_SOURCE_COMMON_FIELDS
+            if field not in clean_source_protocol or field not in source_protocol
+        ]
+        if missing_common_fields:
+            raise RuntimeError(
+                "official/clean E15 source protocols lack paired fields: "
+                f"{missing_common_fields}"
+            )
+        source_mismatches = {
+            field: (clean_source_protocol.get(field), source_protocol.get(field))
+            for field in OFFICIAL_CLEAN_SOURCE_COMMON_FIELDS
+            if clean_source_protocol.get(field) != source_protocol.get(field)
+        }
+        if source_mismatches:
+            raise RuntimeError(
+                "official/clean E15 source protocols are not paired: "
+                f"{source_mismatches}"
+            )
+    else:
         raise RuntimeError(
-            "paired clean continuation is not the C source's sealed clean lineage: "
-            f"{lineage_mismatches}"
+            "only official or C may bind to a completed clean continuation"
         )
     for epoch in range(FIRST_CONTINUATION_EPOCH, int(protocol["stop_after_epoch"]) + 1):
         if not (clean_dir / f"train_e{epoch}.json").is_file():
@@ -538,9 +662,14 @@ def validate_epoch_pair(
     clean_train_path: Path,
     *,
     expected_trace_count: int,
+    variant: str = CANDIDATE_VARIANT,
 ) -> dict[str, Any]:
+    if variant not in (OFFICIAL_VARIANT, CANDIDATE_VARIANT):
+        raise ValueError("epoch pairing is only defined against official or C")
     clean = read_json_object(clean_train_path)
-    fields = ("paired_data_sha256", "raw_label_sha256")
+    fields = ["paired_data_sha256"]
+    if variant == CANDIDATE_VARIANT:
+        fields.append("raw_label_sha256")
     mismatches = {
         field: (clean.get(field), training.get(field))
         for field in fields
@@ -562,15 +691,62 @@ def validate_epoch_pair(
             len(candidate_trace),
             expected_trace_count,
         )
-    elif clean_trace != candidate_trace:
+    elif variant == CANDIDATE_VARIANT and clean_trace != candidate_trace:
         mismatches["first_batch_trace"] = ("clean", "candidate")
+    elif variant == OFFICIAL_VARIANT:
+        paired_trace_fields = (
+            "batch",
+            "pair_sha256",
+            "optical_sha256",
+            "sar_sha256",
+            "normalized_label_sha256",
+        )
+        for index, (clean_item, official_item) in enumerate(
+            zip(clean_trace, candidate_trace, strict=True), start=1
+        ):
+            for field in paired_trace_fields:
+                if clean_item.get(field) != official_item.get(field):
+                    mismatches[f"first_batch_trace[{index}].{field}"] = (
+                        clean_item.get(field),
+                        official_item.get(field),
+                    )
+    raw_label_equal = clean.get("raw_label_sha256") == training.get(
+        "raw_label_sha256"
+    )
+    if (
+        variant == OFFICIAL_VARIANT
+        and expected_trace_count == 10
+        and raw_label_equal
+    ):
+        mismatches["raw_label_sha256"] = (
+            "different_by_official-vs-ignore_padding_design",
+            "equal",
+        )
     if mismatches:
         raise RuntimeError(f"continuation epoch data pairing differs: {mismatches}")
+    raw_trace_difference_count = sum(
+        clean_item.get("raw_label_sha256")
+        != paired_item.get("raw_label_sha256")
+        for clean_item, paired_item in zip(
+            clean_trace, candidate_trace, strict=True
+        )
+    )
     return {
         "clean_train_path": str(clean_train_path),
+        "paired_variant": variant,
         "paired_data_sha256_equal": True,
-        "raw_label_sha256_equal": True,
-        "first_batch_trace_equal": True,
+        "raw_label_sha256_equal": raw_label_equal,
+        "raw_label_relation": (
+            "must_equal"
+            if variant == CANDIDATE_VARIANT
+            else "intentional_official_vs_ignore_padding_difference"
+        ),
+        "raw_label_difference_required": (
+            variant == OFFICIAL_VARIANT and expected_trace_count == 10
+        ),
+        "raw_label_trace_difference_count": raw_trace_difference_count,
+        "first_batch_trace_equal": clean_trace == candidate_trace,
+        "first_batch_trace_pair_fields_equal": True,
         "first_batch_trace_count": expected_trace_count,
     }
 
@@ -610,8 +786,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
-    if args.variant == CANDIDATE_VARIANT and args.paired_clean_dir is None:
-        parser.error("C continuation requires --paired-clean-dir")
+    if (
+        args.variant in (OFFICIAL_VARIANT, CANDIDATE_VARIANT)
+        and args.paired_clean_dir is None
+    ):
+        parser.error(
+            "official and C continuations require --paired-clean-dir; run the "
+            "clean arm first"
+        )
     if args.variant == CLEAN_VARIANT and args.paired_clean_dir is not None:
         parser.error("clean continuation must not receive --paired-clean-dir")
     if args.num_workers < 0 or args.inference_batch_size <= 0:
@@ -644,7 +826,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     )
     stop_after_epoch = FIRST_CONTINUATION_EPOCH if args.smoke else TARGET_EPOCH
-    evaluation_epochs = [stop_after_epoch]
+    evaluation_epochs = (
+        [stop_after_epoch] if args.smoke else list(FORMAL_EVALUATION_EPOCHS)
+    )
     max_train_batches = 1 if args.smoke else None
     max_test_images = 1 if args.smoke else None
     protocol = {
@@ -661,6 +845,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "scheduler_horizon_epochs": PROTOCOL_EPOCHS,
         "not_equivalent_to_uninterrupted": True,
         "persistent_worker_state_restored": False,
+        "three_arm_policy": "official_clean_C_all_required",
+        "official_arm_execution_policy": "unconditional",
         "unrestored_state": [
             "worker_python_numpy_torch_rng",
             "worker_lru_cache",
@@ -675,8 +861,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "loader_generator",
         ],
         "scientific_scope": (
-            "low-cost exploratory C-minus-clean persistence screen; not an "
-            "uninterrupted E30 result"
+            "three-arm E15-to-E30 epoch-boundary restart kill test with "
+            "E20/E25/E30 shape readings; not an uninterrupted E30 result"
         ),
         "model_name": source_protocol["model_name"],
         "dataset_name": source_protocol["dataset_name"],
@@ -687,10 +873,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "optical_stem_location": source_protocol.get("optical_stem_location"),
         "optical_stem_seed": source_protocol.get("optical_stem_seed"),
         "seed": source_protocol["seed"],
-        "mask_padding_ignore": True,
-        "mask_fill": a_runner.IGNORE_INDEX,
+        "mask_padding_ignore": args.variant != OFFICIAL_VARIANT,
+        "mask_fill": (
+            0 if args.variant == OFFICIAL_VARIANT else a_runner.IGNORE_INDEX
+        ),
         "aux_fill": 0,
         "loss_change": "none",
+        "clean_baseline_variant": (
+            CLEAN_VARIANT if args.variant == CANDIDATE_VARIANT else None
+        ),
         "train_batch_size_per_gpu": source_protocol["train_batch_size_per_gpu"],
         "train_workers": args.num_workers,
         "persistent_workers": args.num_workers > 0,
@@ -713,13 +904,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     if args.paired_clean_dir is not None:
         candidate_clean_lineage = seals.get("candidate_clean_lineage")
-        if not isinstance(candidate_clean_lineage, Mapping):
-            raise RuntimeError("C source lacks its sealed clean lineage")
         validate_completed_clean_continuation(
             args.paired_clean_dir,
             protocol=protocol,
             restart_rng_fingerprints=seals["restart_rng_fingerprints"],
             candidate_clean_lineage=candidate_clean_lineage,
+            source_protocol=source_protocol,
         )
 
     cfg, model, optimizer, scheduler = build_training_state(
@@ -735,6 +925,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     train_loader, test_loader, test_names, full_test_length, loader_generator = (
         build_loaders(
+            variant=args.variant,
             source_protocol=source_protocol,
             cfg=cfg,
             num_workers=args.num_workers,
@@ -765,7 +956,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise RuntimeError("continuation test dataset length changed")
     a_runner.prepare_output_dir(args.output_dir, protocol)
     print(
-        f"V4-C paired restart start variant={args.variant} "
+        f"V4 three-arm restart start variant={args.variant} "
         f"source=E{SOURCE_EPOCH} stop=E{stop_after_epoch} scope={protocol['scope']}",
         flush=True,
     )
@@ -808,6 +999,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 training,
                 args.paired_clean_dir / f"train_e{epoch}.json",
                 expected_trace_count=1 if args.smoke else 10,
+                variant=args.variant,
             )
         scheduler.step()
         training["learning_rates_after_scheduler_step"] = [
@@ -887,9 +1079,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.smoke:
         outcome = "PASS_RESTART_SMOKE_CONTRACT"
     elif args.variant == CLEAN_VARIANT:
-        outcome = "ESTABLISHES_PAIRED_RESTART_CLEAN_REFERENCE"
+        outcome = "COMPLETES_REQUIRED_CLEAN_RESTART_ARM"
+    elif args.variant == OFFICIAL_VARIANT:
+        outcome = "COMPLETES_UNCONDITIONAL_OFFICIAL_RESTART_ARM"
     else:
-        outcome = "PENDING_CLEAN_ONLY_E30_COMPARISON"
+        outcome = "COMPLETES_REQUIRED_C_RESTART_ARM"
     summary = {
         "status": "PASS",
         "outcome": outcome,
