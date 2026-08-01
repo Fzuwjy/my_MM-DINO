@@ -33,6 +33,31 @@ from scripts.compare_whu_v4_c_e30_continuation import (
 CLASS_NAMES = ("farmland", "city", "village", "water", "forest", "road", "other")
 
 
+def _fingerprint(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+def _rng_fingerprints(
+    *,
+    python: str = "python",
+    numpy: str = "numpy",
+    torch_cpu: str = "torch-cpu",
+    torch_cuda: tuple[str, ...] = ("torch-cuda",),
+    loader: str = "loader",
+) -> dict:
+    result = {
+        "python_sha256": _fingerprint(python),
+        "numpy_sha256": _fingerprint(numpy),
+        "torch_cpu_sha256": _fingerprint(torch_cpu),
+        "torch_cuda_sha256": [_fingerprint(value) for value in torch_cuda],
+        "loader_generator_sha256": _fingerprint(loader),
+    }
+    result["combined_sha256"] = hashlib.sha256(
+        json.dumps(result, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return result
+
+
 def _protocol(variant: str, *, scope: str = "formal-restart-screen") -> dict:
     smoke = scope == "smoke"
     source_key = {
@@ -75,13 +100,7 @@ def _protocol(variant: str, *, scope: str = "formal-restart-screen") -> dict:
         "evaluated_test_length": 1 if smoke else 20,
         "aux_fill": 0,
         "loss_change": "none",
-        "restart_rng_fingerprints": {
-            "python": "python-rng",
-            "numpy": "numpy-rng",
-            "torch_cpu": "torch-cpu-rng",
-            "torch_cuda": ["torch-cuda-rng"],
-            "loader_generator": "loader-rng",
-        },
+        "restart_rng_fingerprints": _rng_fingerprints(),
         "source_dir_resolved": f"/sealed/{source_key}",
         "source_protocol_sha256": f"{source_key}-protocol-sha",
         "source_git_commit": (
@@ -312,7 +331,8 @@ class V4CE30ThreeArmComparatorTest(unittest.TestCase):
         clean = _protocol(CLEAN_VARIANT)
         candidate = _protocol(CANDIDATE_VARIANT)
         audit = validate_protocol_triplet(official, clean, candidate)
-        self.assertTrue(audit["restart_rng_fingerprints_equal"])
+        self.assertTrue(audit["official_clean_restart_rng_fingerprints_equal"])
+        self.assertTrue(audit["candidate_clean_non_cuda_restart_rng_equal"])
         self.assertTrue(audit["candidate_clean_lineage_equal"])
         self.assertEqual(audit["evaluation_epochs"], [20, 25, 30])
 
@@ -367,6 +387,51 @@ class V4CE30ThreeArmComparatorTest(unittest.TestCase):
                         payloads["clean"],
                         payloads["candidate"],
                     )
+
+    def test_candidate_cuda_rng_is_variant_local_but_other_rng_is_paired(self):
+        official = _protocol(OFFICIAL_VARIANT)
+        clean = _protocol(CLEAN_VARIANT)
+        candidate = _protocol(CANDIDATE_VARIANT)
+        candidate["restart_rng_fingerprints"] = _rng_fingerprints(
+            torch_cuda=("candidate-local-cuda",)
+        )
+        audit = validate_protocol_triplet(official, clean, candidate)
+        self.assertTrue(audit["official_clean_restart_rng_fingerprints_equal"])
+        self.assertTrue(audit["candidate_clean_non_cuda_restart_rng_equal"])
+        self.assertFalse(audit["candidate_clean_torch_cuda_rng_equal"])
+        self.assertFalse(audit["candidate_clean_combined_rng_equal_descriptive_only"])
+        self.assertFalse(audit["combined_rng_hash_used_as_three_arm_gate"])
+        self.assertEqual(
+            audit["candidate_variant_local_stochastic_trajectory"]["observed"],
+            "variant_local_cuda_rng_state",
+        )
+
+        non_cuda_variants = {
+            "python": {"python": "drift"},
+            "numpy": {"numpy": "drift"},
+            "torch_cpu": {"torch_cpu": "drift"},
+            "loader": {"loader": "drift"},
+        }
+        for label, arguments in non_cuda_variants.items():
+            with self.subTest(candidate_non_cuda=label):
+                bad_candidate = deepcopy(candidate)
+                bad_candidate["restart_rng_fingerprints"] = _rng_fingerprints(
+                    torch_cuda=("candidate-local-cuda",), **arguments
+                )
+                with self.assertRaisesRegex(RuntimeError, "non.cuda|protocol"):
+                    validate_protocol_triplet(official, clean, bad_candidate)
+
+        bad_official = deepcopy(official)
+        bad_official["restart_rng_fingerprints"] = _rng_fingerprints(
+            torch_cuda=("official-drift",)
+        )
+        with self.assertRaisesRegex(RuntimeError, "official.clean|protocol"):
+            validate_protocol_triplet(bad_official, clean, candidate)
+
+        empty_cuda = deepcopy(candidate)
+        empty_cuda["restart_rng_fingerprints"] = _rng_fingerprints(torch_cuda=())
+        with self.assertRaisesRegex(RuntimeError, "non-empty"):
+            validate_protocol_triplet(official, clean, empty_cuda)
 
     def test_paired_clean_directories_are_bound_to_supplied_clean(self):
         with tempfile.TemporaryDirectory() as directory:

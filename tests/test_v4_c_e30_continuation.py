@@ -115,6 +115,15 @@ def _rng_state(seed: int = 19) -> dict:
             torch.cuda.set_rng_state_all(previous_cuda)
 
 
+def _pairing_fingerprints(seed: int, cuda_hash: str) -> dict:
+    fingerprints = rng_state_fingerprints(_rng_state(seed))
+    fingerprints["torch_cuda_sha256"] = [cuda_hash]
+    # The combined digest is variant-local provenance.  The pairing contract
+    # deliberately does not use it to force C's CUDA state to match clean.
+    fingerprints["combined_sha256"] = f"combined-{cuda_hash}"
+    return fingerprints
+
+
 def _write_sealed_source(
     root: Path,
     *,
@@ -485,18 +494,13 @@ class V4CE30ContinuationTest(unittest.TestCase):
                 protocol=_source_protocol(OFFICIAL_VARIANT),
                 directory_name="official-source",
             )
-            clean_loaded = load_sealed_source(
+            load_sealed_source(
                 clean_source, variant=CLEAN_VARIANT, smoke=False
             )
             official_loaded = load_sealed_source(
                 official_source, variant=OFFICIAL_VARIANT, smoke=False
             )
-            clean_seals = clean_loaded[4]
-            fingerprints = clean_seals["restart_rng_fingerprints"]
-            self.assertEqual(
-                fingerprints,
-                official_loaded[4]["restart_rng_fingerprints"],
-            )
+            fingerprints = _pairing_fingerprints(19, "shared-cuda")
 
             clean_continuation = root / "clean-continuation"
             clean_continuation.mkdir()
@@ -537,14 +541,27 @@ class V4CE30ContinuationTest(unittest.TestCase):
             )
 
             official_protocol = _pair_protocol(OFFICIAL_VARIANT)
-            validate_completed_clean_continuation(
+            validation = validate_completed_clean_continuation(
                 clean_continuation,
                 protocol=official_protocol,
-                restart_rng_fingerprints=official_loaded[4][
-                    "restart_rng_fingerprints"
-                ],
+                restart_rng_fingerprints=deepcopy(fingerprints),
                 source_protocol=official_loaded[0],
             )
+            rng_audit = validation["restart_rng_pairing_audit"]
+            self.assertTrue(rng_audit["all_fingerprints_equal"])
+            self.assertTrue(rng_audit["cuda_fingerprints_equal"])
+            self.assertEqual(rng_audit["cuda_equality_policy"], "must_equal")
+
+            official_cuda_drift = deepcopy(fingerprints)
+            official_cuda_drift["torch_cuda_sha256"] = ["official-different"]
+            official_cuda_drift["combined_sha256"] = "combined-official-different"
+            with self.assertRaisesRegex(RuntimeError, "official/clean.*differ"):
+                validate_completed_clean_continuation(
+                    clean_continuation,
+                    protocol=official_protocol,
+                    restart_rng_fingerprints=official_cuda_drift,
+                    source_protocol=official_loaded[0],
+                )
             official_training = {
                 "paired_data_sha256": "normalized-pair",
                 "raw_label_sha256": "official-zero-labels",
@@ -613,14 +630,15 @@ class V4CE30ContinuationTest(unittest.TestCase):
                 validate_completed_clean_continuation(
                     clean_continuation,
                     protocol=official_protocol,
-                    restart_rng_fingerprints=official_loaded[4][
-                        "restart_rng_fingerprints"
-                    ],
+                    restart_rng_fingerprints=deepcopy(fingerprints),
                     source_protocol=drifted_official,
                 )
 
     def test_clean_candidate_pairing_rejects_rng_hash_or_epoch_data_drift(self):
-        fingerprints = rng_state_fingerprints(_rng_state(7))
+        clean_fingerprints = _pairing_fingerprints(7, "clean-cuda")
+        candidate_fingerprints = deepcopy(clean_fingerprints)
+        candidate_fingerprints["torch_cuda_sha256"] = ["candidate-cuda"]
+        candidate_fingerprints["combined_sha256"] = "combined-candidate-cuda"
         candidate_protocol = _pair_protocol(CANDIDATE_VARIANT)
         lineage = {
             "clean_reference_dir": "/sealed/clean",
@@ -633,7 +651,7 @@ class V4CE30ContinuationTest(unittest.TestCase):
             clean = Path(directory) / "clean"
             clean.mkdir()
             clean_protocol = _pair_protocol(CLEAN_VARIANT)
-            clean_protocol["restart_rng_fingerprints"] = fingerprints
+            clean_protocol["restart_rng_fingerprints"] = clean_fingerprints
             clean_protocol.update(
                 {
                     "source_dir_resolved": lineage["clean_reference_dir"],
@@ -667,25 +685,46 @@ class V4CE30ContinuationTest(unittest.TestCase):
             )
             (clean / "evaluation_e16.json").write_text("{}", encoding="utf-8")
 
-            validate_completed_clean_continuation(
+            candidate_before = deepcopy(candidate_fingerprints)
+            validation = validate_completed_clean_continuation(
                 clean,
                 protocol=candidate_protocol,
-                restart_rng_fingerprints=fingerprints,
+                restart_rng_fingerprints=candidate_fingerprints,
                 candidate_clean_lineage=lineage,
             )
+            self.assertEqual(candidate_fingerprints, candidate_before)
+            rng_audit = validation["restart_rng_pairing_audit"]
+            self.assertTrue(rng_audit["non_cuda_fingerprints_equal"])
+            self.assertFalse(rng_audit["cuda_fingerprints_equal"])
+            self.assertFalse(rng_audit["all_fingerprints_equal"])
+            self.assertEqual(
+                rng_audit["cuda_equality_policy"],
+                "variant_local_not_compared",
+            )
+            self.assertTrue(rng_audit["variant_local_cuda_restore_required"])
             validate_epoch_pair(
                 training,
                 clean / "train_e16.json",
                 expected_trace_count=1,
             )
 
-            changed_rng = deepcopy(fingerprints)
-            changed_rng["combined_sha256"] = "different"
-            with self.assertRaisesRegex(RuntimeError, "RNG states differ"):
+            changed_rng = deepcopy(candidate_fingerprints)
+            changed_rng["torch_cpu_sha256"] = "different"
+            with self.assertRaisesRegex(RuntimeError, "non-CUDA.*differ"):
                 validate_completed_clean_continuation(
                     clean,
                     protocol=candidate_protocol,
                     restart_rng_fingerprints=changed_rng,
+                    candidate_clean_lineage=lineage,
+                )
+
+            empty_cuda = deepcopy(candidate_fingerprints)
+            empty_cuda["torch_cuda_sha256"] = []
+            with self.assertRaisesRegex(RuntimeError, "non-empty list"):
+                validate_completed_clean_continuation(
+                    clean,
+                    protocol=candidate_protocol,
+                    restart_rng_fingerprints=empty_cuda,
                     candidate_clean_lineage=lineage,
                 )
 
@@ -695,7 +734,7 @@ class V4CE30ContinuationTest(unittest.TestCase):
                 validate_completed_clean_continuation(
                     clean,
                     protocol=candidate_protocol,
-                    restart_rng_fingerprints=fingerprints,
+                    restart_rng_fingerprints=candidate_fingerprints,
                     candidate_clean_lineage=changed_lineage,
                 )
 

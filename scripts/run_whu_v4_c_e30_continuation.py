@@ -526,6 +526,101 @@ OFFICIAL_CLEAN_SOURCE_COMMON_FIELDS = (
     "soft_ce_residual_confound",
 )
 
+NON_CUDA_RNG_FINGERPRINT_FIELDS = (
+    "python_sha256",
+    "numpy_sha256",
+    "torch_cpu_sha256",
+    "loader_generator_sha256",
+)
+
+
+def validate_paired_restart_rng_fingerprints(
+    clean_fingerprints: Mapping[str, Any],
+    variant_fingerprints: Mapping[str, Any],
+    *,
+    variant: str,
+) -> dict[str, Any]:
+    """Validate only the RNG equality that is scientifically pairable.
+
+    Official and clean have the same architecture and must match in every
+    saved RNG fingerprint.  C's different model/training execution path can
+    legitimately leave its sealed E15 checkpoint at a different CUDA RNG
+    state; continuation must restore that arm-local state instead of replacing
+    it with clean's.  The four non-CUDA components covered by the pairing
+    contract, including the loader generator that drives the data stream, must
+    still match clean exactly.
+    """
+
+    if variant not in (OFFICIAL_VARIANT, CANDIDATE_VARIANT):
+        raise ValueError("restart RNG pairing is only defined for official or C")
+    clean = dict(clean_fingerprints)
+    current = dict(variant_fingerprints)
+    missing = {
+        "clean": [
+            field
+            for field in (*NON_CUDA_RNG_FINGERPRINT_FIELDS, "torch_cuda_sha256")
+            if field not in clean
+        ],
+        "variant": [
+            field
+            for field in (*NON_CUDA_RNG_FINGERPRINT_FIELDS, "torch_cuda_sha256")
+            if field not in current
+        ],
+    }
+    missing = {arm: fields for arm, fields in missing.items() if fields}
+    if missing:
+        raise RuntimeError(f"paired RNG fingerprints lack fields: {missing}")
+
+    def require_cuda_fingerprints(payload: Mapping[str, Any], arm: str) -> list[str]:
+        values = payload["torch_cuda_sha256"]
+        if not isinstance(values, list) or not values or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise RuntimeError(
+                f"{arm} torch_cuda_sha256 must be a non-empty list of hashes"
+            )
+        return list(values)
+
+    clean_cuda = require_cuda_fingerprints(clean, "clean")
+    variant_cuda = require_cuda_fingerprints(current, variant)
+    cuda_equal = clean_cuda == variant_cuda
+    if variant == OFFICIAL_VARIANT:
+        if clean != current:
+            raise RuntimeError(
+                "official/clean source checkpoint RNG fingerprints differ"
+            )
+        non_cuda_equal = True
+        all_equal = True
+        cuda_policy = "must_equal"
+    else:
+        non_cuda_mismatches = {
+            field: (clean[field], current[field])
+            for field in NON_CUDA_RNG_FINGERPRINT_FIELDS
+            if clean[field] != current[field]
+        }
+        if non_cuda_mismatches:
+            raise RuntimeError(
+                "C/clean non-CUDA source checkpoint RNG fingerprints differ: "
+                f"{non_cuda_mismatches}"
+            )
+        non_cuda_equal = True
+        all_equal = clean == current
+        cuda_policy = "variant_local_not_compared"
+
+    return {
+        "variant": variant,
+        "non_cuda_fields": list(NON_CUDA_RNG_FINGERPRINT_FIELDS),
+        "non_cuda_fingerprints_equal": non_cuda_equal,
+        "cuda_fingerprints_nonempty": True,
+        "cuda_fingerprints_equal": cuda_equal,
+        "all_fingerprints_equal": all_equal,
+        "cuda_equality_policy": cuda_policy,
+        "variant_local_cuda_restore_required": True,
+        "variant_local_cuda_restore_source": "own_sealed_E15_checkpoint",
+        "clean_cuda_sha256": clean_cuda,
+        "variant_cuda_sha256": variant_cuda,
+    }
+
 
 def validate_completed_clean_continuation(
     clean_dir: Path,
@@ -548,11 +643,15 @@ def validate_completed_clean_continuation(
     }
     if mismatches:
         raise RuntimeError(f"paired clean continuation protocol differs: {mismatches}")
-    if clean_protocol.get("restart_rng_fingerprints") != dict(
-        restart_rng_fingerprints
-    ):
-        raise RuntimeError("paired source checkpoint RNG states differ")
     variant = protocol.get("variant")
+    clean_rng_fingerprints = clean_protocol.get("restart_rng_fingerprints")
+    if not isinstance(clean_rng_fingerprints, Mapping):
+        raise RuntimeError("paired clean continuation lacks RNG fingerprints")
+    restart_rng_pairing_audit = validate_paired_restart_rng_fingerprints(
+        clean_rng_fingerprints,
+        restart_rng_fingerprints,
+        variant=str(variant),
+    )
     if variant == CANDIDATE_VARIANT:
         if not isinstance(candidate_clean_lineage, Mapping):
             raise RuntimeError("C continuation lacks its sealed clean lineage")
@@ -654,7 +753,10 @@ def validate_completed_clean_continuation(
     for epoch in protocol["evaluation_epochs"]:
         if not (clean_dir / f"evaluation_e{int(epoch)}.json").is_file():
             raise FileNotFoundError(f"paired clean continuation lacks eval E{epoch}")
-    return clean_protocol
+    return {
+        "clean_protocol": clean_protocol,
+        "restart_rng_pairing_audit": restart_rng_pairing_audit,
+    }
 
 
 def validate_epoch_pair(
@@ -904,13 +1006,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     if args.paired_clean_dir is not None:
         candidate_clean_lineage = seals.get("candidate_clean_lineage")
-        validate_completed_clean_continuation(
+        paired_clean_validation = validate_completed_clean_continuation(
             args.paired_clean_dir,
             protocol=protocol,
             restart_rng_fingerprints=seals["restart_rng_fingerprints"],
             candidate_clean_lineage=candidate_clean_lineage,
             source_protocol=source_protocol,
         )
+        protocol = {
+            **protocol,
+            "paired_clean_restart_rng_audit": paired_clean_validation[
+                "restart_rng_pairing_audit"
+            ],
+        }
 
     cfg, model, optimizer, scheduler = build_training_state(
         variant=args.variant,

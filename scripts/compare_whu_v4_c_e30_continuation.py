@@ -71,6 +71,14 @@ SOURCE_SEAL_FIELDS = (
     "source_evaluation_sha256",
 )
 
+RNG_NON_CUDA_FIELDS = (
+    "python_sha256",
+    "numpy_sha256",
+    "torch_cpu_sha256",
+    "loader_generator_sha256",
+)
+RNG_FINGERPRINT_FIELDS = (*RNG_NON_CUDA_FIELDS, "torch_cuda_sha256", "combined_sha256")
+
 
 def read_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -113,6 +121,40 @@ def _nonempty_seals(payload: Mapping[str, Any], *, arm: str) -> dict[str, Any]:
             raise RuntimeError(f"{arm} protocol has an empty source seal {field!r}")
         seals[field] = value
     return seals
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validated_rng_fingerprints(value: Any, *, arm: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{arm} restart RNG fingerprints are not an object")
+    if set(value) != set(RNG_FINGERPRINT_FIELDS):
+        raise RuntimeError(f"{arm} restart RNG fingerprint fields differ")
+    invalid = [field for field in RNG_NON_CUDA_FIELDS if not _is_sha256(value[field])]
+    cuda = value["torch_cuda_sha256"]
+    if not isinstance(cuda, list) or not cuda or any(not _is_sha256(item) for item in cuda):
+        raise RuntimeError(f"{arm} CUDA RNG fingerprints must be a non-empty SHA256 list")
+    if not _is_sha256(value["combined_sha256"]):
+        invalid.append("combined_sha256")
+    if invalid:
+        raise RuntimeError(f"{arm} restart RNG fingerprints are invalid: {invalid}")
+    components = {field: value[field] for field in RNG_FINGERPRINT_FIELDS if field != "combined_sha256"}
+    expected_combined = hashlib.sha256(
+        json.dumps(components, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if value["combined_sha256"] != expected_combined:
+        raise RuntimeError(f"{arm} combined RNG fingerprint is internally inconsistent")
+    return {
+        **{field: value[field] for field in RNG_NON_CUDA_FIELDS},
+        "torch_cuda_sha256": list(cuda),
+        "combined_sha256": value["combined_sha256"],
+    }
 
 
 def _expected_epochs(scope: str) -> tuple[int, tuple[int, ...]]:
@@ -395,13 +437,34 @@ def validate_protocol_triplet(
             mismatches[field] = values
 
     rng_values = {
-        arm: _required(payload, "restart_rng_fingerprints", arm=f"{arm} protocol")
+        arm: _validated_rng_fingerprints(
+            _required(payload, "restart_rng_fingerprints", arm=f"{arm} protocol"),
+            arm=arm,
+        )
         for arm, payload in payloads.items()
     }
-    if any(not isinstance(value, Mapping) or not value for value in rng_values.values()):
-        raise RuntimeError("three-arm restart RNG fingerprints must be non-empty objects")
-    if not (rng_values["official"] == rng_values["clean"] == rng_values["candidate"]):
-        mismatches["restart_rng_fingerprints"] = rng_values
+    if rng_values["official"] != rng_values["clean"]:
+        mismatches["official_clean_restart_rng_fingerprints"] = {
+            "official": rng_values["official"],
+            "clean": rng_values["clean"],
+        }
+    candidate_non_cuda_differences = {
+        field: (rng_values["clean"][field], rng_values["candidate"][field])
+        for field in RNG_NON_CUDA_FIELDS
+        if rng_values["clean"][field] != rng_values["candidate"][field]
+    }
+    if candidate_non_cuda_differences:
+        mismatches["candidate_clean_non_cuda_restart_rng"] = (
+            candidate_non_cuda_differences
+        )
+    candidate_cuda_equal = (
+        rng_values["candidate"]["torch_cuda_sha256"]
+        == rng_values["clean"]["torch_cuda_sha256"]
+    )
+    candidate_combined_equal = (
+        rng_values["candidate"]["combined_sha256"]
+        == rng_values["clean"]["combined_sha256"]
+    )
 
     lineage = _required(candidate, "candidate_clean_lineage", arm="candidate protocol")
     if not isinstance(lineage, Mapping):
@@ -431,8 +494,23 @@ def validate_protocol_triplet(
         "output_git_commit_equal": True,
         "seed_equal": True,
         "paired_protocol_fields_equal": True,
-        "restart_rng_fingerprints_equal": True,
-        "restart_rng_fingerprints": dict(rng_values["clean"]),
+        "official_clean_restart_rng_fingerprints_equal": True,
+        "candidate_clean_non_cuda_restart_rng_equal": True,
+        "candidate_clean_torch_cuda_rng_equal": candidate_cuda_equal,
+        "candidate_clean_combined_rng_equal_descriptive_only": (
+            candidate_combined_equal
+        ),
+        "combined_rng_hash_used_as_three_arm_gate": False,
+        "candidate_variant_local_stochastic_trajectory": {
+            "allowed_difference": "torch_cuda_sha256_only",
+            "torch_cuda_equal_to_clean": candidate_cuda_equal,
+            "observed": (
+                "shared_cuda_rng_state"
+                if candidate_cuda_equal
+                else "variant_local_cuda_rng_state"
+            ),
+            "data_stream_pairing_still_required": True,
+        },
         "source_seals_present": {arm: True for arm in payloads},
         "candidate_clean_lineage_equal": True,
         "intentional_protocol_difference": (
