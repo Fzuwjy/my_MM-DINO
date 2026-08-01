@@ -608,7 +608,9 @@ def main() -> None:
         "checked": args.max_images is None,
         "expected_miou_percent": EXPECTED_FULL_BASELINE_MIOU_PERCENT,
         "actual_miou_percent": aggregate["k1"]["miou_percent"],
-        "actual_minus_expected_pp": baseline_delta,
+        "actual_minus_expected_pp": (
+            baseline_delta if args.max_images is None else None
+        ),
         "tolerance_pp": args.baseline_miou_tolerance_pp,
         "within_tolerance": (
             abs(baseline_delta) <= args.baseline_miou_tolerance_pp
@@ -627,6 +629,15 @@ def main() -> None:
         aggregate["k4_8"]["minus_k1_miou_pp"],
         aggregate["k4_16_control"]["minus_k1_miou_pp"],
     )
+    interpretation["formal_scope"] = args.max_images is None
+    if args.max_images is not None:
+        interpretation["provisional_pattern"] = interpretation["outcome"]
+        interpretation["outcome"] = "SUBSET_SMOKE_ONLY"
+        interpretation["interpretation"] = (
+            "Subset smoke only; the observed per-tile pattern is not a dataset-level "
+            "efficacy conclusion. "
+            + interpretation["interpretation"]
+        )
     output = {
         "status": "PASS",
         "scope": "full-test" if args.max_images is None else "subset-smoke",
