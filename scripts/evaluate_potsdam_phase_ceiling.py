@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -43,6 +44,8 @@ EXPECTED_FULL_BASELINE_MIOU_PERCENT = 86.10387847691046
 PHASE_OFFSET = 8
 CONTROL_OFFSET = 16
 PHASE_NAMES = ("normal", "x", "y", "xy")
+PARTIAL_SCHEMA = "potsdam-phase-ceiling-partial-v1"
+CONDITION_NAMES = ("k1", "k2_x8", "k4_8", "k4_16")
 
 
 def file_sha256(path: Path) -> str:
@@ -51,6 +54,24 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def array_sha256(array: np.ndarray) -> str:
+    value = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(value.dtype).encode("ascii"))
+    digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+    digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
 
 
 def git_revision() -> str | None:
@@ -278,6 +299,123 @@ def ceiling_interpretation(
     }
 
 
+def serializable_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "image_index": int(record["image_index"]),
+        "sample_name": str(record["sample_name"]),
+        "shape_hw": [int(value) for value in record["shape_hw"]],
+        "confusions": {
+            name: np.asarray(record[name], dtype=np.int64).tolist()
+            for name in CONDITION_NAMES
+        },
+        "hashes": dict(record["hashes"]),
+        "elapsed_seconds": float(record["elapsed_seconds"]),
+    }
+
+
+def restored_record(
+    payload: dict[str, Any], bootstrap_replicates: int, bootstrap_seed: int
+) -> dict[str, Any]:
+    confusions = payload.get("confusions", {})
+    if set(confusions) != set(CONDITION_NAMES):
+        raise ValueError("partial record does not contain all phase conditions")
+    record = {
+        name: np.asarray(confusions[name], dtype=np.int64)
+        for name in CONDITION_NAMES
+    }
+    if any(value.shape != (len(CLASS_NAMES), len(CLASS_NAMES)) for value in record.values()):
+        raise ValueError("partial record contains a malformed confusion matrix")
+    hashes = payload.get("hashes")
+    required_hashes = {"label", *CONDITION_NAMES}
+    if not isinstance(hashes, dict) or set(hashes) != required_hashes:
+        raise ValueError("partial record hashes are incomplete")
+    record.update(
+        {
+            "image_index": int(payload["image_index"]),
+            "sample_name": str(payload["sample_name"]),
+            "shape_hw": [int(value) for value in payload["shape_hw"]],
+            "hashes": {name: str(value) for name, value in hashes.items()},
+            "elapsed_seconds": float(payload["elapsed_seconds"]),
+            "bootstrap_replicates": int(bootstrap_replicates),
+            "bootstrap_seed": int(bootstrap_seed),
+        }
+    )
+    return record
+
+
+def partial_protocol_binding(
+    *,
+    checkpoint_sha256: str,
+    inference_batch_size: int,
+    valid_margin: int,
+    seed: int,
+    sample_names: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "checkpoint_sha256": checkpoint_sha256,
+        "dataset": DATASET_NAME,
+        "model": MODEL_NAME,
+        "backbone": BACKBONE_TYPE,
+        "num_modalities": NUM_MODALITIES,
+        "use_lora": False,
+        "crop_size_hw": [512, 512],
+        "stride_hw": [341, 341],
+        "inference_batch_size": int(inference_batch_size),
+        "valid_margin": int(valid_margin),
+        "seed": int(seed),
+        "sample_names": [str(name) for name in sample_names],
+        "primary_phases_dy_dx": [list(shift) for shift in four_phase_shifts(8)],
+        "control_phases_dy_dx": [list(shift) for shift in four_phase_shifts(16)],
+    }
+
+
+def write_partial_journal(
+    path: Path,
+    binding: dict[str, Any],
+    records: Sequence[dict[str, Any]],
+    *,
+    complete: bool,
+) -> None:
+    atomic_write_json(
+        path,
+        {
+            "schema": PARTIAL_SCHEMA,
+            "status": "complete" if complete else "in_progress",
+            "binding": binding,
+            "completed_images": len(records),
+            "records": [serializable_record(record) for record in records],
+        },
+    )
+
+
+def load_partial_journal(
+    path: Path,
+    expected_binding: dict[str, Any],
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != PARTIAL_SCHEMA:
+        raise ValueError("partial journal schema is not recognized")
+    if payload.get("binding") != expected_binding:
+        raise ValueError("partial journal protocol/checkpoint binding differs")
+    records_payload = payload.get("records")
+    if not isinstance(records_payload, list):
+        raise ValueError("partial journal records are malformed")
+    if payload.get("completed_images") != len(records_payload):
+        raise ValueError("partial journal completed-image count is inconsistent")
+    records = [
+        restored_record(record, bootstrap_replicates, bootstrap_seed)
+        for record in records_payload
+    ]
+    expected_names = expected_binding["sample_names"][: len(records)]
+    if [record["sample_name"] for record in records] != expected_names:
+        raise ValueError("partial journal sample prefix differs from current test order")
+    if [record["image_index"] for record in records] != list(range(len(records))):
+        raise ValueError("partial journal image indices are not a contiguous prefix")
+    return records
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Potsdam ViT-L multimodal K1/K2/K4 spatial-phase ceiling"
@@ -292,11 +430,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260801)
     parser.add_argument("--baseline-miou-tolerance-pp", type=float, default=1e-3)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a matching output-path.partial.json journal",
+    )
     args = parser.parse_args()
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {args.checkpoint}")
     if args.output_path.exists():
         parser.error(f"refusing to overwrite output: {args.output_path}")
+    partial_path = Path(str(args.output_path) + ".partial.json")
+    if args.resume and not partial_path.is_file():
+        parser.error(f"resume journal does not exist: {partial_path}")
+    if not args.resume and partial_path.exists():
+        parser.error(
+            f"partial journal already exists; pass --resume or choose a new output: "
+            f"{partial_path}"
+        )
     if args.inference_batch_size <= 0:
         parser.error("--inference-batch-size must be positive")
     if args.valid_margin < 0:
@@ -423,6 +574,26 @@ def main() -> None:
     if len(set(all_nonzero_shifts)) != 6:
         raise AssertionError("primary and control nonzero phases must be distinct")
 
+    partial_path = Path(str(args.output_path) + ".partial.json")
+    partial_binding = partial_protocol_binding(
+        checkpoint_sha256=checkpoint_sha,
+        inference_batch_size=args.inference_batch_size,
+        valid_margin=args.valid_margin,
+        seed=args.seed,
+        sample_names=sample_names,
+    )
+    records: list[dict[str, Any]] = (
+        load_partial_journal(
+            partial_path,
+            partial_binding,
+            args.bootstrap_replicates,
+            args.bootstrap_seed,
+        )
+        if args.resume
+        else []
+    )
+    resumed_image_count = len(records)
+
     print(f"torch={torch.__version__}", flush=True)
     print(f"cuda={torch.version.cuda}", flush=True)
     print(f"gpu={torch.cuda.get_device_name(device)}", flush=True)
@@ -432,12 +603,16 @@ def main() -> None:
     print(f"primary_phases={primary_shifts}", flush=True)
     print(f"control_phases={control_shifts}", flush=True)
     print(f"evaluated_images={len(loader.dataset)}/{full_test_length}", flush=True)
+    print(
+        f"partial_journal={partial_path.resolve()} "
+        f"resumed_images={len(records)}",
+        flush=True,
+    )
+    if not args.resume:
+        write_partial_journal(
+            partial_path, partial_binding, records, complete=False
+        )
 
-    records: list[dict[str, Any]] = []
-    prediction_digests = {
-        name: hashlib.sha256() for name in ("k1", "k2_x8", "k4_8", "k4_16")
-    }
-    label_digest = hashlib.sha256()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
@@ -446,12 +621,18 @@ def main() -> None:
         for image_index, ((optical, dsm, label_tensor), sample_name) in enumerate(
             zip(loader, sample_names, strict=True)
         ):
+            if image_index < len(records):
+                print(
+                    f"image={image_index + 1}/{len(loader.dataset)} "
+                    f"name={sample_name} resume_skip=PASS",
+                    flush=True,
+                )
+                continue
             image_started = time.perf_counter()
             label = np.ascontiguousarray(
                 label_tensor[0].numpy().astype(np.int16, copy=False)
             )
             shape = tuple(int(value) for value in label.shape)
-            label_digest.update(label.tobytes())
             common_slice, shifted_slices = common_translation_slices(
                 shape, all_nonzero_shifts, args.valid_margin
             )
@@ -478,7 +659,6 @@ def main() -> None:
             baseline_prediction = np.ascontiguousarray(
                 baseline_scores[0].argmax(dim=0).numpy().astype(np.int16, copy=False)
             )
-            prediction_digests["k1"].update(baseline_prediction.tobytes())
             score_sums = {
                 PHASE_OFFSET: baseline_scores[
                     0, :, common_slice[0], common_slice[1]
@@ -530,7 +710,6 @@ def main() -> None:
                     k2_prediction = prediction_from_score_sum(
                         baseline_prediction, x_score_sum, x_slice
                     )
-                    prediction_digests["k2_x8"].update(k2_prediction.tobytes())
                     del x_score_sum
                 del phase_scores, aligned
 
@@ -542,9 +721,6 @@ def main() -> None:
             control_prediction = prediction_from_score_sum(
                 baseline_prediction, score_sums[CONTROL_OFFSET], common_slice
             )
-            prediction_digests["k4_8"].update(k4_prediction.tobytes())
-            prediction_digests["k4_16"].update(control_prediction.tobytes())
-
             image_confusions = {
                 "k1": confusion_from_arrays(baseline_prediction, label),
                 "k2_x8": confusion_from_arrays(k2_prediction, label),
@@ -555,15 +731,27 @@ def main() -> None:
                 name: metric_summary(confusion)["miou_percent"]
                 for name, confusion in image_confusions.items()
             }
+            image_elapsed = time.perf_counter() - image_started
             records.append(
                 {
                     **image_confusions,
                     "image_index": image_index,
                     "sample_name": sample_name,
                     "shape_hw": list(shape),
+                    "hashes": {
+                        "label": array_sha256(label),
+                        "k1": array_sha256(baseline_prediction),
+                        "k2_x8": array_sha256(k2_prediction),
+                        "k4_8": array_sha256(k4_prediction),
+                        "k4_16": array_sha256(control_prediction),
+                    },
+                    "elapsed_seconds": image_elapsed,
                     "bootstrap_replicates": args.bootstrap_replicates,
                     "bootstrap_seed": args.bootstrap_seed,
                 }
+            )
+            write_partial_journal(
+                partial_path, partial_binding, records, complete=False
             )
             print(
                 f"image={image_index + 1}/{len(loader.dataset)} name={sample_name} "
@@ -571,7 +759,7 @@ def main() -> None:
                 f"K2x8={image_metrics['k2_x8']:.6f}% "
                 f"K4x8={image_metrics['k4_8']:.6f}% "
                 f"K4x16={image_metrics['k4_16']:.6f}% "
-                f"seconds={time.perf_counter() - image_started:.1f}",
+                f"seconds={image_elapsed:.1f} partial_saved=PASS",
                 flush=True,
             )
             del (
@@ -588,7 +776,11 @@ def main() -> None:
             )
 
     torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - started
+    invocation_elapsed = time.perf_counter() - started
+    if len(records) != len(loader.dataset):
+        raise AssertionError("phase journal does not cover the selected dataset")
+    write_partial_journal(partial_path, partial_binding, records, complete=True)
+    elapsed = sum(float(record["elapsed_seconds"]) for record in records)
     baseline_stack = np.stack([record["k1"] for record in records])
     aggregate = {
         "k1": metric_summary(baseline_stack.sum(axis=0)),
@@ -636,6 +828,19 @@ def main() -> None:
             "efficacy conclusion. "
             + interpretation["interpretation"]
         )
+    per_image_hashes = [
+        {
+            "image_index": record["image_index"],
+            "sample_name": record["sample_name"],
+            **record["hashes"],
+        }
+        for record in records
+    ]
+    hash_manifest_sha256 = hashlib.sha256(
+        json.dumps(
+            per_image_hashes, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
     output = {
         "status": "PASS" if baseline_pass else "BASELINE_VALIDATION_FAILED",
         "scope": "full-test" if args.max_images is None else "subset-smoke",
@@ -651,6 +856,13 @@ def main() -> None:
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_sha,
         "checkpoint_audit": checkpoint_audit,
+        "resume": {
+            "used": args.resume,
+            "resumed_images": resumed_image_count,
+            "partial_journal": str(partial_path.resolve()),
+            "partial_schema": PARTIAL_SCHEMA,
+            "journal_complete": True,
+        },
         "full_test_length": full_test_length,
         "evaluated_images": len(records),
         "sample_manifest": [
@@ -706,11 +918,9 @@ def main() -> None:
         },
         "ceiling_interpretation": interpretation,
         "hashes": {
-            "label_int16_sha256": label_digest.hexdigest(),
-            **{
-                f"{name}_prediction_int16_sha256": digest.hexdigest()
-                for name, digest in prediction_digests.items()
-            },
+            "scheme": "per-image dtype+shape+bytes SHA256; canonical manifest SHA256",
+            "per_image": per_image_hashes,
+            "manifest_sha256": hash_manifest_sha256,
         },
         "reproducibility": {
             "git_revision": git_revision(),
@@ -722,14 +932,12 @@ def main() -> None:
         },
         "runtime": {
             "elapsed_seconds": elapsed,
+            "this_invocation_seconds": invocation_elapsed,
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3,
             "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 1024**3,
         },
     }
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    args.output_path.write_text(
-        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(args.output_path, output)
     print(
         json.dumps(
             {
