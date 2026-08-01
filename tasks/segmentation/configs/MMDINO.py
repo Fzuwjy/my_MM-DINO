@@ -49,7 +49,11 @@ def get_cfg(model_name=None, dataset_name=None, **kwargs):
                             naf_backend=kwargs.get('naf_backend',
                                                    'cutlass-fna'),
                             naf_q_tile_shape=kwargs.get('naf_q_tile_shape'),
-                            naf_kv_tile_shape=kwargs.get('naf_kv_tile_shape'))
+                            naf_kv_tile_shape=kwargs.get('naf_kv_tile_shape'),
+                            use_optical_stem=kwargs.get(
+                                'use_optical_stem', False),
+                            optical_stem_seed=kwargs.get(
+                                'optical_stem_seed', 0))
     else:
         raise ValueError("Model name not recognized")
 

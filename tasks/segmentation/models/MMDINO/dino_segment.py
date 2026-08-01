@@ -53,8 +53,16 @@ class DINOSegmentModule(nn.Module):
         naf_backend: str = "cutlass-fna",
         naf_q_tile_shape=None,
         naf_kv_tile_shape=None,
+        use_optical_stem: bool = False,
+        optical_stem_seed: int = 0,
     ):
         super().__init__()
+
+        self.use_optical_stem = bool(use_optical_stem)
+        if self.use_optical_stem and decoder_type != 'Decoder':
+            raise ValueError(
+                "the optical spatial stem is only implemented for Decoder"
+            )
 
         dinov3_vits_dict = {
             "dinov3_vits16": dinov3_vits16,
@@ -100,6 +108,8 @@ class DINOSegmentModule(nn.Module):
         if decoder_type == 'LinearHead':
             self.decoder = LinearHead(in_ch=embed_dim, n_classes=n_classes)
         elif decoder_type == 'Decoder':
+            decoder_kwargs["use_optical_stem"] = self.use_optical_stem
+            decoder_kwargs["optical_stem_seed"] = optical_stem_seed
             self.decoder = Decoder(**decoder_kwargs)
         elif decoder_type == 'Decoder_FRM':
             self.decoder = Decoder_FRM(**decoder_kwargs)
@@ -158,6 +168,10 @@ class DINOSegmentModule(nn.Module):
     def forward(self, *modalities):
         if len(modalities) == 0:
             raise ValueError("At least one modality must be provided")
+        if self.use_optical_stem and len(modalities) == 1:
+            raise ValueError(
+                "the optical spatial stem requires multimodal inputs"
+            )
 
         # 主输入x
         x = modalities[0]
@@ -231,7 +245,11 @@ class DINOSegmentModule(nn.Module):
                         processed_outputs_modality)
 
             # 将处理后的所有模态特征传递给解码器
-            logits = self.decoder(*processed_outputs_modalities)
+            if self.use_optical_stem:
+                logits = self.decoder(*processed_outputs_modalities,
+                                      guidance=x)
+            else:
+                logits = self.decoder(*processed_outputs_modalities)
 
         _H, _W = logits.shape[2:]
         if _H != H or _W != W:

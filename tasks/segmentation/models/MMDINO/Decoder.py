@@ -351,6 +351,38 @@ class ProgressiveRefinementNeck(nn.Module):
         return [P2_out, P3_out, P4_out]
 
 
+class OpticalSpatialStem(nn.Module):
+    """Low-cost optical path used by the research-only V4-C variant."""
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+        )
+        self.projection = nn.Conv2d(64, out_channels, kernel_size=1)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, optical: torch.Tensor) -> torch.Tensor:
+        if optical.ndim != 4 or optical.shape[1] != 3:
+            raise ValueError(
+                "optical guidance must have shape [B, 3, H, W]"
+            )
+        if optical.shape[-2] % 16 != 0 or optical.shape[-1] % 16 != 0:
+            raise ValueError(
+                "optical guidance height and width must be divisible by 16"
+            )
+        return self.projection(self.features(optical))
+
+
 class Decoder(nn.Module):
 
     def __init__(
@@ -359,6 +391,8 @@ class Decoder(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        use_optical_stem: bool = False,
+        optical_stem_seed: int = 0,
     ):
         super().__init__()
 
@@ -386,7 +420,20 @@ class Decoder(nn.Module):
 
         self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
 
-    def forward(self, *modalities):
+        self.optical_stem = None
+        if use_optical_stem:
+            if num_modalities <= 1:
+                raise ValueError(
+                    "the optical spatial stem requires a multimodal decoder"
+                )
+            # Construct the new branch on an isolated CPU RNG stream.  This is
+            # deliberately last so every released parameter keeps its original
+            # initialization order and value.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(optical_stem_seed)
+                self.optical_stem = OpticalSpatialStem(out_channels)
+
+    def forward(self, *modalities, guidance=None):
         if len(modalities) == 1:
             # 单模态情况：仅使用第一个模态
             x = modalities[0]
@@ -408,6 +455,19 @@ class Decoder(nn.Module):
             ff2 = self.fusion2(*all_x3)
             ff3 = self.fusion3(*all_x4)
             ff4 = self.fusion4(*all_x5)
+
+            if self.optical_stem is not None:
+                if guidance is None:
+                    raise ValueError(
+                        "optical guidance is required when the optical stem is enabled"
+                    )
+                shallow_feature = self.optical_stem(guidance)
+                if shallow_feature.shape != ff1.shape:
+                    raise ValueError(
+                        "optical stem output shape does not match the fused L0 "
+                        f"feature: {tuple(shallow_feature.shape)} != {tuple(ff1.shape)}"
+                    )
+                ff1 = ff1 + shallow_feature
 
             features = (ff1, ff2, ff3, ff4)
 
