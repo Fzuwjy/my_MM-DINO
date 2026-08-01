@@ -25,6 +25,7 @@ palette = {
 }  # Undefined (black)
 
 invert_palette = {v: k for k, v in palette.items()}
+IGNORE_INDEX = 7
 
 
 class LRUCache:
@@ -63,12 +64,14 @@ class WHU_Dataset(torch.utils.data.Dataset):
         normalize_type=None,
         sar_dir=None,
         cache_size=100,
+        mask_padding_ignore=False,
     ):
         super(WHU_Dataset, self).__init__()
 
         self.data_type = data_type
         self.window_size = window_size
         self.cache_size = cache_size
+        self.mask_padding_ignore = bool(mask_padding_ignore)
 
         # List of files
         self.rgb_files = []
@@ -155,7 +158,18 @@ class WHU_Dataset(torch.utils.data.Dataset):
 
             # 弱增强
             data, label, sar = resize(data, label, sar, ratio_range=(0.5, 2.0))
-            data, label, sar = crop(data, label, sar, size=self.window_size[0])
+            if self.mask_padding_ignore:
+                data, label, sar = crop(data,
+                                        label,
+                                        sar,
+                                        size=self.window_size[0],
+                                        mask_fill=IGNORE_INDEX,
+                                        aux_fill=0)
+            else:
+                data, label, sar = crop(data,
+                                        label,
+                                        sar,
+                                        size=self.window_size[0])
             data, label, sar = hflip(data, label, sar, p=0.5)
             data, label, sar = vflip(data, label, sar, p=0.5)
             # data, label = rotate(data, label, p=0.5)

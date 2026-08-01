@@ -121,4 +121,6 @@ def build_dataset(dataset_name, data_type="test", **kwargs):
                            sar_dir=sar_dir,
                            data_type=data_type,
                            window_size=kwargs.get("window_size", (224, 224)),
-                           normalize_type=normalize_type)
+                           normalize_type=normalize_type,
+                           mask_padding_ignore=kwargs.get(
+                               "mask_padding_ignore", False))

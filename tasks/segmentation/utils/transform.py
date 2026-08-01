@@ -48,7 +48,25 @@ def resize(img_a, mask=None, dsm=None, ratio_range=(0.5, 2.0)):
     return img_a, mask, dsm
 
 
-def crop(img_a, mask, dsm, size, ignore_value=0):
+def crop(img_a,
+         mask,
+         dsm,
+         size,
+         ignore_value=0,
+         *,
+         mask_fill=None,
+         aux_fill=None):
+    """Randomly crop after right/bottom padding.
+
+    ``ignore_value`` preserves the released behavior for every existing call.
+    Research variants may split the semantic-mask and auxiliary-modality fill
+    values with the keyword-only ``mask_fill`` and ``aux_fill`` arguments.
+    """
+    if mask_fill is None:
+        mask_fill = ignore_value
+    if aux_fill is None:
+        aux_fill = ignore_value
+
     w, h = img_a.shape[:2] if isinstance(img_a, np.ndarray) else img_a.size
     padw = size - w if w < size else 0
     padh = size - h if h < size else 0
@@ -66,12 +84,12 @@ def crop(img_a, mask, dsm, size, ignore_value=0):
         if mask is not None:
             mask = np.pad(mask, ((0, padh), (0, padw)),
                           mode='constant',
-                          constant_values=ignore_value)
+                          constant_values=mask_fill)
 
         if dsm is not None:
             dsm = np.pad(dsm, ((0, padh), (0, padw)),
                          mode='constant',
-                         constant_values=ignore_value)
+                         constant_values=aux_fill)
 
         # 随机裁剪
         h, w = img_a.shape[:2]
@@ -88,11 +106,11 @@ def crop(img_a, mask, dsm, size, ignore_value=0):
         if mask is not None:
             mask = ImageOps.expand(mask,
                                    border=(0, 0, padw, padh),
-                                   fill=ignore_value)
+                                   fill=mask_fill)
         if dsm is not None:
             dsm = ImageOps.expand(dsm,
                                   border=(0, 0, padw, padh),
-                                  fill=ignore_value)
+                                  fill=aux_fill)
 
         w, h = img_a.size
         x = random.randint(0, w - size)
