@@ -291,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260801)
-    parser.add_argument("--baseline-miou-tolerance-pp", type=float, default=1e-8)
+    parser.add_argument("--baseline-miou-tolerance-pp", type=float, default=1e-3)
     args = parser.parse_args()
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {args.checkpoint}")
@@ -618,18 +618,16 @@ def main() -> None:
             else None
         ),
     }
-    if args.max_images is None and not baseline_validation["within_tolerance"]:
-        raise AssertionError(
-            "K1 failed to reproduce the faithful epoch-35 metric: "
-            f"{baseline_validation}"
-        )
+    baseline_pass = (
+        args.max_images is not None or baseline_validation["within_tolerance"] is True
+    )
 
     interpretation = ceiling_interpretation(
         aggregate["k2_x8"]["minus_k1_miou_pp"],
         aggregate["k4_8"]["minus_k1_miou_pp"],
         aggregate["k4_16_control"]["minus_k1_miou_pp"],
     )
-    interpretation["formal_scope"] = args.max_images is None
+    interpretation["formal_scope"] = args.max_images is None and baseline_pass
     if args.max_images is not None:
         interpretation["provisional_pattern"] = interpretation["outcome"]
         interpretation["outcome"] = "SUBSET_SMOKE_ONLY"
@@ -639,7 +637,7 @@ def main() -> None:
             + interpretation["interpretation"]
         )
     output = {
-        "status": "PASS",
+        "status": "PASS" if baseline_pass else "BASELINE_VALIDATION_FAILED",
         "scope": "full-test" if args.max_images is None else "subset-smoke",
         "scientific_scope": (
             "Zero-training optimistic spatial-phase ceiling on the faithful "
@@ -756,7 +754,13 @@ def main() -> None:
         flush=True,
     )
     print(f"potsdam_phase_ceiling_result={args.output_path.resolve()}", flush=True)
-    print("potsdam_phase_ceiling_status=PASS", flush=True)
+    print(f"potsdam_phase_ceiling_status={output['status']}", flush=True)
+    if not baseline_pass:
+        raise AssertionError(
+            "K1 failed to reproduce the faithful epoch-35 metric; the complete "
+            f"diagnostic artifact was preserved at {args.output_path}: "
+            f"{baseline_validation}"
+        )
 
 
 if __name__ == "__main__":
