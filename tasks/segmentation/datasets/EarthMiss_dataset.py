@@ -311,7 +311,12 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         if sar is None:
             return rgb, label
 
-        sar = np.ascontiguousarray(sar[None, :, :], dtype=np.float32)
+        # ``sar`` may be the exact array stored in the LRU cache.  A full-size
+        # validation tile is already contiguous, so ``ascontiguousarray`` can
+        # otherwise return a view backed by that cache entry.  The in-place
+        # scaling below would then divide the cached tile by 255 again on every
+        # validation pass (persistent DataLoader workers keep the cache alive).
+        sar = np.array(sar[None, :, :], dtype=np.float32, order="C", copy=True)
         sar = torch.from_numpy(sar).div_(255.0)
         sar = self._normalize(sar, self.sar_mean, self.sar_std)
         return rgb, sar, label

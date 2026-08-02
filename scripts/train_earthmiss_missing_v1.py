@@ -38,10 +38,10 @@ DEFAULT_WEIGHTS = (
     "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
 DEFAULT_OUTPUT_ROOT = (
-    "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-raw-logits"
+    "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe"
 )
 VAL_SELECTION_CLASS_IDS = list(range(7))
-PROTOCOL_REVISION = "earthmiss_missing_v1_raw_logits_v2"
+PROTOCOL_REVISION = "earthmiss_missing_v1_cache_safe_v3"
 
 
 def parse_args():
@@ -157,6 +157,10 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
                 "mean": list(train_dataset.sar_mean),
                 "std": list(train_dataset.sar_std),
             },
+        },
+        "data_loader": {
+            "cached_source_arrays_immutable": True,
+            "persistent_workers": args.num_workers > 0,
         },
         "budget": {
             "sampling": "one_crop_per_tile_per_epoch",

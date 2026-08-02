@@ -40,7 +40,12 @@ class EarthMissV1RunnerTest(unittest.TestCase):
 
     def test_run_metadata_freezes_normalization_and_optimizer_budget(self):
         args = SimpleNamespace(
-            run="C", seed=42, window_size=512, batch_size=8, epochs=50
+            run="C",
+            seed=42,
+            window_size=512,
+            batch_size=8,
+            num_workers=4,
+            epochs=50,
         )
         train_dataset = MagicMock()
         train_dataset.__len__.return_value = 2641
@@ -76,6 +81,13 @@ class EarthMissV1RunnerTest(unittest.TestCase):
                 "steps_per_epoch": 331,
                 "planned_optimizer_steps": 16550,
                 "checkpoint_unit": "epoch",
+            },
+        )
+        self.assertEqual(
+            metadata["data_loader"],
+            {
+                "cached_source_arrays_immutable": True,
+                "persistent_workers": True,
             },
         )
         self.assertEqual(

@@ -121,6 +121,21 @@ class EarthMissDatasetTest(unittest.TestCase):
             expected_sar = (1.0 - EARTHMISS.EARTHMISS_SAR_MEAN[0]) / EARTHMISS.EARTHMISS_SAR_STD[0]
             self.assertTrue(torch.allclose(sar, torch.full_like(sar, expected_sar)))
 
+    def test_repeated_reads_do_not_rescale_the_cached_sar_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_tile(root, "City", "tile", 255, 255)
+            dataset = _dataset(root)
+
+            first = dataset[0][1]
+            second = dataset[0][1]
+
+            torch.testing.assert_close(second, first, rtol=0, atol=0)
+            np.testing.assert_array_equal(
+                dataset.sar_cache.get(0),
+                np.full((4, 5), 255.0, dtype=np.float32),
+            )
+
     def test_released_float32_same_basename_contract_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
