@@ -17,6 +17,7 @@ from scripts.train_earthmiss_missing_v1 import (
     ground_truth_pixel_counts,
     save_checkpoint,
     train_state,
+    update_early_stopping_state,
     validation_states,
 )
 
@@ -46,6 +47,8 @@ class EarthMissV1RunnerTest(unittest.TestCase):
             batch_size=8,
             num_workers=4,
             epochs=50,
+            eval_interval=5,
+            early_stop_patience_evals=3,
         )
         train_dataset = MagicMock()
         train_dataset.__len__.return_value = 2641
@@ -107,6 +110,28 @@ class EarthMissV1RunnerTest(unittest.TestCase):
                 "paired_endpoint_rule": "same_checkpoint_and_epoch",
             },
         )
+        self.assertEqual(
+            metadata["early_stopping"],
+            {
+                "selection_state": "sar",
+                "strict_improvement": True,
+                "patience_evaluations": 3,
+                "evaluation_interval_epochs": 5,
+                "disabled": False,
+            },
+        )
+
+    def test_early_stopping_patience_resets_only_on_strict_sar_improvement(self):
+        state = {"bad_validation_count": 0, "best_epoch": None}
+        state = update_early_stopping_state(state, improved=True, epoch=5)
+        self.assertEqual(state, {"bad_validation_count": 0, "best_epoch": 5})
+
+        state = update_early_stopping_state(state, improved=False, epoch=10)
+        state = update_early_stopping_state(state, improved=False, epoch=15)
+        self.assertEqual(state, {"bad_validation_count": 2, "best_epoch": 5})
+
+        state = update_early_stopping_state(state, improved=True, epoch=20)
+        self.assertEqual(state, {"bad_validation_count": 0, "best_epoch": 20})
 
     def test_best_checkpoint_records_its_scientific_role(self):
         model = MagicMock()

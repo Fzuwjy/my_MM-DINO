@@ -41,7 +41,7 @@ DEFAULT_OUTPUT_ROOT = (
     "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe"
 )
 VAL_SELECTION_CLASS_IDS = list(range(7))
-PROTOCOL_REVISION = "earthmiss_missing_v1_cache_safe_v3"
+PROTOCOL_REVISION = "earthmiss_missing_v1_val_patience_v4"
 
 
 def parse_args():
@@ -57,6 +57,15 @@ def parse_args():
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--eval-interval", type=int, default=5)
+    parser.add_argument(
+        "--early-stop-patience-evals",
+        type=int,
+        default=0,
+        help=(
+            "Stop after this many consecutive SAR validation checks without a "
+            "strict mIoU improvement; 0 disables early stopping."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--audit-only",
@@ -119,6 +128,16 @@ def validation_states(run):
     return ("sar",) if run == "A" else ("sar", "full")
 
 
+def update_early_stopping_state(state, *, improved, epoch):
+    updated = dict(state)
+    if improved:
+        updated["bad_validation_count"] = 0
+        updated["best_epoch"] = epoch
+    else:
+        updated["bad_validation_count"] += 1
+    return updated
+
+
 def build_run_metadata(args, train_dataset, val_dataset, train_loader):
     steps_per_epoch = len(train_loader)
     checkpoint_roles = {"best_sar.pth": "primary_deployment"}
@@ -179,6 +198,13 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
             "checkpoint_roles": checkpoint_roles,
             "paired_endpoint_rule": "same_checkpoint_and_epoch",
         },
+        "early_stopping": {
+            "selection_state": "sar",
+            "strict_improvement": True,
+            "patience_evaluations": args.early_stop_patience_evals,
+            "evaluation_interval_epochs": args.eval_interval,
+            "disabled": args.early_stop_patience_evals == 0,
+        },
     }
 
 
@@ -222,6 +248,7 @@ def save_checkpoint(
     *,
     checkpoint_role,
     selection_state=None,
+    early_stopping_state=None,
 ):
     torch.save(
         {
@@ -239,6 +266,7 @@ def save_checkpoint(
             "selection_score": (
                 best[selection_state] if selection_state is not None else None
             ),
+            "early_stopping_state": early_stopping_state,
         },
         path,
     )
@@ -286,6 +314,8 @@ def main():
         raise ValueError("--window-size must be a positive multiple of 16")
     if args.epochs <= 0 or args.eval_interval <= 0:
         raise ValueError("--epochs and --eval-interval must be positive")
+    if args.early_stop_patience_evals < 0:
+        raise ValueError("--early-stop-patience-evals must be non-negative")
 
     seed_everything(args.seed)
     train_dataset, val_dataset, train_loader, val_loader = build_loaders(args)
@@ -341,6 +371,7 @@ def main():
     )
     start_epoch = 1
     best = {state: float("-inf") for state in validation_states(args.run)}
+    early_stopping_state = {"bad_validation_count": 0, "best_epoch": None}
     metadata = build_run_metadata(args, train_dataset, val_dataset, train_loader)
 
     if args.resume:
@@ -354,6 +385,16 @@ def main():
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"] + 1
         best = checkpoint["best"]
+        saved_early_stopping = checkpoint.get("early_stopping_state")
+        if not isinstance(saved_early_stopping, dict):
+            raise ValueError("Resume checkpoint lacks early-stopping state")
+        early_stopping_state = dict(saved_early_stopping)
+        if (
+            args.early_stop_patience_evals > 0
+            and early_stopping_state["bad_validation_count"]
+            >= args.early_stop_patience_evals
+        ):
+            raise ValueError("Resume checkpoint has already triggered early stopping")
 
     (output_dir / "run.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
@@ -397,7 +438,14 @@ def main():
                     args.batch_size * 4,
                 )
                 record[state] = metrics
-                if metrics["mIoU"] > best[state]:
+                improved = metrics["mIoU"] > best[state]
+                if state == "sar":
+                    early_stopping_state = update_early_stopping_state(
+                        early_stopping_state,
+                        improved=improved,
+                        epoch=epoch,
+                    )
+                if improved:
                     best[state] = metrics["mIoU"]
                     save_checkpoint(
                         output_dir / f"best_{state}.pth",
@@ -413,7 +461,17 @@ def main():
                             else "diagnostic_only"
                         ),
                         selection_state=state,
+                        early_stopping_state=early_stopping_state,
                     )
+            record["early_stopping"] = {
+                **early_stopping_state,
+                "patience_evaluations": args.early_stop_patience_evals,
+                "stop": (
+                    args.early_stop_patience_evals > 0
+                    and early_stopping_state["bad_validation_count"]
+                    >= args.early_stop_patience_evals
+                ),
+            }
             model.train()
 
         with metrics_path.open("a", encoding="utf-8") as stream:
@@ -427,8 +485,22 @@ def main():
             best,
             metadata,
             checkpoint_role="resume_only",
+            early_stopping_state=early_stopping_state,
         )
         print(json.dumps(record))
+        if record.get("early_stopping", {}).get("stop", False):
+            print(
+                json.dumps(
+                    {
+                        "event": "early_stop",
+                        "epoch": epoch,
+                        "selection_state": "sar",
+                        "best_epoch": early_stopping_state["best_epoch"],
+                        "best_mIoU": best["sar"],
+                    }
+                )
+            )
+            break
 
 
 if __name__ == "__main__":
