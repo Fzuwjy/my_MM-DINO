@@ -1,0 +1,308 @@
+"""Train the three EarthMiss missing-modality V1 baselines.
+
+Run A trains with SAR only, Run B trains with both modalities, and Run C uses
+homogeneous 50/50 Full/SAR batches. Validation is city-held-out EarthMiss Val.
+This launcher is intentionally single-GPU and foreground-only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+
+SEED = 42
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SEGMENTATION_ROOT = REPO_ROOT / "tasks" / "segmentation"
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(SEGMENTATION_ROOT))
+
+from datasets import build_dataset  # noqa: E402
+from losses import DiceLoss, JointLoss, SoftCrossEntropyLoss  # noqa: E402
+from models.MMDINO.availability import canonical_availability  # noqa: E402
+from models.MMDINO.dino_segment import build_model  # noqa: E402
+from utils.earthmiss_metrics import EarthMissMetrics  # noqa: E402
+from utils.inference import slide_inference  # noqa: E402
+
+
+DEFAULT_DATASET_ROOT = "/root/autodl-tmp/mm-dino/datasets/EarthMiss"
+DEFAULT_WEIGHTS = (
+    "/root/autodl-tmp/mm-dino/weights/"
+    "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+)
+DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", choices=("A", "B", "C"), required=True)
+    parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--backbone-weights", default=DEFAULT_WEIGHTS)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--window-size", type=int, default=512)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--eval-interval", type=int, default=5)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="Build Train/Val manifests and inspect one sample without loading the model.",
+    )
+    return parser.parse_args()
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def build_loaders(args):
+    dataset_kwargs = {
+        "dataset_root": args.dataset_root,
+        "window_size": (args.window_size, args.window_size),
+        "model_name": "DINOv3",
+        "modality": "multi",
+        "backbone_type": "dinov3_vits16",
+    }
+    train_dataset = build_dataset("EarthMiss", "train", **dataset_kwargs)
+    val_dataset = build_dataset("EarthMiss", "val", **dataset_kwargs)
+    train_generator = torch.Generator().manual_seed(args.seed)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        generator=train_generator,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=min(args.num_workers, 2),
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    return train_dataset, val_dataset, train_loader, val_loader
+
+
+def train_state(run, state_rng):
+    if run == "A":
+        return "sar"
+    if run == "B":
+        return "full"
+    return "sar" if state_rng.random() < 0.5 else "full"
+
+
+def validation_states(run):
+    return ("sar",) if run == "A" else ("sar", "full")
+
+
+@torch.no_grad()
+def evaluate(model, loader, state, device, window_size, inference_batch_size):
+    model.eval()
+    evaluator = EarthMissMetrics()
+    availability = canonical_availability(state, batch_size=1, device=device)
+    stride = int(window_size * 2 / 3)
+    for rgb, sar, label in tqdm(loader, desc=f"Val {state}", leave=False):
+        rgb = rgb.to(device, non_blocking=True)
+        sar = sar.to(device, non_blocking=True)
+        logits = slide_inference(
+            rgb,
+            model,
+            n_output_channels=8,
+            crop_size=(window_size, window_size),
+            stride=(stride, stride),
+            dsm=sar,
+            availability=availability,
+            batch_size=inference_batch_size,
+        )
+        evaluator.update(logits.argmax(dim=1), label)
+    return evaluator.compute()
+
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best, args):
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "best": best,
+            "run": args.run,
+            "seed": args.seed,
+        },
+        path,
+    )
+
+
+def audit_datasets(train_dataset, val_dataset):
+    rgb, sar, label = train_dataset[0]
+    summary = {
+        "train_tiles": len(train_dataset),
+        "val_tiles": len(val_dataset),
+        "first_train_tile": {
+            "city": train_dataset.samples[0].city,
+            "tile_id": train_dataset.samples[0].tile_id,
+            "rgb_shape": list(rgb.shape),
+            "sar_shape": list(sar.shape),
+            "label_shape": list(label.shape),
+            "label_ids": sorted(label.unique().tolist()),
+        },
+    }
+    print(json.dumps(summary, indent=2))
+
+
+def main():
+    args = parse_args()
+    if args.window_size <= 0 or args.window_size % 16:
+        raise ValueError("--window-size must be a positive multiple of 16")
+    if args.epochs <= 0 or args.eval_interval <= 0:
+        raise ValueError("--epochs and --eval-interval must be positive")
+
+    seed_everything(args.seed)
+    train_dataset, val_dataset, train_loader, val_loader = build_loaders(args)
+    if args.audit_only:
+        audit_datasets(train_dataset, val_dataset)
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("EarthMiss V1 training requires a CUDA GPU")
+    weights_path = Path(args.backbone_weights)
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
+
+    output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = output_dir / "last.pth"
+    metrics_path = output_dir / "metrics.jsonl"
+
+    device = torch.device("cuda")
+    model = build_model(
+        model_name="DINOv3",
+        backbone_weights=str(weights_path),
+        backbone_type="dinov3_vits16",
+        freeze_backbone=True,
+        n_classes=8,
+        use_lora=False,
+        r=3,
+        num_modalities=2,
+    ).to(device)
+    criterion = JointLoss(
+        SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=8),
+        DiceLoss(smooth=0.05, ignore_index=8),
+        1.0,
+        1.0,
+    )
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=args.learning_rate,
+        weight_decay=0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-7
+    )
+    start_epoch = 1
+    best = {state: float("-inf") for state in validation_states(args.run)}
+
+    if args.resume:
+        checkpoint = torch.load(last_checkpoint, map_location=device)
+        if checkpoint["run"] != args.run or checkpoint["seed"] != args.seed:
+            raise ValueError("Resume checkpoint does not match --run/--seed")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        start_epoch = checkpoint["epoch"] + 1
+        best = checkpoint["best"]
+
+    metadata = {
+        "run": args.run,
+        "seed": args.seed,
+        "train_tiles": len(train_dataset),
+        "val_tiles": len(val_dataset),
+        "window_size": args.window_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "train_policy": {"A": "sar", "B": "full", "C": "50/50 full-sar"}[args.run],
+    }
+    (output_dir / "run.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        model.train()
+        state_rng = random.Random(args.seed * 100_000 + epoch)
+        loss_sum = 0.0
+        batch_count = 0
+        for rgb, sar, label in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"):
+            state = train_state(args.run, state_rng)
+            rgb = rgb.to(device, non_blocking=True)
+            sar = sar.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
+            availability = canonical_availability(
+                state, batch_size=rgb.shape[0], device=device
+            )
+            optimizer.zero_grad()
+            logits = model(rgb, sar, availability=availability)
+            loss = criterion(logits, label)
+            loss.backward()
+            optimizer.step()
+            loss_sum += float(loss.detach())
+            batch_count += 1
+        scheduler.step()
+
+        record = {
+            "epoch": epoch,
+            "train_loss": loss_sum / batch_count,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+        if epoch % args.eval_interval == 0 or epoch == args.epochs:
+            for state in validation_states(args.run):
+                metrics = evaluate(
+                    model,
+                    val_loader,
+                    state,
+                    device,
+                    args.window_size,
+                    args.batch_size * 4,
+                )
+                record[state] = metrics
+                if metrics["mIoU"] > best[state]:
+                    best[state] = metrics["mIoU"]
+                    save_checkpoint(
+                        output_dir / f"best_{state}.pth",
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        best,
+                        args,
+                    )
+            model.train()
+
+        with metrics_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
+        save_checkpoint(
+            last_checkpoint, model, optimizer, scheduler, epoch, best, args
+        )
+        print(json.dumps(record))
+
+
+if __name__ == "__main__":
+    main()

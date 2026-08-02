@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from .linear_decoder import LinearHead
 from .Decoder import Decoder, Decoder_FRM, Decoder_PRN, Decoder_MMFF, Decoder_FRM_MMFF, Decoder_PRN_MMFF, Decoder_FRM_PRN
 from .sample_adapter import SampleAdapter
+from .availability import active_modality_indices
 from .lora import LoRA
 from .ResNet import ResNet50
 
@@ -58,6 +59,7 @@ class DINOSegmentModule(nn.Module):
     ):
         super().__init__()
 
+        self.num_modalities = num_modalities
         self.use_optical_stem = bool(use_optical_stem)
         if self.use_optical_stem and decoder_type != 'Decoder':
             raise ValueError(
@@ -165,22 +167,37 @@ class DINOSegmentModule(nn.Module):
         for w_b in self.w_b:
             nn.init.zeros_(w_b.weight)
 
-    def forward(self, *modalities):
+    def forward(self, *modalities, availability=None):
         if len(modalities) == 0:
             raise ValueError("At least one modality must be provided")
-        if self.use_optical_stem and len(modalities) == 1:
+        batch_size = modalities[0].shape[0]
+        if any(modality.shape[0] != batch_size for modality in modalities):
+            raise ValueError("All modality inputs must have the same batch size")
+        if availability is not None and len(modalities) != self.num_modalities:
             raise ValueError(
-                "the optical spatial stem requires multimodal inputs"
+                "Canonical availability requires one tensor for every modality slot"
+            )
+        active_indices = active_modality_indices(
+            availability,
+            batch_size=batch_size,
+            num_modalities=(
+                len(modalities) if availability is None else self.num_modalities
+            ),
+        )
+        canonical_slots = availability is not None
+        if self.use_optical_stem and (len(active_indices) == 1 or 0 not in active_indices):
+            raise ValueError(
+                "the optical spatial stem requires optical and multimodal inputs"
             )
 
         # 主输入x
-        x = modalities[0]
-        _, C, H, W = x.shape
-        patch_h, patch_w = x.shape[-2] // 16, x.shape[-1] // 16
+        x = modalities[active_indices[0]]
+        _, _, H, W = x.shape
+        patch_h, patch_w = H // 16, W // 16
 
         scale_factors = [4, 2, 1, 0.5]
 
-        if len(modalities) == 1:
+        if len(active_indices) == 1 and not canonical_slots:
             if self.adapter is not None:
                 outputs = self.backbone.get_intermediate_layers(
                     x, n=BACKBONE_INTERMEDIATE_LAYERS[self.backbone_type])
@@ -207,9 +224,16 @@ class DINOSegmentModule(nn.Module):
 
         else:
             outputs_modalities = []
-            for idx, modality_input in enumerate(modalities):
-                if modality_input.shape[1] != C and idx > 0:
-                    modality_input = modality_input.repeat(1, C, 1, 1)
+            for modality_index in active_indices:
+                modality_input = modalities[modality_index]
+                if modality_input.shape[-2:] != (H, W):
+                    raise ValueError("All active modalities must have the same spatial shape")
+                if modality_input.shape[1] == 1:
+                    modality_input = modality_input.repeat(1, 3, 1, 1)
+                elif modality_input.shape[1] != 3:
+                    raise ValueError(
+                        "DINOv3 modality inputs must have one or three channels"
+                    )
 
                 outputs_modality = self.backbone.get_intermediate_layers(
                     modality_input,
@@ -222,7 +246,8 @@ class DINOSegmentModule(nn.Module):
                     *outputs_modalities,
                     patch_h=patch_h,
                     patch_w=patch_w,
-                    guidance=x)
+                    guidance=modalities[0] if 0 in active_indices else None,
+                    modality_indices=active_indices if canonical_slots else None)
             else:
                 processed_outputs_modalities = []
                 for outputs_modality in outputs_modalities:
@@ -247,10 +272,11 @@ class DINOSegmentModule(nn.Module):
             # 将处理后的所有模态特征传递给解码器
             if self.use_optical_stem:
                 logits = self.decoder(*processed_outputs_modalities,
-                                      guidance=x)
+                                      guidance=modalities[0])
             else:
                 logits = self.decoder(*processed_outputs_modalities)
 
+        pred = logits
         _H, _W = logits.shape[2:]
         if _H != H or _W != W:
             # 确保输出大小与输入一致

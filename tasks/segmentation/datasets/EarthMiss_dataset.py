@@ -1,57 +1,114 @@
 import os
 import random
-import sys
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
-from PIL import Image
 from skimage.io import imread
-import torchvision.transforms.functional as TF
-from collections import OrderedDict
 
-deps_path = os.path.join(os.path.dirname(__file__), "task/segmentation")
-sys.path.insert(0, deps_path)
-from utils.transform import *
 
 palette = {
-    0: (255, 255, 255),  # Background (white)
-    1: (255, 0, 0),  # Building (red)
-    2: (255, 255, 0),  # Road (yellow)
-    3: (0, 0, 255),  # Water (blue)
-    4: (159, 129, 183),  # Barren (purple)
-    5: (0, 255, 0),  # Forest (green)
-    6: (255, 195, 128),  # Agricultural (deeper yellow)
-    7: (165, 0, 165),  # Playground (deeper purple)
-    8: (0, 0, 0)
-}  # Undefined (black)
+    0: (255, 255, 255),
+    1: (255, 0, 0),
+    2: (255, 255, 0),
+    3: (0, 0, 255),
+    4: (159, 129, 183),
+    5: (0, 255, 0),
+    6: (255, 195, 128),
+    7: (165, 0, 165),
+    8: (0, 0, 0),
+}
 
-invert_palette = {v: k for k, v in palette.items()}
+invert_palette = {value: key for key, value in palette.items()}
+
+# Statistics released with the EarthMiss/MetaRS metadata, expressed on [0, 1].
+EARTHMISS_SAR_MEAN = (63.30051921735858 / 255.0,)
+EARTHMISS_SAR_STD = (68.20405016 / 255.0,)
 
 
 class LRUCache:
-    """LRU缓存实现"""
-
     def __init__(self, capacity):
         self.capacity = capacity
         self.cache = OrderedDict()
 
     def get(self, key):
         if key in self.cache:
-            # 移动到最前面（最近使用）
             self.cache.move_to_end(key)
             return self.cache[key]
         return None
 
     def put(self, key, value):
         if key in self.cache:
-            # 更新值并移动到最前面
             self.cache.move_to_end(key)
         self.cache[key] = value
-        # 如果超出容量，删除最久未使用的项
         if len(self.cache) > self.capacity:
             self.cache.popitem(last=False)
 
 
+@dataclass(frozen=True)
+class EarthMissSample:
+    city: str
+    tile_id: str
+    rgb_path: str
+    label_path: str
+    sar_path: Optional[str]
+
+
+def _tile_id(path: Path, suffix: str) -> str:
+    stem = path.stem
+    if suffix and not stem.endswith(suffix):
+        raise ValueError(f"Unexpected EarthMiss filename for suffix {suffix!r}: {path.name}")
+    return stem[:-len(suffix)] if suffix else stem
+
+
+def _index_tiffs(directory: str, suffix: str) -> dict[str, str]:
+    directory_path = Path(directory)
+    if not directory_path.is_dir():
+        raise FileNotFoundError(f"EarthMiss directory does not exist: {directory}")
+
+    indexed = {}
+    for path in sorted(directory_path.glob("*.tif")):
+        key = _tile_id(path, suffix)
+        if key in indexed:
+            raise ValueError(f"Duplicate EarthMiss tile id {key!r} in {directory}")
+        indexed[key] = str(path)
+    return indexed
+
+
+def _paired_city_samples(city, rgb_dir, label_dir, sar_dir=None):
+    rgb = _index_tiffs(rgb_dir.format(city), "")
+    labels = _index_tiffs(label_dir.format(city), "_mask")
+    sar = _index_tiffs(sar_dir.format(city), "_SAR") if sar_dir is not None else None
+
+    reference_ids = set(rgb)
+    for modality_name, paths in (("mask", labels), ("SAR", sar)):
+        if paths is None:
+            continue
+        missing = sorted(reference_ids - set(paths))
+        extra = sorted(set(paths) - reference_ids)
+        if missing or extra:
+            raise ValueError(
+                f"EarthMiss pairing mismatch in {city} for {modality_name}: "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
+
+    return [
+        EarthMissSample(
+            city=city,
+            tile_id=tile_id,
+            rgb_path=rgb[tile_id],
+            label_path=labels[tile_id],
+            sar_path=sar[tile_id] if sar is not None else None,
+        )
+        for tile_id in sorted(reference_ids)
+    ]
+
+
 class EarthMiss_Dataset(torch.utils.data.Dataset):
+    """Paired EarthMiss RGB/SAR semantic-segmentation tiles."""
 
     def __init__(
         self,
@@ -64,41 +121,24 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         sar_dir=None,
         cache_size=500,
     ):
-        super(EarthMiss_Dataset, self).__init__()
+        super().__init__()
+        if data_type not in {"train", "val", "test"}:
+            raise ValueError(f"Unsupported EarthMiss split: {data_type!r}")
 
         self.data_type = data_type
-        self.window_size = window_size
+        self.window_size = tuple(window_size)
         self.cache_size = cache_size
-
-        # List of files
-        self.rgb_files = []
-        self.sar_files = []
-        self.label_files = []
+        self.samples = []
         for city in citys:
-            data_rgb_dir = rgb_dir.format(city)
-            data_sar_dir = sar_dir.format(
-                city) if sar_dir is not None else None
-            data_label_dir = label_dir.format(city)
-            # 读取data_dir下的所有文件名
-            self.rgb_files.extend([
-                os.path.join(data_rgb_dir, f) for f in os.listdir(data_rgb_dir)
-                if f.endswith(".tif")
-            ])
-            self.sar_files.extend([
-                os.path.join(data_sar_dir, f) for f in os.listdir(data_sar_dir)
-                if f.endswith(".tif")
-            ])
-            self.label_files.extend([
-                os.path.join(data_label_dir, f)
-                for f in os.listdir(data_label_dir) if f.endswith(".tif")
-            ])
+            self.samples.extend(_paired_city_samples(city, rgb_dir, label_dir, sar_dir))
+        if not self.samples:
+            raise ValueError(f"No EarthMiss samples found for split {data_type!r}")
 
-        # Sanity check : raise an error if some files do not exist
-        for file in self.rgb_files + self.label_files + self.sar_files:
-            if not os.path.exists(file) and not os.path.isfile(file):
-                raise ValueError(f"File {file} does not exist")
+        # Keep the public lists used by older scripts, but derive all three from one manifest.
+        self.rgb_files = [sample.rgb_path for sample in self.samples]
+        self.label_files = [sample.label_path for sample in self.samples]
+        self.sar_files = [sample.sar_path for sample in self.samples if sample.sar_path]
 
-        # 初始化LRU缓存
         self.rgb_cache = LRUCache(cache_size)
         self.label_cache = LRUCache(cache_size)
         self.sar_cache = LRUCache(cache_size)
@@ -112,150 +152,142 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         else:
             self.imagenet_mean = None
             self.imagenet_std = None
-
-        # self.imagenet_mean = (0.43910831, 0.46440756, 0.45110319)
-        # self.imagenet_std = (0.28616032, 0.28621673, 0.32124605)
-        # self.sar_mean = (0.24823733)
-        # self.sar_std = (0.26746686)
+        self.sar_mean = EARTHMISS_SAR_MEAN
+        self.sar_std = EARTHMISS_SAR_STD
 
     def __len__(self):
-        interval_num = (256**2 / self.window_size[0]**2) * 160  # 256尺寸时为*16
-        data_len = len(self.rgb_files
-                       ) * interval_num if self.data_type == 'train' else len(
-                           self.rgb_files)
-        return int(data_len)
+        # One logical epoch visits every tile once; DataLoader shuffling controls order.
+        return len(self.samples)
+
+    @staticmethod
+    def _normalize(tensor, mean, std):
+        mean_tensor = tensor.new_tensor(mean).view(-1, 1, 1)
+        std_tensor = tensor.new_tensor(std).view(-1, 1, 1)
+        return tensor.sub(mean_tensor).div(std_tensor)
+
+    @staticmethod
+    def _read_uint8(path, name):
+        array = imread(path)
+        if array.dtype != np.uint8:
+            raise ValueError(f"EarthMiss {name} must be uint8, got {array.dtype} at {path}")
+        return array
+
+    @staticmethod
+    def _read_label(path):
+        raw = imread(path)
+        if not np.issubdtype(raw.dtype, np.integer):
+            raise ValueError(f"EarthMiss mask must be integer-valued, got {raw.dtype} at {path}")
+        if raw.ndim != 2:
+            raise ValueError(f"EarthMiss mask must be 2-D, got shape {raw.shape} at {path}")
+        values = np.unique(raw)
+        invalid = values[(values < 0) | (values > 8)]
+        if invalid.size:
+            raise ValueError(f"EarthMiss mask has invalid raw labels {invalid.tolist()} at {path}")
+        # Raw 0 is no-data; raw 1..8 become the eight training classes 0..7.
+        return np.where(raw == 0, 8, raw - 1).astype(np.int64, copy=False)
+
+    def _load_sample(self, idx):
+        sample = self.samples[idx]
+
+        rgb = self.rgb_cache.get(idx)
+        if rgb is None:
+            rgb = self._read_uint8(sample.rgb_path, "RGB")
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise ValueError(
+                    f"EarthMiss RGB must have shape HxWx3, got {rgb.shape} at {sample.rgb_path}"
+                )
+            self.rgb_cache.put(idx, rgb)
+
+        label = self.label_cache.get(idx)
+        if label is None:
+            label = self._read_label(sample.label_path)
+            self.label_cache.put(idx, label)
+
+        sar = None
+        if sample.sar_path is not None:
+            sar = self.sar_cache.get(idx)
+            if sar is None:
+                sar = self._read_uint8(sample.sar_path, "SAR")
+                if sar.ndim == 3 and sar.shape[2] == 1:
+                    sar = sar[:, :, 0]
+                if sar.ndim != 2:
+                    raise ValueError(
+                        f"EarthMiss SAR must have shape HxW, got {sar.shape} at {sample.sar_path}"
+                    )
+                self.sar_cache.put(idx, sar)
+
+        spatial_shapes = {rgb.shape[:2], label.shape[:2]}
+        if sar is not None:
+            spatial_shapes.add(sar.shape[:2])
+        if len(spatial_shapes) != 1:
+            raise ValueError(f"EarthMiss modalities are not aligned for {sample.city}/{sample.tile_id}")
+        return rgb, sar, label
+
+    def _train_transform(self, rgb, sar, label):
+        crop_h, crop_w = self.window_size
+        image_h, image_w = rgb.shape[:2]
+        if image_h < crop_h or image_w < crop_w:
+            raise ValueError(
+                f"EarthMiss tile {image_h}x{image_w} is smaller than crop {crop_h}x{crop_w}"
+            )
+
+        top = random.randint(0, image_h - crop_h)
+        left = random.randint(0, image_w - crop_w)
+        row = slice(top, top + crop_h)
+        col = slice(left, left + crop_w)
+        rgb = rgb[row, col]
+        label = label[row, col]
+        sar = sar[row, col] if sar is not None else None
+
+        # Match the released EarthMiss policy: choose at most one geometric operation.
+        if random.random() < 0.75:
+            operation = random.randrange(3)
+            if operation == 0:
+                rgb, label = np.flip(rgb, 1), np.flip(label, 1)
+                sar = np.flip(sar, 1) if sar is not None else None
+            elif operation == 1:
+                rgb, label = np.flip(rgb, 0), np.flip(label, 0)
+                sar = np.flip(sar, 0) if sar is not None else None
+            else:
+                turns = random.randrange(4)
+                rgb, label = np.rot90(rgb, turns), np.rot90(label, turns)
+                sar = np.rot90(sar, turns) if sar is not None else None
+        return rgb, sar, label
 
     def __getitem__(self, idx):
-        if self.data_type == 'train':
-            random_idx = random.randint(0, len(self.rgb_files) - 1)
+        rgb, sar, label = self._load_sample(idx)
+        if self.data_type == "train":
+            rgb, sar, label = self._train_transform(rgb, sar, label)
 
-            # 使用LRU缓存
-            cached_data = self.rgb_cache.get(random_idx)
-            if cached_data is not None:
-                data = cached_data
-            else:
-                data = imread(self.rgb_files[random_idx]).astype(np.float32)
-                self.rgb_cache.put(random_idx, data)
-
-            cached_label = self.label_cache.get(random_idx)
-            if cached_label is not None:
-                label = cached_label
-            else:
-                label = imread(self.label_files[random_idx]).astype(np.int32)
-                label = label - 1
-                label[label == -1] = 8
-                self.label_cache.put(random_idx, label)
-
-            sar = None
-            cached_sar = self.sar_cache.get(random_idx)
-            if cached_sar is not None:
-                sar = cached_sar
-            elif len(self.sar_files) > 0:
-                sar = imread(self.sar_files[random_idx])
-                self.sar_cache.put(random_idx, sar)
-
-            # Get a random patch
-            x1, x2, y1, y2 = self.get_random_pos(data, self.window_size)
-            if isinstance(data, np.ndarray):
-                data = data[x1:x2, y1:y2, :]
-                label = label[x1:x2, y1:y2]
-                sar = sar[x1:x2, y1:y2] if sar is not None else None
-            elif isinstance(data, Image.Image):
-                data = data.crop(
-                    (y1, x1, y2, x2))  # PIL使用(left, upper, right, lower)
-                label = label.crop((y1, x1, y2, x2))
-                sar = sar.crop((y1, x1, y2, x2)) if sar is not None else None
-
-            # 弱增强
-            data, label, sar = resize(data, label, sar, ratio_range=(0.5, 2.0))
-            data, label, sar = crop(data, label, sar, size=self.window_size[0])
-            data, label, sar = hflip(data, label, sar, p=0.5)
-            data, label, sar = vflip(data, label, sar, p=0.5)
-            # data, label = rotate(data, label, p=0.5)
-
-            # data = color_jitter(data, p=0.8)
-            # data = grayscale(data, p=0.2)
-            # data = blur(data, p=0.5)
-
-            # convert to np.array
-            # data = np.array(data, dtype='float32').transpose((2, 0, 1))
-            # label = np.array(label)
-            # label = np.asarray(self.convert_from_color(label), dtype='int64')
-        else:
-            data = imread(self.rgb_files[idx]).astype(np.float32)
-
-            label = imread(self.label_files[idx]).astype(np.int32)
-            label = label - 1
-            label[label == -1] = 8
-
-            sar = imread(self.sar_files[idx]) if len(
-                self.sar_files) > 0 else None
-
-        # 最终转换为tensor前确保数据连续且格式正确
-        if isinstance(data, np.ndarray):
-            # 确保数据连续且转换为(C,H,W)格式用于tensor转换
-            data = np.ascontiguousarray(data)
-            label = np.ascontiguousarray(label)
-
-        data = TF.to_tensor(data)  # Convert image to tensor
+        # Make the input scale explicit before normalization.
+        rgb = np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32)
+        rgb = torch.from_numpy(rgb).div_(255.0)
         if self.imagenet_mean is not None:
-            data = TF.normalize(
-                data, self.imagenet_mean,
-                self.imagenet_std)  # Normalize with ImageNet mean and std
+            rgb = self._normalize(rgb, self.imagenet_mean, self.imagenet_std)
 
-        if sar is not None:
-            # if isinstance(sar, np.ndarray):
-            #     # 获取最小值和最大值
-            #     min_val = np.min(sar)
-            #     max_val = np.max(sar)
-            #     # 防止除零错误
-            #     if max_val > min_val:
-            #         sar = (sar - min_val) / (max_val - min_val)
-            #     else:
-            #         # 如果所有像素值都相同，设置为0（或保持原值）
-            #         sar = np.full_like(
-            #             sar, 0.0)  # 或者 sar = np.full_like(sar, min_val)
+        label = torch.from_numpy(np.ascontiguousarray(label, dtype=np.int64))
+        if sar is None:
+            return rgb, label
 
-            #     sar = np.ascontiguousarray(sar)
-            # else:
-            #     # 处理 PIL Image 对象
-            #     min_val, max_val = sar.getextrema()
-            #     if max_val > min_val:
-            #         sar = Image.eval(
-            #             sar, lambda x: (x - min_val) / (max_val - min_val))
-            #     else:
-            #         sar = Image.eval(sar, lambda x: min_val)
-
-            if isinstance(sar, np.ndarray):
-                sar = np.ascontiguousarray(sar)
-            sar = TF.to_tensor(sar)
-            sar = TF.normalize(sar, self.sar_mean, self.sar_std)
-            return data, sar, label
-        else:
-            return data, label
+        sar = np.ascontiguousarray(sar[None, :, :], dtype=np.float32)
+        sar = torch.from_numpy(sar).div_(255.0)
+        sar = self._normalize(sar, self.sar_mean, self.sar_std)
+        return rgb, sar, label
 
     @staticmethod
     def convert_from_color(arr_3d, palette=invert_palette):
-        """ RGB-color encoding to grayscale labels """
         arr_2d = np.zeros((arr_3d.shape[0], arr_3d.shape[1]), dtype=np.uint8)
-
-        for c, i in palette.items():
-            m = np.all(arr_3d == np.array(c).reshape(1, 1, 3), axis=2)
-            arr_2d[m] = i
-
+        for color, class_id in palette.items():
+            matches = np.all(arr_3d == np.array(color).reshape(1, 1, 3), axis=2)
+            arr_2d[matches] = class_id
         return arr_2d
 
     @staticmethod
     def get_random_pos(img, window_shape):
-        """ Extract of 2D random patch of shape window_shape in the image """
-        w, h = window_shape
-        if isinstance(img, np.ndarray):
-            W, H = img.shape[:2]
-        elif isinstance(img, Image.Image):
-            W, H = img.size
-
-        x1 = random.randint(0, W - w - 1)
-        x2 = x1 + w
-        y1 = random.randint(0, H - h - 1)
-        y2 = y1 + h
-        return x1, x2, y1, y2
+        crop_h, crop_w = window_shape
+        image_h, image_w = img.shape[:2]
+        if image_h < crop_h or image_w < crop_w:
+            raise ValueError("Image is smaller than the requested crop")
+        top = random.randint(0, image_h - crop_h)
+        left = random.randint(0, image_w - crop_w)
+        return top, top + crop_h, left, left + crop_w

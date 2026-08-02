@@ -114,11 +114,24 @@ class SampleAdapter(nn.Module):
                 *features_list,
                 patch_h=None,
                 patch_w=None,
-                guidance=None):
+                guidance=None,
+                modality_indices=None):
         if len(features_list) == 0:
             raise ValueError("At least one feature set must be provided")
 
-        if len(features_list) == 1:
+        canonical_slots = modality_indices is not None
+        if canonical_slots:
+            modality_indices = tuple(modality_indices)
+            if len(modality_indices) != len(features_list):
+                raise ValueError("modality_indices must match the provided feature sets")
+            if len(set(modality_indices)) != len(modality_indices):
+                raise ValueError("modality_indices must be unique")
+            if any(index < 0 or index >= self.num_modalities for index in modality_indices):
+                raise ValueError("modality_indices contains an invalid modality slot")
+        else:
+            modality_indices = tuple(range(len(features_list)))
+
+        if len(features_list) == 1 and not canonical_slots:
             # 单模态情况
             out = []
             for i, x in enumerate(features_list[0]):
@@ -134,14 +147,18 @@ class SampleAdapter(nn.Module):
         else:
             # 多模态情况（2到n个模态）
             # 动态创建或获取模态权重参数
-            if len(features_list) != self.num_modalities:
+            if (
+                not canonical_slots
+                and len(features_list) != self.num_modalities
+            ):
                 raise ValueError(
                     f"Number of modalities ({len(features_list)}) does not match the number of modality weights ({self.num_modalities})"
                 )
-            num_modalities = len(features_list)
 
             naf_guidance = None
             if self.use_naf:
+                if 0 not in modality_indices:
+                    raise ValueError("NAF P2 requires the optical modality")
                 if guidance is None:
                     raise ValueError("Optical guidance is required for NAF P2")
                 if guidance.ndim != 4 or guidance.shape[1] != 3:
@@ -156,7 +173,8 @@ class SampleAdapter(nn.Module):
                 )
 
             # 处理每个模态的特征
-            all_processed_features = [[] for _ in range(len(features_list))
+            output_slots = self.num_modalities if canonical_slots else len(features_list)
+            all_processed_features = [[] for _ in range(output_slots)
                                       ]  # 为每个层级创建列表
             for i, modality_features in enumerate(zip(*features_list)):
                 processed_features = []
@@ -173,9 +191,9 @@ class SampleAdapter(nn.Module):
                     processed_features.append(feat)
 
                 naf_correction = None
-                for j, feat in enumerate(processed_features):
+                for j in range(output_slots):
                     weight_param_names = [
-                        f'weight_modality_{i}' for i in range(num_modalities)
+                        f'weight_modality_{index}' for index in modality_indices
                     ]
                     weights = [
                         torch.sigmoid(self.modality_weights[name])

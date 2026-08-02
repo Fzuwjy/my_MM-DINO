@@ -100,6 +100,7 @@ def slide_inference(inputs: torch.Tensor,
                     stride: Tuple = (341, 341),
                     num_max_forward: int = 1,
                     dsm: torch.Tensor = None,
+                    availability: torch.Tensor = None,
                     batch_size: int = 4):
     """Inference by sliding-window with overlap, with batch processing optimization.
     If h_crop > h_img or w_crop > w_img, the small patch will be used to
@@ -160,10 +161,35 @@ def slide_inference(inputs: torch.Tensor,
         if dsm is not None:
             batch_img = torch.cat([crop[0] for crop in batch_crops], dim=0)
             batch_dsm = torch.cat([crop[1] for crop in batch_crops], dim=0)
-            batch_preds = segmentation_model(batch_img, batch_dsm)
+            if availability is None:
+                batch_preds = segmentation_model(batch_img, batch_dsm)
+            else:
+                batch_availability = availability
+                if batch_availability.ndim == 1:
+                    batch_availability = batch_availability.unsqueeze(0)
+                if batch_availability.shape[0] == 1:
+                    batch_availability = batch_availability.expand(
+                        batch_img.shape[0], -1)
+                batch_preds = segmentation_model(
+                    batch_img,
+                    batch_dsm,
+                    availability=batch_availability,
+                )
         else:
             batch_img = torch.cat(batch_crops, dim=0)
-            batch_preds = segmentation_model(batch_img)
+            if availability is None:
+                batch_preds = segmentation_model(batch_img)
+            else:
+                batch_availability = availability
+                if batch_availability.ndim == 1:
+                    batch_availability = batch_availability.unsqueeze(0)
+                if batch_availability.shape[0] == 1:
+                    batch_availability = batch_availability.expand(
+                        batch_img.shape[0], -1)
+                batch_preds = segmentation_model(
+                    batch_img,
+                    availability=batch_availability,
+                )
 
         # 处理批次预测结果
         if decoder_head_type == "m2f":

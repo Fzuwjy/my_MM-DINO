@@ -7,6 +7,29 @@ from .WHU_dataset import WHU_Dataset
 from configs.common_cfg import MS_ROOT_DIR
 
 
+EARTHMISS_CITIES = {
+    "train": [
+        "America-Eugene",
+        "America-Louisville",
+        "French-Paris",
+        "Morocco-Casablanca",
+        "Nanjing",
+        "Netherlands-Rotterdam",
+        "Singapore",
+    ],
+    "val": [
+        "Australia-PortHedland",
+        "America-Pake",
+        "Russian-Engels",
+    ],
+    "test": [
+        "America-NewYork",
+        "Japan-Hakodate",
+        "Peru-Callao",
+    ],
+}
+
+
 def build_dataset(dataset_name, data_type="test", **kwargs):
     model_name = kwargs.get("model_name")
     backbone_type = kwargs.get("backbone_type")
@@ -76,13 +99,12 @@ def build_dataset(dataset_name, data_type="test", **kwargs):
                             window_size=kwargs.get("window_size", (224, 224)),
                             normalize_type=normalize_type)
     elif dataset_name == "EarthMiss":
-        citys = [
-            "Singapore", "Nanjing", "America-Eugene", "America-Louisville",
-            "French-Paris", "Netherlands-Rotterdam", "Morocco-Casablanca"
-        ] if data_type == "train" else [
-            "Japan-Hakodate", "America-NewYork", "Peru-Callao"
-        ]
-        root_dir = f"{MS_ROOT_DIR}/SS-datasets/EarthMiss/"
+        if data_type not in EARTHMISS_CITIES:
+            raise ValueError(f"Unsupported EarthMiss split: {data_type!r}")
+        citys = EARTHMISS_CITIES[data_type]
+        root_dir = kwargs.get(
+            "dataset_root", f"{MS_ROOT_DIR}/SS-datasets/EarthMiss"
+        ).rstrip("/\\") + "/"
         rgb_dir = root_dir + "{}/images/RGB/"
         sar_dir = root_dir + "{}/images/SAR/" if kwargs.get(
             "modality") == "multi" else None
