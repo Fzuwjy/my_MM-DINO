@@ -26,6 +26,12 @@ class ConvBNReLU(nn.Sequential):
         super().__init__(*layers)
 
 
+def _segmentation_head(in_channels, n_classes, *, raw_logits=False):
+    if raw_logits:
+        return nn.Conv2d(in_channels, n_classes, kernel_size=1)
+    return ConvBNReLU(in_channels, n_classes, 1, pad=0)
+
+
 class FeatureReinforcementModule(nn.Module):
 
     def __init__(self, in_d=None, out_d=64, drop_rate=0):
@@ -393,6 +399,7 @@ class Decoder(nn.Module):
         num_modalities: int = 1,
         use_optical_stem: bool = False,
         optical_stem_seed: int = 0,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -418,7 +425,9 @@ class Decoder(nn.Module):
         self.neck = ProgressiveRefinementNeck(channels_list=[out_channels] * 4,
                                               num_stages=1)
 
-        self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            out_channels, n_classes, raw_logits=raw_logits
+        )
 
         self.optical_stem = None
         if use_optical_stem:
@@ -488,6 +497,7 @@ class Decoder_FRM(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -499,7 +509,9 @@ class Decoder_FRM(nn.Module):
         self.frm = FeatureReinforcementModule([in_channels[0]] + in_channels,
                                               out_channels)
 
-        self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            out_channels, n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:
@@ -557,6 +569,7 @@ class Decoder_FRM_MMFF(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -579,7 +592,9 @@ class Decoder_FRM_MMFF(nn.Module):
             self.fusion4 = SEFusion(out_channels,
                                     num_modalities=num_modalities)
 
-        self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            out_channels, n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:
@@ -637,6 +652,7 @@ class Decoder_PRN(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -647,7 +663,9 @@ class Decoder_PRN(nn.Module):
         self.neck = ProgressiveRefinementNeck(channels_list=in_channels,
                                               num_stages=1)
 
-        self.out_conv = ConvBNReLU(in_channels[0], n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            in_channels[0], n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:
@@ -690,6 +708,7 @@ class Decoder_PRN_MMFF(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -711,7 +730,9 @@ class Decoder_PRN_MMFF(nn.Module):
         self.neck = ProgressiveRefinementNeck(channels_list=in_channels,
                                               num_stages=1)
 
-        self.out_conv = ConvBNReLU(in_channels[0], n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            in_channels[0], n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:
@@ -754,6 +775,7 @@ class Decoder_MMFF(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -777,7 +799,9 @@ class Decoder_MMFF(nn.Module):
         self.conv_3 = ConvBNReLU(in_channels[2], out_channels, 1, pad=0)
         self.conv_4 = ConvBNReLU(in_channels[3], out_channels, 1, pad=0)
 
-        self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            out_channels, n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:
@@ -844,6 +868,7 @@ class Decoder_FRM_PRN(nn.Module):
         in_channels=[256, 512, 1024, 1024],
         out_channels=256,
         num_modalities: int = 1,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -858,7 +883,9 @@ class Decoder_FRM_PRN(nn.Module):
         self.neck = ProgressiveRefinementNeck(channels_list=[out_channels] * 4,
                                               num_stages=1)
 
-        self.out_conv = ConvBNReLU(out_channels, n_classes, 1, pad=0)
+        self.out_conv = _segmentation_head(
+            out_channels, n_classes, raw_logits=raw_logits
+        )
 
     def forward(self, *modalities):
         if len(modalities) == 1:

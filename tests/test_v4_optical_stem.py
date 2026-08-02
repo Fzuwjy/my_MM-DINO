@@ -8,7 +8,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tasks.segmentation.models.MMDINO.Decoder import Decoder, OpticalSpatialStem
+from tasks.segmentation.models.MMDINO.Decoder import (
+    ConvBNReLU,
+    Decoder,
+    OpticalSpatialStem,
+    _segmentation_head,
+)
 
 
 def _decoder(*, use_optical_stem: bool) -> Decoder:
@@ -65,6 +70,19 @@ class _CountingStem(nn.Module):
 
 
 class V4OpticalStemTest(unittest.TestCase):
+    def test_raw_logits_head_is_opt_in_and_keeps_signed_outputs(self):
+        released = _segmentation_head(4, 3)
+        corrected = _segmentation_head(4, 3, raw_logits=True)
+
+        self.assertIsInstance(released, ConvBNReLU)
+        self.assertIsInstance(corrected, nn.Conv2d)
+        self.assertIsNotNone(corrected.bias)
+        with torch.no_grad():
+            corrected.weight.zero_()
+            corrected.bias.fill_(-1.0)
+        output = corrected(torch.ones(2, 4, 3, 3))
+        self.assertTrue(torch.equal(output, torch.full_like(output, -1.0)))
+
     def test_default_state_dict_is_unchanged_and_stem_rng_is_isolated(self):
         torch.manual_seed(13)
         released = _decoder(use_optical_stem=False)

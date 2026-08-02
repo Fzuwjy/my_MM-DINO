@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from scripts.evaluate_earthmiss_missing_v1 import _validate_checkpoint
+from scripts.evaluate_earthmiss_missing_v1 import (
+    _checkpoint_uses_raw_logits,
+    _validate_checkpoint,
+)
 
 from scripts.train_earthmiss_missing_v1 import (
     build_run_metadata,
@@ -58,6 +61,13 @@ class EarthMissV1RunnerTest(unittest.TestCase):
         self.assertEqual(
             metadata["normalization"]["rgb"]["policy"],
             "dinov3_lvd_imagenet",
+        )
+        self.assertEqual(
+            metadata["model"],
+            {
+                "segmentation_head": "raw_conv1x1",
+                "released_segmentation_head": "conv_bn_relu",
+            },
         )
         self.assertEqual(
             metadata["budget"],
@@ -147,6 +157,20 @@ class EarthMissV1RunnerTest(unittest.TestCase):
             ground_truth_pixel_counts(dataset),
             [1, 2, 0, 0, 0, 0, 0, 1],
         )
+
+    def test_checkpoint_head_contract_is_backward_compatible_and_explicit(self):
+        released = {"protocol": {}}
+        corrected = {
+            "protocol": {"model": {"segmentation_head": "raw_conv1x1"}}
+        }
+        unknown = {
+            "protocol": {"model": {"segmentation_head": "mystery"}}
+        }
+
+        self.assertFalse(_checkpoint_uses_raw_logits(released))
+        self.assertTrue(_checkpoint_uses_raw_logits(corrected))
+        with self.assertRaisesRegex(ValueError, "Unknown checkpoint"):
+            _checkpoint_uses_raw_logits(unknown)
 
 
 if __name__ == "__main__":

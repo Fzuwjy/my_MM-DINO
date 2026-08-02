@@ -56,6 +56,7 @@ class DINOSegmentModule(nn.Module):
         naf_kv_tile_shape=None,
         use_optical_stem: bool = False,
         optical_stem_seed: int = 0,
+        raw_logits: bool = False,
     ):
         super().__init__()
 
@@ -106,6 +107,8 @@ class DINOSegmentModule(nn.Module):
         }
         if adapter_type is None:
             decoder_kwargs["in_channels"] = [embed_dim] * 4
+        if decoder_type != 'LinearHead':
+            decoder_kwargs["raw_logits"] = raw_logits
 
         if decoder_type == 'LinearHead':
             self.decoder = LinearHead(in_ch=embed_dim, n_classes=n_classes)

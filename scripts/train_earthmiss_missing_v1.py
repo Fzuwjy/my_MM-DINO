@@ -37,8 +37,11 @@ DEFAULT_WEIGHTS = (
     "/root/autodl-tmp/mm-dino/weights/"
     "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
-DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1"
+DEFAULT_OUTPUT_ROOT = (
+    "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-raw-logits"
+)
 VAL_SELECTION_CLASS_IDS = list(range(7))
+PROTOCOL_REVISION = "earthmiss_missing_v1_raw_logits_v2"
 
 
 def parse_args():
@@ -122,6 +125,7 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
     if args.run != "A":
         checkpoint_roles["best_full.pth"] = "diagnostic_only"
     return {
+        "protocol_revision": PROTOCOL_REVISION,
         "run": args.run,
         "seed": args.seed,
         "train_tiles": len(train_dataset),
@@ -132,6 +136,10 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
         "train_policy": {"A": "sar", "B": "full", "C": "50/50 full-sar"}[
             args.run
         ],
+        "model": {
+            "segmentation_head": "raw_conv1x1",
+            "released_segmentation_head": "conv_bn_relu",
+        },
         "augmentation": {
             "random_crop": [args.window_size, args.window_size],
             "horizontal_flip_p": 0.5,
@@ -287,6 +295,16 @@ def main():
         raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
 
     output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
+    existing_artifacts = (
+        output_dir / "metrics.jsonl",
+        output_dir / "last.pth",
+        output_dir / "best_sar.pth",
+        output_dir / "best_full.pth",
+    )
+    if not args.resume and any(path.exists() for path in existing_artifacts):
+        raise FileExistsError(
+            f"Refusing to overwrite an existing EarthMiss run: {output_dir}"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     last_checkpoint = output_dir / "last.pth"
     metrics_path = output_dir / "metrics.jsonl"
@@ -301,6 +319,7 @@ def main():
         use_lora=False,
         r=3,
         num_modalities=2,
+        raw_logits=True,
     ).to(device)
     criterion = JointLoss(
         SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=8),

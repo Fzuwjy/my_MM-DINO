@@ -43,6 +43,8 @@ ENDPOINTS = (
     "sar-one-input",
 )
 TEST_SELECTION_CLASS_IDS = list(range(8))
+RELEASED_SEGMENTATION_HEAD = "conv_bn_relu"
+RAW_SEGMENTATION_HEAD = "raw_conv1x1"
 
 
 def parse_args():
@@ -179,6 +181,21 @@ def _validate_checkpoint(checkpoint, args):
         raise ValueError("Checkpoint predates the fixed EarthMiss selection metric")
 
 
+def _checkpoint_uses_raw_logits(checkpoint):
+    model_protocol = checkpoint.get("protocol", {}).get("model", {})
+    segmentation_head = model_protocol.get(
+        "segmentation_head", RELEASED_SEGMENTATION_HEAD
+    )
+    if segmentation_head not in {
+        RELEASED_SEGMENTATION_HEAD,
+        RAW_SEGMENTATION_HEAD,
+    }:
+        raise ValueError(
+            f"Unknown checkpoint segmentation head: {segmentation_head!r}"
+        )
+    return segmentation_head == RAW_SEGMENTATION_HEAD
+
+
 def main():
     args = parse_args()
     if args.window_size <= 0 or args.window_size % 16:
@@ -197,6 +214,7 @@ def main():
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     _validate_checkpoint(checkpoint, args)
+    raw_logits = _checkpoint_uses_raw_logits(checkpoint)
     dataset, loader = build_loader(args)
 
     device = torch.device("cuda")
@@ -209,6 +227,7 @@ def main():
         use_lora=False,
         r=3,
         num_modalities=2,
+        raw_logits=raw_logits,
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
@@ -232,6 +251,11 @@ def main():
             "selection_state": checkpoint.get("selection_state"),
             "selection_metric": checkpoint.get("selection_metric"),
             "selection_score": checkpoint.get("selection_score"),
+            "segmentation_head": (
+                RAW_SEGMENTATION_HEAD
+                if raw_logits
+                else RELEASED_SEGMENTATION_HEAD
+            ),
         },
         "fair_comparison_contract": {
             "same_checkpoint_for_all_endpoints": True,
