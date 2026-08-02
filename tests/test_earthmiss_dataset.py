@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -126,6 +127,32 @@ class EarthMissDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(sar.shape), (1, 3, 3))
             self.assertEqual(tuple(label.shape), (3, 3))
             self.assertTrue(set(label.unique().tolist()).issubset(set(range(9))))
+
+    def test_formal_geometric_transforms_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_tile(root, "City", "tile", 127, 63)
+            dataset = _dataset(root, data_type="train", window_size=(4, 5))
+            rgb, sar, label = dataset._load_sample(0)
+
+            with (
+                patch.object(EARTHMISS.random, "randint", return_value=0),
+                patch.object(
+                    EARTHMISS.random,
+                    "random",
+                    side_effect=(0.1, 0.1, 0.1),
+                ) as probability,
+                patch.object(EARTHMISS.random, "randrange", return_value=1),
+            ):
+                transformed = dataset._train_transform(rgb, sar, label)
+
+            expected_rgb = np.rot90(np.flip(np.flip(rgb, 1), 0), 1)
+            expected_sar = np.rot90(np.flip(np.flip(sar, 1), 0), 1)
+            expected_label = np.rot90(np.flip(np.flip(label, 1), 0), 1)
+            np.testing.assert_array_equal(transformed[0], expected_rgb)
+            np.testing.assert_array_equal(transformed[1], expected_sar)
+            np.testing.assert_array_equal(transformed[2], expected_label)
+            self.assertEqual(probability.call_count, 3)
 
     def test_evaluator_pools_confusion_and_ignores_no_data(self):
         evaluator = EarthMissMetrics(num_classes=3, ignore_index=8)

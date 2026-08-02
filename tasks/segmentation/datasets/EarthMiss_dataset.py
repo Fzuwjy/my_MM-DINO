@@ -239,19 +239,17 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         label = label[row, col]
         sar = sar[row, col] if sar is not None else None
 
-        # Match the released EarthMiss policy: choose at most one geometric operation.
-        if random.random() < 0.75:
-            operation = random.randrange(3)
-            if operation == 0:
-                rgb, label = np.flip(rgb, 1), np.flip(label, 1)
-                sar = np.flip(sar, 1) if sar is not None else None
-            elif operation == 1:
-                rgb, label = np.flip(rgb, 0), np.flip(label, 0)
-                sar = np.flip(sar, 0) if sar is not None else None
-            else:
-                turns = random.randrange(4)
-                rgb, label = np.rot90(rgb, turns), np.rot90(label, turns)
-                sar = np.rot90(sar, turns) if sar is not None else None
+        # The formal EarthMiss config applies all three transforms independently.
+        if random.random() < 0.5:
+            rgb, label = np.flip(rgb, 1), np.flip(label, 1)
+            sar = np.flip(sar, 1) if sar is not None else None
+        if random.random() < 0.5:
+            rgb, label = np.flip(rgb, 0), np.flip(label, 0)
+            sar = np.flip(sar, 0) if sar is not None else None
+        if random.random() < 0.5:
+            turns = random.randrange(4)
+            rgb, label = np.rot90(rgb, turns), np.rot90(label, turns)
+            sar = np.rot90(sar, turns) if sar is not None else None
         return rgb, sar, label
 
     def __getitem__(self, idx):
