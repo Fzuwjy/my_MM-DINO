@@ -14,6 +14,7 @@ from models.MMDINO.availability import (  # noqa: E402
     active_modality_indices,
     canonical_availability,
 )
+from models.MMDINO.diagnostics import FeatureZeroSampleAdapter  # noqa: E402
 from models.MMDINO.sample_adapter import SampleAdapter  # noqa: E402
 from models.MMDINO.dino_segment import DINOSegmentModule  # noqa: E402
 from utils.inference import slide_inference  # noqa: E402
@@ -81,6 +82,130 @@ class AvailabilityTest(unittest.TestCase):
         for legacy_slot, canonical_slot in zip(legacy, canonical):
             for legacy_feature, canonical_feature in zip(legacy_slot, canonical_slot):
                 self.assertTrue(torch.equal(legacy_feature, canonical_feature))
+
+    def test_feature_zero_no_mask_is_exactly_the_released_full_path(self):
+        torch.manual_seed(19)
+        adapter = SampleAdapter(
+            in_channels=4,
+            out_channels=[2, 2, 2, 2],
+            num_modalities=2,
+        )
+        rgb_features = tuple(torch.randn(1, 4, 4) for _ in range(4))
+        sar_features = tuple(torch.randn(1, 4, 4) for _ in range(4))
+
+        expected = adapter(
+            rgb_features,
+            sar_features,
+            patch_h=2,
+            patch_w=2,
+        )
+        actual = FeatureZeroSampleAdapter(
+            adapter,
+            zero_modality_index=None,
+        )(
+            rgb_features,
+            sar_features,
+            patch_h=2,
+            patch_w=2,
+        )
+
+        for expected_slot, actual_slot in zip(expected, actual, strict=True):
+            for expected_feature, actual_feature in zip(
+                expected_slot, actual_slot, strict=True
+            ):
+                self.assertTrue(torch.equal(expected_feature, actual_feature))
+
+    def test_feature_zero_keeps_original_denominator_and_two_slots(self):
+        torch.manual_seed(23)
+        adapter = SampleAdapter(
+            in_channels=4,
+            out_channels=[2, 2, 2, 2],
+            num_modalities=2,
+        )
+        adapter.modality_weights["weight_modality_0"].data.fill_(-0.4)
+        adapter.modality_weights["weight_modality_1"].data.fill_(0.9)
+        rgb_features = tuple(torch.randn(1, 4, 4) for _ in range(4))
+        sar_features = tuple(torch.randn(1, 4, 4) for _ in range(4))
+
+        actual = FeatureZeroSampleAdapter(
+            adapter,
+            zero_modality_index=0,
+        )(
+            rgb_features,
+            sar_features,
+            patch_h=2,
+            patch_w=2,
+        )
+
+        weights = [
+            torch.sigmoid(adapter.modality_weights[f"weight_modality_{index}"])
+            for index in range(2)
+        ]
+        sar_weight_with_original_denominator = weights[1] / sum(weights)
+        self.assertEqual(len(actual), 2)
+        self.assertEqual([len(slot) for slot in actual], [4, 4])
+        for layer_index, sar_feature in enumerate(sar_features):
+            sar_processed = sar_feature.permute(0, 2, 1).reshape(1, 4, 2, 2)
+            sar_processed = adapter.projects[layer_index](sar_processed)
+            sar_processed = adapter.resize_layers[layer_index](sar_processed)
+            expected = sar_weight_with_original_denominator * sar_processed
+            torch.testing.assert_close(
+                actual[0][layer_index], expected, rtol=0.0, atol=0.0
+            )
+            torch.testing.assert_close(
+                actual[1][layer_index], expected, rtol=0.0, atol=0.0
+            )
+            self.assertFalse(torch.equal(actual[0][layer_index], sar_processed))
+
+    def test_feature_zero_model_path_runs_both_backbones_and_two_decoder_slots(self):
+        class Backbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def get_intermediate_layers(self, tensor, n):
+                self.calls.append(tensor.detach().clone())
+                batch = tensor.shape[0]
+                value = tensor.mean(dim=(1, 2, 3), keepdim=True)
+                return tuple(
+                    value.reshape(batch, 1, 1).expand(batch, 4, 4)
+                    for _ in range(4)
+                )
+
+        class Decoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.slot_count = None
+
+            def forward(self, *slots):
+                self.slot_count = len(slots)
+                batch = slots[0][0].shape[0]
+                return torch.zeros(batch, 8, 32, 32)
+
+        model = DINOSegmentModule.__new__(DINOSegmentModule)
+        torch.nn.Module.__init__(model)
+        model.num_modalities = 2
+        model.use_optical_stem = False
+        model.backbone_type = "dinov3_vits16"
+        model.backbone = Backbone()
+        model.adapter = FeatureZeroSampleAdapter(
+            SampleAdapter(
+                in_channels=4,
+                out_channels=[2, 2, 2, 2],
+                num_modalities=2,
+            ),
+            zero_modality_index=0,
+        )
+        model.decoder = Decoder()
+
+        output = model(
+            torch.full((2, 3, 32, 32), 11.0),
+            torch.full((2, 1, 32, 32), 23.0),
+        )
+
+        self.assertEqual(tuple(output.shape), (2, 8, 32, 32))
+        self.assertEqual(len(model.backbone.calls), 2)
+        self.assertEqual(model.decoder.slot_count, 2)
 
     def test_sar_only_skips_rgb_backbone_and_keeps_two_decoder_slots(self):
         class Backbone(torch.nn.Module):

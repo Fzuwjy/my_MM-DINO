@@ -38,6 +38,7 @@ DEFAULT_WEIGHTS = (
     "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
 DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1"
+VAL_SELECTION_CLASS_IDS = list(range(7))
 
 
 def parse_args():
@@ -117,6 +118,9 @@ def validation_states(run):
 
 def build_run_metadata(args, train_dataset, val_dataset, train_loader):
     steps_per_epoch = len(train_loader)
+    checkpoint_roles = {"best_sar.pth": "primary_deployment"}
+    if args.run != "A":
+        checkpoint_roles["best_full.pth"] = "diagnostic_only"
     return {
         "run": args.run,
         "seed": args.seed,
@@ -152,6 +156,17 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
             "planned_optimizer_steps": steps_per_epoch * args.epochs,
             "checkpoint_unit": "epoch",
         },
+        "evaluation": {
+            "checkpoint_selection_metric": "mIoU",
+            "checkpoint_selection_support": "pooled_gt_present",
+            "selection_split": "val_city_holdout",
+            "expected_val_selection_class_ids": VAL_SELECTION_CLASS_IDS,
+            "external_comparison_metric": "official_ever_mIoU",
+            "external_comparison_support": "fixed_all_8_classes",
+            "external_comparison_split": "test_city_holdout",
+            "checkpoint_roles": checkpoint_roles,
+            "paired_endpoint_rule": "same_checkpoint_and_epoch",
+        },
     }
 
 
@@ -175,10 +190,27 @@ def evaluate(model, loader, state, device, window_size, inference_batch_size):
             batch_size=inference_batch_size,
         )
         evaluator.update(logits.argmax(dim=1), label)
-    return evaluator.compute()
+    metrics = evaluator.compute()
+    if metrics["selection_class_ids"] != VAL_SELECTION_CLASS_IDS:
+        raise RuntimeError(
+            "EarthMiss Val class support changed: expected "
+            f"{VAL_SELECTION_CLASS_IDS}, got {metrics['selection_class_ids']}"
+        )
+    return metrics
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best, metadata):
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    best,
+    metadata,
+    *,
+    checkpoint_role,
+    selection_state=None,
+):
     torch.save(
         {
             "model": model.state_dict(),
@@ -189,16 +221,41 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best, metadata):
             "run": metadata["run"],
             "seed": metadata["seed"],
             "protocol": metadata,
+            "checkpoint_role": checkpoint_role,
+            "selection_state": selection_state,
+            "selection_metric": "mIoU" if selection_state is not None else None,
+            "selection_score": (
+                best[selection_state] if selection_state is not None else None
+            ),
         },
         path,
     )
 
 
+def ground_truth_pixel_counts(dataset):
+    counts = np.zeros(8, dtype=np.int64)
+    for sample in dataset.samples:
+        label = dataset._read_label(sample.label_path)
+        counts += np.bincount(label.reshape(-1), minlength=9)[:8]
+    return counts.tolist()
+
+
 def audit_datasets(train_dataset, val_dataset):
     rgb, sar, label = train_dataset[0]
+    val_gt_pixels = ground_truth_pixel_counts(val_dataset)
+    val_selection_class_ids = [
+        class_id for class_id, count in enumerate(val_gt_pixels) if count > 0
+    ]
+    if val_selection_class_ids != VAL_SELECTION_CLASS_IDS:
+        raise RuntimeError(
+            "EarthMiss Val class support changed: expected "
+            f"{VAL_SELECTION_CLASS_IDS}, got {val_selection_class_ids}"
+        )
     summary = {
         "train_tiles": len(train_dataset),
         "val_tiles": len(val_dataset),
+        "val_gt_pixels": val_gt_pixels,
+        "val_selection_class_ids": val_selection_class_ids,
         "first_train_tile": {
             "city": train_dataset.samples[0].city,
             "tile_id": train_dataset.samples[0].tile_id,
@@ -327,13 +384,26 @@ def main():
                         epoch,
                         best,
                         metadata,
+                        checkpoint_role=(
+                            "primary_deployment"
+                            if state == "sar"
+                            else "diagnostic_only"
+                        ),
+                        selection_state=state,
                     )
             model.train()
 
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         save_checkpoint(
-            last_checkpoint, model, optimizer, scheduler, epoch, best, metadata
+            last_checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            best,
+            metadata,
+            checkpoint_role="resume_only",
         )
         print(json.dumps(record))
 

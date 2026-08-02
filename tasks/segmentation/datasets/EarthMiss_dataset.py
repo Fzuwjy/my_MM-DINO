@@ -62,43 +62,62 @@ class EarthMissSample:
     sar_path: Optional[str]
 
 
-def _tile_id(path: Path, suffix: str) -> str:
-    stem = path.stem
-    if suffix and not stem.endswith(suffix):
-        raise ValueError(f"Unexpected EarthMiss filename for suffix {suffix!r}: {path.name}")
-    return stem[:-len(suffix)] if suffix else stem
-
-
-def _index_tiffs(directory: str, suffix: str) -> dict[str, str]:
+def _index_tiffs(directory: str) -> dict[str, str]:
     directory_path = Path(directory)
     if not directory_path.is_dir():
         raise FileNotFoundError(f"EarthMiss directory does not exist: {directory}")
 
     indexed = {}
     for path in sorted(directory_path.glob("*.tif")):
-        key = _tile_id(path, suffix)
+        key = path.stem
         if key in indexed:
             raise ValueError(f"Duplicate EarthMiss tile id {key!r} in {directory}")
         indexed[key] = str(path)
     return indexed
 
 
+def _match_modality(reference_ids, candidates, suffix, modality_name, city):
+    matched = {}
+    consumed = set()
+    missing = []
+    ambiguous = []
+    for tile_id in sorted(reference_ids):
+        candidate_ids = (tile_id, f"{tile_id}{suffix}")
+        present = [candidate_id for candidate_id in candidate_ids if candidate_id in candidates]
+        if not present:
+            missing.append(tile_id)
+            continue
+        if len(present) != 1:
+            ambiguous.append((tile_id, present))
+            continue
+        candidate_id = present[0]
+        if candidate_id in consumed:
+            ambiguous.append((tile_id, present))
+            continue
+        consumed.add(candidate_id)
+        matched[tile_id] = candidates[candidate_id]
+
+    extra = sorted(set(candidates) - consumed)
+    if missing or ambiguous or extra:
+        raise ValueError(
+            f"EarthMiss pairing mismatch in {city} for {modality_name}: "
+            f"missing={missing[:5]}, ambiguous={ambiguous[:5]}, extra={extra[:5]}"
+        )
+    return matched
+
+
 def _paired_city_samples(city, rgb_dir, label_dir, sar_dir=None):
-    rgb = _index_tiffs(rgb_dir.format(city), "")
-    labels = _index_tiffs(label_dir.format(city), "_mask")
-    sar = _index_tiffs(sar_dir.format(city), "_SAR") if sar_dir is not None else None
+    rgb = _index_tiffs(rgb_dir.format(city))
+    raw_labels = _index_tiffs(label_dir.format(city))
+    raw_sar = _index_tiffs(sar_dir.format(city)) if sar_dir is not None else None
 
     reference_ids = set(rgb)
-    for modality_name, paths in (("mask", labels), ("SAR", sar)):
-        if paths is None:
-            continue
-        missing = sorted(reference_ids - set(paths))
-        extra = sorted(set(paths) - reference_ids)
-        if missing or extra:
-            raise ValueError(
-                f"EarthMiss pairing mismatch in {city} for {modality_name}: "
-                f"missing={missing[:5]}, extra={extra[:5]}"
-            )
+    labels = _match_modality(reference_ids, raw_labels, "_mask", "mask", city)
+    sar = (
+        _match_modality(reference_ids, raw_sar, "_SAR", "SAR", city)
+        if raw_sar is not None
+        else None
+    )
 
     return [
         EarthMissSample(
@@ -181,11 +200,21 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         return tensor.sub(mean_tensor).div(std_tensor)
 
     @staticmethod
-    def _read_uint8(path, name):
+    def _read_sensor(path, name):
         array = imread(path)
-        if array.dtype != np.uint8:
-            raise ValueError(f"EarthMiss {name} must be uint8, got {array.dtype} at {path}")
-        return array
+        if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+            array.dtype, np.complexfloating
+        ):
+            raise ValueError(
+                f"EarthMiss {name} must be real-valued, got {array.dtype} at {path}"
+            )
+        if not np.isfinite(array).all():
+            raise ValueError(f"EarthMiss {name} contains non-finite values at {path}")
+        # Released RGB/SAR TIFFs are float32 in their original radiometric
+        # 0-255-scale convention and may contain values outside [0, 255].
+        # Preserve those values; normalization below is an affine transform,
+        # not a clipping or uint8 conversion.
+        return array.astype(np.float32, copy=False)
 
     @staticmethod
     def _read_label(path):
@@ -206,7 +235,7 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
 
         rgb = self.rgb_cache.get(idx)
         if rgb is None:
-            rgb = self._read_uint8(sample.rgb_path, "RGB")
+            rgb = self._read_sensor(sample.rgb_path, "RGB")
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 raise ValueError(
                     f"EarthMiss RGB must have shape HxWx3, got {rgb.shape} at {sample.rgb_path}"
@@ -222,7 +251,7 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         if sample.sar_path is not None:
             sar = self.sar_cache.get(idx)
             if sar is None:
-                sar = self._read_uint8(sample.sar_path, "SAR")
+                sar = self._read_sensor(sample.sar_path, "SAR")
                 if sar.ndim == 3 and sar.shape[2] == 1:
                     sar = sar[:, :, 0]
                 if sar.ndim != 2:
