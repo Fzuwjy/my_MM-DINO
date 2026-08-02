@@ -19,6 +19,7 @@ checkpoints/
 experiments/
 outputs/
 artifacts/
+EarthMiss/
 
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**

@@ -115,6 +115,46 @@ def validation_states(run):
     return ("sar",) if run == "A" else ("sar", "full")
 
 
+def build_run_metadata(args, train_dataset, val_dataset, train_loader):
+    steps_per_epoch = len(train_loader)
+    return {
+        "run": args.run,
+        "seed": args.seed,
+        "train_tiles": len(train_dataset),
+        "val_tiles": len(val_dataset),
+        "window_size": args.window_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "train_policy": {"A": "sar", "B": "full", "C": "50/50 full-sar"}[
+            args.run
+        ],
+        "augmentation": {
+            "random_crop": [args.window_size, args.window_size],
+            "horizontal_flip_p": 0.5,
+            "vertical_flip_p": 0.5,
+            "random_rotate90_p": 0.5,
+        },
+        "normalization": {
+            "rgb": {
+                "policy": train_dataset.rgb_normalization,
+                "mean": list(train_dataset.imagenet_mean),
+                "std": list(train_dataset.imagenet_std),
+            },
+            "sar": {
+                "policy": "earthmiss_metars_dataset_stats",
+                "mean": list(train_dataset.sar_mean),
+                "std": list(train_dataset.sar_std),
+            },
+        },
+        "budget": {
+            "sampling": "one_crop_per_tile_per_epoch",
+            "steps_per_epoch": steps_per_epoch,
+            "planned_optimizer_steps": steps_per_epoch * args.epochs,
+            "checkpoint_unit": "epoch",
+        },
+    }
+
+
 @torch.no_grad()
 def evaluate(model, loader, state, device, window_size, inference_batch_size):
     model.eval()
@@ -138,7 +178,7 @@ def evaluate(model, loader, state, device, window_size, inference_batch_size):
     return evaluator.compute()
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best, args):
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best, metadata):
     torch.save(
         {
             "model": model.state_dict(),
@@ -146,8 +186,9 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best, args):
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "best": best,
-            "run": args.run,
-            "seed": args.seed,
+            "run": metadata["run"],
+            "seed": metadata["seed"],
+            "protocol": metadata,
         },
         path,
     )
@@ -220,27 +261,20 @@ def main():
     )
     start_epoch = 1
     best = {state: float("-inf") for state in validation_states(args.run)}
+    metadata = build_run_metadata(args, train_dataset, val_dataset, train_loader)
 
     if args.resume:
         checkpoint = torch.load(last_checkpoint, map_location=device)
         if checkpoint["run"] != args.run or checkpoint["seed"] != args.seed:
             raise ValueError("Resume checkpoint does not match --run/--seed")
+        if checkpoint.get("protocol") != metadata:
+            raise ValueError("Resume checkpoint does not match the frozen protocol")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"] + 1
         best = checkpoint["best"]
 
-    metadata = {
-        "run": args.run,
-        "seed": args.seed,
-        "train_tiles": len(train_dataset),
-        "val_tiles": len(val_dataset),
-        "window_size": args.window_size,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "train_policy": {"A": "sar", "B": "full", "C": "50/50 full-sar"}[args.run],
-    }
     (output_dir / "run.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
@@ -292,14 +326,14 @@ def main():
                         scheduler,
                         epoch,
                         best,
-                        args,
+                        metadata,
                     )
             model.train()
 
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         save_checkpoint(
-            last_checkpoint, model, optimizer, scheduler, epoch, best, args
+            last_checkpoint, model, optimizer, scheduler, epoch, best, metadata
         )
         print(json.dumps(record))
 

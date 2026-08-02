@@ -276,17 +276,16 @@ class DINOSegmentModule(nn.Module):
             else:
                 logits = self.decoder(*processed_outputs_modalities)
 
-        pred = logits
         _H, _W = logits.shape[2:]
         if _H != H or _W != W:
             # 确保输出大小与输入一致
-            pred = F.interpolate(
+            logits = F.interpolate(
                 logits,
                 size=(H, W),
                 mode="bilinear",
             )
 
-        return pred
+        return logits
 
 
 class ResNetSegmentModule(nn.Module):

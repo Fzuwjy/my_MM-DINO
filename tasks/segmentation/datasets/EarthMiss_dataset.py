@@ -24,6 +24,11 @@ palette = {
 
 invert_palette = {value: key for key, value in palette.items()}
 
+# The ViT-S/LVD backbone stays on its pretraining input convention.  This is a
+# deliberate MM-DINO choice; it is not the dataset-specific MetaRS RGB policy.
+DINOV3_LVD_RGB_MEAN = (0.485, 0.456, 0.406)
+DINOV3_LVD_RGB_STD = (0.229, 0.224, 0.225)
+
 # Statistics released with the EarthMiss/MetaRS metadata, expressed on [0, 1].
 EARTHMISS_SAR_MEAN = (63.30051921735858 / 255.0,)
 EARTHMISS_SAR_STD = (68.20405016 / 255.0,)
@@ -127,6 +132,13 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
 
         self.data_type = data_type
         self.window_size = tuple(window_size)
+        if len(self.window_size) != 2 or any(size <= 0 for size in self.window_size):
+            raise ValueError("EarthMiss window_size must contain two positive values")
+        if data_type == "train" and self.window_size[0] != self.window_size[1]:
+            raise ValueError(
+                "EarthMiss training crop must be square because RandomRotate90 "
+                "can exchange height and width"
+            )
         self.cache_size = cache_size
         self.samples = []
         for city in citys:
@@ -146,12 +158,15 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         if normalize_type == "geo":
             self.imagenet_mean = (0.430, 0.411, 0.296)
             self.imagenet_std = (0.213, 0.156, 0.143)
+            self.rgb_normalization = "dinov3_satellite"
         elif normalize_type == "common":
-            self.imagenet_mean = (0.485, 0.456, 0.406)
-            self.imagenet_std = (0.229, 0.224, 0.225)
+            self.imagenet_mean = DINOV3_LVD_RGB_MEAN
+            self.imagenet_std = DINOV3_LVD_RGB_STD
+            self.rgb_normalization = "dinov3_lvd_imagenet"
         else:
             self.imagenet_mean = None
             self.imagenet_std = None
+            self.rgb_normalization = "none"
         self.sar_mean = EARTHMISS_SAR_MEAN
         self.sar_std = EARTHMISS_SAR_STD
 
