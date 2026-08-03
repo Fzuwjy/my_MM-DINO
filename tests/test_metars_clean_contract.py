@@ -23,6 +23,11 @@ def test_effective_official_recipe_constants() -> None:
     assert runner.RESNET50_SHA256_PREFIX == "19c8e357"
 
 
+def test_decode_smoke_covers_every_split() -> None:
+    runner = _load_runner()
+    assert ("train", "val", "test") in runner.decode_samples.__code__.co_consts
+
+
 def test_clean_config_changes_val_and_effective_batch_only() -> None:
     text = (ROOT / "configs" / "metars_clean.py").read_text(encoding="utf-8")
     assert 'config["data"]["val"]["params"]["image_dir"] = _dirs(val_cities, "images")' in text

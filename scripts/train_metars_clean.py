@@ -115,6 +115,29 @@ def inspect_pretrain(torch_home: Path, require: bool) -> dict:
     }
 
 
+def decode_samples(cfg) -> dict:
+    from data.EarthMiss import EarthM3
+
+    report = {}
+    for split in ("train", "val", "test"):
+        params = cfg.data[split].params
+        dataset = EarthM3(
+            params.image_dir,
+            params.mask_dir,
+            transforms=params.transforms,
+            sensors=params.sensors,
+        )
+        image, target = dataset[0]
+        report[split] = {
+            "image_shape": list(image.shape),
+            "image_dtype": str(image.dtype),
+            "mask_shape": list(target["cls"].shape),
+            "mask_dtype": str(target["cls"].dtype),
+            "filename": target["fname"],
+        }
+    return report
+
+
 def validate_config(cfg, dataset_root: Path, splits: dict[str, list[str]]) -> None:
     for split, cities in splits.items():
         actual_images = list(cfg.data[split].params.image_dir)
@@ -147,6 +170,7 @@ def main() -> None:
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--torch-home", type=Path, default=DEFAULT_TORCH_HOME)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--decode-samples", action="store_true")
     parser.set_defaults(config_path=str(DEFAULT_CONFIG))
     args = parser.parse_args()
 
@@ -182,6 +206,8 @@ def main() -> None:
             "seed": 2333,
         },
     }
+    if args.decode_samples:
+        report["decoded_samples"] = decode_samples(cfg)
     if args.check_only:
         print(json.dumps(report, indent=2))
         return
