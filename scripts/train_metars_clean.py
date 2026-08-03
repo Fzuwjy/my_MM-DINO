@@ -144,6 +144,7 @@ def validate_config(
     splits: dict[str, list[str]],
     val_source: str = "val",
     batch_per_rank: int = 4,
+    test_batch_per_rank: int = 16,
 ) -> None:
     loader_sources = {"train": "train", "val": val_source, "test": "test"}
     for loader_name, source_split in loader_sources.items():
@@ -168,6 +169,11 @@ def validate_config(
             f"per-rank batch must be {batch_per_rank}, got "
             f"{cfg.data.train.params.batch_size}"
         )
+    if cfg.data.test.params.batch_size != test_batch_per_rank:
+        raise ValueError(
+            f"test batch per rank must be {test_batch_per_rank}, got "
+            f"{cfg.data.test.params.batch_size}"
+        )
     if cfg.train.num_iters != 15000 or cfg.learning_rate.params.max_iters != 15000:
         raise ValueError("official 15000-iteration schedule was changed")
     if cfg.model.params.begin_mmr_iter != 1600:
@@ -180,6 +186,7 @@ def main(
     protocol: str = "MetaRS-clean: official recipe with data.val corrected to true Val",
     expected_world_size: int = 2,
     batch_per_rank: int = 4,
+    test_batch_per_rank: int = 16,
 ) -> None:
     import ever as er
     from ever.core.config import import_config
@@ -198,6 +205,7 @@ def main(
     os.environ["EARTHMISS_ROOT"] = str(args.dataset_root)
     os.environ["TORCH_HOME"] = str(args.torch_home)
     os.environ["METARS_TRAIN_BATCH_PER_RANK"] = str(batch_per_rank)
+    os.environ["METARS_TEST_BATCH_PER_RANK"] = str(test_batch_per_rank)
     _enter_official_tree(args.official_code_root)
 
     from configs.metadata.EarthMiss import test_cities, train_cities, val_cities
@@ -216,6 +224,7 @@ def main(
         splits,
         val_source=val_source,
         batch_per_rank=batch_per_rank,
+        test_batch_per_rank=test_batch_per_rank,
     )
     report = {
         "protocol": protocol,
@@ -227,6 +236,7 @@ def main(
             "world_size": expected_world_size,
             "batch_per_rank": batch_per_rank,
             "global_batch": expected_world_size * batch_per_rank,
+            "test_batch_per_rank": test_batch_per_rank,
             "iterations": 15000,
             "begin_mmr_iter": 1600,
             "data_val_source": val_source,

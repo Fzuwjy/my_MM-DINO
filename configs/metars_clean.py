@@ -23,6 +23,7 @@ dataset_root = Path(
     )
 ).resolve()
 train_batch_per_rank = int(os.environ.get("METARS_TRAIN_BATCH_PER_RANK", "4"))
+test_batch_per_rank = int(os.environ.get("METARS_TEST_BATCH_PER_RANK", "16"))
 
 
 def _dirs(cities: list[str], leaf: str) -> list[str]:
@@ -40,6 +41,7 @@ config["data"]["val"]["params"]["mask_dir"] = _dirs(val_cities, "masks")
 
 config["data"]["test"]["params"]["image_dir"] = _dirs(test_cities, "images")
 config["data"]["test"]["params"]["mask_dir"] = _dirs(test_cities, "masks")
+config["data"]["test"]["params"]["batch_size"] = test_batch_per_rank
 
 # MetaRS.conduct_mask_matrix() reads this nested loader configuration at step
 # 1600.  Keep it tied to the corrected validation loader.

@@ -14,4 +14,5 @@ if __name__ == "__main__":
         ),
         expected_world_size=1,
         batch_per_rank=8,
+        test_batch_per_rank=1,
     )

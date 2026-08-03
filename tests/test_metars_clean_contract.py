@@ -33,6 +33,7 @@ def test_clean_config_changes_val_and_effective_batch_only() -> None:
     assert 'config["data"]["val"]["params"]["image_dir"] = _dirs(val_cities, "images")' in text
     assert 'config["model"]["params"]["data"] = config["data"]["val"]' in text
     assert 'config["data"]["train"]["params"]["batch_size"] = train_batch_per_rank' in text
+    assert 'config["data"]["test"]["params"]["batch_size"] = test_batch_per_rank' in text
 
 
 def test_official_reproduction_preserves_test_backed_val() -> None:
@@ -42,6 +43,7 @@ def test_official_reproduction_preserves_test_backed_val() -> None:
     assert 'config["data"]["val"]["params"]["image_dir"] = _dirs(test_cities, "images")' in text
     assert 'config["model"]["params"]["data"] = config["data"]["val"]' in text
     assert 'config["data"]["train"]["params"]["batch_size"] = train_batch_per_rank' in text
+    assert 'config["data"]["test"]["params"]["batch_size"] = test_batch_per_rank' in text
 
 
 def test_official_launcher_selects_test_backed_protocol() -> None:
@@ -59,3 +61,4 @@ def test_single_gpu_launchers_preserve_global_batch_eight() -> None:
         text = (ROOT / "scripts" / filename).read_text(encoding="utf-8")
         assert "expected_world_size=1" in text
         assert "batch_per_rank=8" in text
+        assert "test_batch_per_rank=1" in text
