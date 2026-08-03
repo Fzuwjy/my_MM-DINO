@@ -143,6 +143,7 @@ def validate_config(
     dataset_root: Path,
     splits: dict[str, list[str]],
     val_source: str = "val",
+    batch_per_rank: int = 4,
 ) -> None:
     loader_sources = {"train": "train", "val": val_source, "test": "test"}
     for loader_name, source_split in loader_sources.items():
@@ -162,8 +163,11 @@ def validate_config(
         != list(cfg.data.val.params.mask_dir)
     ):
         raise ValueError("MetaRS MMR loader is not tied to data.val")
-    if cfg.data.train.params.batch_size != 4:
-        raise ValueError("per-rank batch must remain 4 for the official two-rank recipe")
+    if cfg.data.train.params.batch_size != batch_per_rank:
+        raise ValueError(
+            f"per-rank batch must be {batch_per_rank}, got "
+            f"{cfg.data.train.params.batch_size}"
+        )
     if cfg.train.num_iters != 15000 or cfg.learning_rate.params.max_iters != 15000:
         raise ValueError("official 15000-iteration schedule was changed")
     if cfg.model.params.begin_mmr_iter != 1600:
@@ -174,6 +178,8 @@ def main(
     default_config: Path = DEFAULT_CONFIG,
     val_source: str = "val",
     protocol: str = "MetaRS-clean: official recipe with data.val corrected to true Val",
+    expected_world_size: int = 2,
+    batch_per_rank: int = 4,
 ) -> None:
     import ever as er
     from ever.core.config import import_config
@@ -191,6 +197,7 @@ def main(
     args.torch_home = args.torch_home.resolve()
     os.environ["EARTHMISS_ROOT"] = str(args.dataset_root)
     os.environ["TORCH_HOME"] = str(args.torch_home)
+    os.environ["METARS_TRAIN_BATCH_PER_RANK"] = str(batch_per_rank)
     _enter_official_tree(args.official_code_root)
 
     from configs.metadata.EarthMiss import test_cities, train_cities, val_cities
@@ -203,7 +210,13 @@ def main(
     cfg = import_config(str(Path(args.config_path).resolve()))
     if args.opts:
         cfg.update_from_list(args.opts)
-    validate_config(cfg, args.dataset_root, splits, val_source=val_source)
+    validate_config(
+        cfg,
+        args.dataset_root,
+        splits,
+        val_source=val_source,
+        batch_per_rank=batch_per_rank,
+    )
     report = {
         "protocol": protocol,
         "official_code_root": str(args.official_code_root.resolve()),
@@ -211,9 +224,9 @@ def main(
         "dataset": inspect_dataset(args.dataset_root, splits),
         "pretrain": inspect_pretrain(args.torch_home, require=not args.check_only),
         "effective_recipe": {
-            "world_size": 2,
-            "batch_per_rank": 4,
-            "global_batch": 8,
+            "world_size": expected_world_size,
+            "batch_per_rank": batch_per_rank,
+            "global_batch": expected_world_size * batch_per_rank,
             "iterations": 15000,
             "begin_mmr_iter": 1600,
             "data_val_source": val_source,
@@ -231,9 +244,9 @@ def main(
     if not torch.cuda.is_available():
         raise RuntimeError("training requires GPU mode; use --check-only without a GPU")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size != 2:
+    if world_size != expected_world_size:
         raise RuntimeError(
-            f"official effective recipe requires WORLD_SIZE=2, got {world_size}"
+            f"this recipe requires WORLD_SIZE={expected_world_size}, got {world_size}"
         )
     if args.model_dir is None:
         raise ValueError("--model_dir is required for training")

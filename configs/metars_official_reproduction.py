@@ -20,6 +20,7 @@ dataset_root = Path(
         "EARTHMISS_ROOT", "/root/autodl-tmp/mm-dino/datasets/EarthMiss"
     )
 ).resolve()
+train_batch_per_rank = int(os.environ.get("METARS_TRAIN_BATCH_PER_RANK", "4"))
 
 
 def _dirs(cities: list[str], leaf: str) -> list[str]:
@@ -30,7 +31,7 @@ config = copy.deepcopy(_official_config)
 
 config["data"]["train"]["params"]["image_dir"] = _dirs(train_cities, "images")
 config["data"]["train"]["params"]["mask_dir"] = _dirs(train_cities, "masks")
-config["data"]["train"]["params"]["batch_size"] = 4
+config["data"]["train"]["params"]["batch_size"] = train_batch_per_rank
 
 config["data"]["val"]["params"]["image_dir"] = _dirs(test_cities, "images")
 config["data"]["val"]["params"]["mask_dir"] = _dirs(test_cities, "masks")
