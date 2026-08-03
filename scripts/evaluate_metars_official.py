@@ -126,6 +126,11 @@ def build_official_model(args: argparse.Namespace):
     cfg.data.test.params.num_workers = args.num_workers
 
     _, released_state = load_released_checkpoint(args.checkpoint)
+    model_cls = er.registry.MODEL[cfg.model.type]
+    original_init = getattr(model_cls.__init__, "__wrapped__", None)
+    if getattr(model_cls, "_is_auto_config_class", False) and original_init is not None:
+        model_cls.__init__ = original_init
+        model_cls._is_auto_config_class = False
     model = make_model(cfg.model)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.load_state_dict(remove_module_prefix(released_state), strict=True)
