@@ -42,9 +42,9 @@ def main() -> None:
     import ever as er
     import torch
     import torch.distributed as dist
+    from ever.core import to
     from ever.core.builder import make_dataloader, make_model, make_optimizer
     from ever.core.config import import_config
-    from ever.util import to
 
     if not torch.cuda.is_available():
         raise RuntimeError("training smoke requires a CUDA device")
