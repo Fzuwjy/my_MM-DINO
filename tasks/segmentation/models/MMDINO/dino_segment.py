@@ -170,12 +170,161 @@ class DINOSegmentModule(nn.Module):
         for w_b in self.w_b:
             nn.init.zeros_(w_b.weight)
 
-    def forward(self, *modalities, availability=None):
+    @staticmethod
+    def _validate_modality_batch(modalities, *, require_same_spatial=False):
         if len(modalities) == 0:
             raise ValueError("At least one modality must be provided")
         batch_size = modalities[0].shape[0]
         if any(modality.shape[0] != batch_size for modality in modalities):
             raise ValueError("All modality inputs must have the same batch size")
+        if require_same_spatial:
+            spatial_shape = modalities[0].shape[-2:]
+            if any(modality.shape[-2:] != spatial_shape for modality in modalities):
+                raise ValueError("All modality inputs must have the same spatial shape")
+        return batch_size
+
+    @staticmethod
+    def _prepare_dino_modality(modality):
+        if modality.shape[1] == 1:
+            return modality.repeat(1, 3, 1, 1)
+        if modality.shape[1] != 3:
+            raise ValueError(
+                "DINOv3 modality inputs must have one or three channels"
+            )
+        return modality
+
+    def _extract_backbone_output(self, modality):
+        modality = self._prepare_dino_modality(modality)
+        return self.backbone.get_intermediate_layers(
+            modality,
+            n=BACKBONE_INTERMEDIATE_LAYERS[self.backbone_type],
+        )
+
+    def extract_frozen_backbone_outputs(self, *modalities):
+        """Extract one reusable raw DINO output tuple per canonical slot.
+
+        Reusing these tensors across sequential backward calls is valid only
+        while the backbone is fully frozen. Existing ``forward`` callers keep
+        their original branch-skipping behavior and do not use this API.
+        """
+
+        self._validate_modality_batch(modalities, require_same_spatial=True)
+        if len(modalities) != self.num_modalities:
+            raise ValueError(
+                "Frozen feature extraction requires one tensor for every "
+                "canonical modality slot"
+            )
+        if any(parameter.requires_grad for parameter in self.backbone.parameters()):
+            raise RuntimeError(
+                "Cached raw backbone outputs require a fully frozen backbone"
+            )
+        with torch.no_grad():
+            return tuple(
+                self._extract_backbone_output(modality) for modality in modalities
+            )
+
+    def _decode_active_backbone_outputs(
+        self,
+        modalities,
+        outputs_modalities,
+        *,
+        active_indices,
+        canonical_slots,
+    ):
+        if len(outputs_modalities) != len(active_indices):
+            raise ValueError("Active modalities and backbone outputs do not match")
+
+        x = modalities[active_indices[0]]
+        _, _, height, width = x.shape
+        if any(
+            modalities[index].shape[-2:] != (height, width)
+            for index in active_indices
+        ):
+            raise ValueError("All active modalities must have the same spatial shape")
+        patch_h, patch_w = height // 16, width // 16
+        scale_factors = [4, 2, 1, 0.5]
+
+        if self.adapter is not None:
+            processed_outputs_modalities = self.adapter(
+                *outputs_modalities,
+                patch_h=patch_h,
+                patch_w=patch_w,
+                guidance=modalities[0] if 0 in active_indices else None,
+                modality_indices=active_indices if canonical_slots else None,
+            )
+        else:
+            processed_outputs_modalities = []
+            for outputs_modality in outputs_modalities:
+                processed_outputs_modality = []
+                for index, output in enumerate(outputs_modality):
+                    output = output.permute(0, 2, 1).reshape(
+                        (output.shape[0], output.shape[-1], patch_h, patch_w)
+                    )
+                    if index < len(scale_factors):
+                        output = F.interpolate(
+                            output,
+                            scale_factor=scale_factors[index],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    processed_outputs_modality.append(output)
+                processed_outputs_modalities.append(processed_outputs_modality)
+
+        if self.use_optical_stem:
+            logits = self.decoder(
+                *processed_outputs_modalities,
+                guidance=modalities[0],
+            )
+        else:
+            logits = self.decoder(*processed_outputs_modalities)
+
+        if logits.shape[-2:] != (height, width):
+            logits = F.interpolate(
+                logits,
+                size=(height, width),
+                mode="bilinear",
+            )
+        return logits
+
+    def forward_from_backbone_outputs(
+        self,
+        *modalities,
+        backbone_outputs,
+        availability=None,
+    ):
+        """Decode one canonical availability state from cached raw outputs."""
+
+        batch_size = self._validate_modality_batch(
+            modalities,
+            require_same_spatial=True,
+        )
+        if len(modalities) != self.num_modalities:
+            raise ValueError(
+                "Cached canonical forward requires one tensor for every modality slot"
+            )
+        if len(backbone_outputs) != len(modalities):
+            raise ValueError(
+                "Cached backbone output count must match the modality slot count"
+            )
+        active_indices = active_modality_indices(
+            availability,
+            batch_size=batch_size,
+            num_modalities=self.num_modalities,
+        )
+        if self.use_optical_stem and (len(active_indices) == 1 or 0 not in active_indices):
+            raise ValueError(
+                "the optical spatial stem requires optical and multimodal inputs"
+            )
+        active_outputs = tuple(backbone_outputs[index] for index in active_indices)
+        return self._decode_active_backbone_outputs(
+            modalities,
+            active_outputs,
+            active_indices=active_indices,
+            canonical_slots=availability is not None,
+        )
+
+    def forward(self, *modalities, availability=None):
+        batch_size = self._validate_modality_batch(modalities)
         if availability is not None and len(modalities) != self.num_modalities:
             raise ValueError(
                 "Canonical availability requires one tensor for every modality slot"
@@ -196,6 +345,11 @@ class DINOSegmentModule(nn.Module):
         # 主输入x
         x = modalities[active_indices[0]]
         _, _, H, W = x.shape
+        if any(
+            modalities[index].shape[-2:] != (H, W)
+            for index in active_indices
+        ):
+            raise ValueError("All active modalities must have the same spatial shape")
         patch_h, patch_w = H // 16, W // 16
 
         scale_factors = [4, 2, 1, 0.5]
@@ -226,22 +380,10 @@ class DINOSegmentModule(nn.Module):
             logits = self.decoder(multi_scale_features)
 
         else:
-            outputs_modalities = []
-            for modality_index in active_indices:
-                modality_input = modalities[modality_index]
-                if modality_input.shape[-2:] != (H, W):
-                    raise ValueError("All active modalities must have the same spatial shape")
-                if modality_input.shape[1] == 1:
-                    modality_input = modality_input.repeat(1, 3, 1, 1)
-                elif modality_input.shape[1] != 3:
-                    raise ValueError(
-                        "DINOv3 modality inputs must have one or three channels"
-                    )
-
-                outputs_modality = self.backbone.get_intermediate_layers(
-                    modality_input,
-                    n=BACKBONE_INTERMEDIATE_LAYERS[self.backbone_type])
-                outputs_modalities.append(outputs_modality)
+            outputs_modalities = [
+                self._extract_backbone_output(modalities[modality_index])
+                for modality_index in active_indices
+            ]
 
             if self.adapter is not None:
                 # 使用适配器处理多尺度特征
