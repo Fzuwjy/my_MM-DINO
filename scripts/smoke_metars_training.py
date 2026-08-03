@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--torch-home", type=Path, default=DEFAULT_TORCH_HOME)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--with-mmr", action="store_true")
     args = parser.parse_args()
 
     if args.batch_size <= 0:
@@ -73,6 +74,13 @@ def main() -> None:
     image, target = next(iter(loader))
     image, target = to.to_device((image, target), device)
 
+    if args.with_mmr:
+        model.train()
+        model.module.global_step.fill_(cfg.model.params.begin_mmr_iter)
+        model.module.conduct_mask_matrix()
+        model.train()
+        torch.cuda.empty_cache()
+
     torch.cuda.reset_peak_memory_stats(device)
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -83,6 +91,7 @@ def main() -> None:
     torch.cuda.synchronize(device)
     report = {
         "training_step": True,
+        "with_mmr": args.with_mmr,
         "batch_size": args.batch_size,
         "image_shape": list(image.shape),
         "loss_keys": sorted(key for key in losses if key.endswith("loss")),
