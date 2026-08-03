@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--save-predictions", action="store_true")
     return parser.parse_args()
@@ -134,6 +135,7 @@ def load_official_config(args: argparse.Namespace):
         str(args.dataset_root / city / "masks") for city in test_cities
     ]
     cfg.data.test.params.distributed = False
+    cfg.data.test.params.batch_size = args.batch_size
     cfg.data.test.params.num_workers = args.num_workers
     return er, make_dataloader, make_model, remove_module_prefix, cfg
 
@@ -152,7 +154,6 @@ def build_official_model(args: argparse.Namespace):
 
 def data_smoke(args: argparse.Namespace) -> None:
     _, make_dataloader, _, _, cfg = load_official_config(args)
-    cfg.data.test.params.batch_size = 1
     ensure_single_process_group()
     image, target = next(iter(make_dataloader(cfg.data.test)))
     report = {
