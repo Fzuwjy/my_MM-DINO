@@ -33,3 +33,19 @@ def test_clean_config_changes_val_and_effective_batch_only() -> None:
     assert 'config["data"]["val"]["params"]["image_dir"] = _dirs(val_cities, "images")' in text
     assert 'config["model"]["params"]["data"] = config["data"]["val"]' in text
     assert 'config["data"]["train"]["params"]["batch_size"] = 4' in text
+
+
+def test_official_reproduction_preserves_test_backed_val() -> None:
+    text = (ROOT / "configs" / "metars_official_reproduction.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'config["data"]["val"]["params"]["image_dir"] = _dirs(test_cities, "images")' in text
+    assert 'config["model"]["params"]["data"] = config["data"]["val"]' in text
+    assert 'config["data"]["train"]["params"]["batch_size"] = 4' in text
+
+
+def test_official_launcher_selects_test_backed_protocol() -> None:
+    text = (ROOT / "scripts" / "train_metars_official.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'val_source="test"' in text

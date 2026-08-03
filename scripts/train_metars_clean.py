@@ -138,14 +138,23 @@ def decode_samples(cfg) -> dict:
     return report
 
 
-def validate_config(cfg, dataset_root: Path, splits: dict[str, list[str]]) -> None:
-    for split, cities in splits.items():
-        actual_images = list(cfg.data[split].params.image_dir)
-        actual_masks = list(cfg.data[split].params.mask_dir)
+def validate_config(
+    cfg,
+    dataset_root: Path,
+    splits: dict[str, list[str]],
+    val_source: str = "val",
+) -> None:
+    loader_sources = {"train": "train", "val": val_source, "test": "test"}
+    for loader_name, source_split in loader_sources.items():
+        cities = splits[source_split]
+        actual_images = list(cfg.data[loader_name].params.image_dir)
+        actual_masks = list(cfg.data[loader_name].params.mask_dir)
         expected_images = [str(dataset_root / city / "images") for city in cities]
         expected_masks = [str(dataset_root / city / "masks") for city in cities]
         if actual_images != expected_images or actual_masks != expected_masks:
-            raise ValueError(f"{split} paths do not match the released city split")
+            raise ValueError(
+                f"data.{loader_name} paths do not match the expected {source_split} split"
+            )
     if (
         list(cfg.model.params.data.params.image_dir)
         != list(cfg.data.val.params.image_dir)
@@ -161,7 +170,11 @@ def validate_config(cfg, dataset_root: Path, splits: dict[str, list[str]]) -> No
         raise ValueError("official begin_mmr_iter=1600 was changed")
 
 
-def main() -> None:
+def main(
+    default_config: Path = DEFAULT_CONFIG,
+    val_source: str = "val",
+    protocol: str = "MetaRS-clean: official recipe with data.val corrected to true Val",
+) -> None:
     import ever as er
     from ever.core.config import import_config
 
@@ -171,7 +184,7 @@ def main() -> None:
     parser.add_argument("--torch-home", type=Path, default=DEFAULT_TORCH_HOME)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--decode-samples", action="store_true")
-    parser.set_defaults(config_path=str(DEFAULT_CONFIG))
+    parser.set_defaults(config_path=str(default_config))
     args = parser.parse_args()
 
     args.dataset_root = args.dataset_root.resolve()
@@ -190,9 +203,9 @@ def main() -> None:
     cfg = import_config(str(Path(args.config_path).resolve()))
     if args.opts:
         cfg.update_from_list(args.opts)
-    validate_config(cfg, args.dataset_root, splits)
+    validate_config(cfg, args.dataset_root, splits, val_source=val_source)
     report = {
-        "protocol": "MetaRS-clean: official recipe with data.val corrected to true Val",
+        "protocol": protocol,
         "official_code_root": str(args.official_code_root.resolve()),
         "config_path": str(Path(args.config_path).resolve()),
         "dataset": inspect_dataset(args.dataset_root, splits),
@@ -203,6 +216,7 @@ def main() -> None:
             "global_batch": 8,
             "iterations": 15000,
             "begin_mmr_iter": 1600,
+            "data_val_source": val_source,
             "seed": 2333,
         },
     }
