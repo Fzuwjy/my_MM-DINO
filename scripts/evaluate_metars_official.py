@@ -33,7 +33,9 @@ DEFAULT_DATASET_ROOT = Path("/root/autodl-tmp/mm-dino/datasets/EarthMiss")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("inspect", "data", "load", "eval"), default="inspect"
+        "--mode",
+        choices=("inspect", "data", "load", "forward", "eval"),
+        default="inspect",
     )
     parser.add_argument("--official-code-root", type=Path, default=DEFAULT_OFFICIAL_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -180,6 +182,29 @@ def load_smoke(args: argparse.Namespace) -> None:
     print(json.dumps(report, indent=2))
 
 
+def forward_smoke(args: argparse.Namespace) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("MetaRS forward smoke requires a CUDA device")
+    _, _, model, _ = build_official_model(args)
+    device = torch.device("cuda:0")
+    model.to(device).eval()
+    torch.cuda.reset_peak_memory_stats(device)
+    image = torch.zeros((1, 4, 512, 512), dtype=torch.float32, device=device)
+    with torch.no_grad():
+        prediction = model(image)
+    torch.cuda.synchronize(device)
+    report = {
+        "forward": True,
+        "input_shape": list(image.shape),
+        "output_shape": list(prediction.shape),
+        "output_dtype": str(prediction.dtype),
+        "finite": bool(torch.isfinite(prediction).all().item()),
+        "peak_memory_mib": round(torch.cuda.max_memory_allocated(device) / 2**20, 1),
+        "device": torch.cuda.get_device_name(device),
+    }
+    print(json.dumps(report, indent=2))
+
+
 def evaluate(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("MetaRS evaluation requires a GPU; current mode has no CUDA device")
@@ -241,6 +266,8 @@ def main() -> None:
         data_smoke(args)
     elif args.mode == "load":
         load_smoke(args)
+    elif args.mode == "forward":
+        forward_smoke(args)
     else:
         evaluate(args)
 
