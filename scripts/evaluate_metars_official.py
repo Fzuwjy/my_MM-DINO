@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 
 DEFAULT_OFFICIAL_ROOT = Path(
@@ -53,6 +54,14 @@ def seed_torch(seed: int = 2333) -> None:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.enabled = False
+
+
+def ensure_single_process_group() -> None:
+    if dist.is_initialized():
+        return
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29527")
+    dist.init_process_group(backend="gloo", rank=0, world_size=1)
 
 
 def load_released_checkpoint(path: Path) -> tuple[dict, dict]:
@@ -149,6 +158,7 @@ def build_official_model(args: argparse.Namespace):
 def data_smoke(args: argparse.Namespace) -> None:
     _, make_dataloader, _, _, cfg = load_official_config(args)
     cfg.data.test.params.batch_size = 1
+    ensure_single_process_group()
     image, target = next(iter(make_dataloader(cfg.data.test)))
     report = {
         "image_shape": list(image.shape),
@@ -190,6 +200,7 @@ def evaluate(args: argparse.Namespace) -> None:
     seed_torch()
     device = torch.device("cuda:0")
     model.to(device).eval()
+    ensure_single_process_group()
     loader = make_dataloader(cfg.data.test)
     metric = er.metric.PixelMetric(
         cfg.model.params.num_classes,
