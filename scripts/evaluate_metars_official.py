@@ -31,7 +31,9 @@ DEFAULT_DATASET_ROOT = Path("/root/autodl-tmp/mm-dino/datasets/EarthMiss")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("inspect", "load", "eval"), default="inspect")
+    parser.add_argument(
+        "--mode", choices=("inspect", "data", "load", "eval"), default="inspect"
+    )
     parser.add_argument("--official-code-root", type=Path, default=DEFAULT_OFFICIAL_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
@@ -102,7 +104,7 @@ def enter_official_tree(root: Path):
     return er, make_dataloader, make_model, remove_module_prefix, import_config
 
 
-def build_official_model(args: argparse.Namespace):
+def load_official_config(args: argparse.Namespace):
     (
         er,
         make_dataloader,
@@ -124,6 +126,13 @@ def build_official_model(args: argparse.Namespace):
     ]
     cfg.data.test.params.distributed = False
     cfg.data.test.params.num_workers = args.num_workers
+    return er, make_dataloader, make_model, remove_module_prefix, cfg
+
+
+def build_official_model(args: argparse.Namespace):
+    er, make_dataloader, make_model, remove_module_prefix, cfg = (
+        load_official_config(args)
+    )
 
     _, released_state = load_released_checkpoint(args.checkpoint)
     model_cls = er.registry.MODEL[cfg.model.type]
@@ -135,6 +144,20 @@ def build_official_model(args: argparse.Namespace):
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.load_state_dict(remove_module_prefix(released_state), strict=True)
     return er, make_dataloader, model, cfg
+
+
+def data_smoke(args: argparse.Namespace) -> None:
+    _, make_dataloader, _, _, cfg = load_official_config(args)
+    cfg.data.test.params.batch_size = 1
+    image, target = next(iter(make_dataloader(cfg.data.test)))
+    report = {
+        "image_shape": list(image.shape),
+        "image_dtype": str(image.dtype),
+        "mask_shape": list(target["cls"].shape),
+        "mask_dtype": str(target["cls"].dtype),
+        "filename": list(target["fname"]),
+    }
+    print(json.dumps(report, indent=2))
 
 
 def load_smoke(args: argparse.Namespace) -> None:
@@ -207,6 +230,8 @@ def main() -> None:
             raise FileNotFoundError(path)
     if args.mode == "inspect":
         inspect_checkpoint(args.checkpoint)
+    elif args.mode == "data":
+        data_smoke(args)
     elif args.mode == "load":
         load_smoke(args)
     else:
