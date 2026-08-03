@@ -14,5 +14,7 @@ if __name__ == "__main__":
         ),
         expected_world_size=1,
         batch_per_rank=8,
-        test_batch_per_rank=1,
+        test_batch_per_rank=4,
+        save_ckpt_interval_epoch=5,
+        resume_insurance=True,
     )

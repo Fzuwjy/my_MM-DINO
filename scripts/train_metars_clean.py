@@ -145,6 +145,7 @@ def validate_config(
     val_source: str = "val",
     batch_per_rank: int = 4,
     test_batch_per_rank: int = 16,
+    save_ckpt_interval_epoch: int = 20,
 ) -> None:
     loader_sources = {"train": "train", "val": val_source, "test": "test"}
     for loader_name, source_split in loader_sources.items():
@@ -174,6 +175,11 @@ def validate_config(
             f"test batch per rank must be {test_batch_per_rank}, got "
             f"{cfg.data.test.params.batch_size}"
         )
+    if cfg.train.save_ckpt_interval_epoch != save_ckpt_interval_epoch:
+        raise ValueError(
+            f"checkpoint interval must be {save_ckpt_interval_epoch}, got "
+            f"{cfg.train.save_ckpt_interval_epoch}"
+        )
     if cfg.train.num_iters != 15000 or cfg.learning_rate.params.max_iters != 15000:
         raise ValueError("official 15000-iteration schedule was changed")
     if cfg.model.params.begin_mmr_iter != 1600:
@@ -187,6 +193,8 @@ def main(
     expected_world_size: int = 2,
     batch_per_rank: int = 4,
     test_batch_per_rank: int = 16,
+    save_ckpt_interval_epoch: int = 20,
+    resume_insurance: bool = False,
 ) -> None:
     import ever as er
     from ever.core.config import import_config
@@ -206,6 +214,9 @@ def main(
     os.environ["TORCH_HOME"] = str(args.torch_home)
     os.environ["METARS_TRAIN_BATCH_PER_RANK"] = str(batch_per_rank)
     os.environ["METARS_TEST_BATCH_PER_RANK"] = str(test_batch_per_rank)
+    os.environ["METARS_SAVE_CKPT_INTERVAL_EPOCH"] = str(
+        save_ckpt_interval_epoch
+    )
     _enter_official_tree(args.official_code_root)
 
     from configs.metadata.EarthMiss import test_cities, train_cities, val_cities
@@ -225,6 +236,7 @@ def main(
         val_source=val_source,
         batch_per_rank=batch_per_rank,
         test_batch_per_rank=test_batch_per_rank,
+        save_ckpt_interval_epoch=save_ckpt_interval_epoch,
     )
     report = {
         "protocol": protocol,
@@ -237,6 +249,8 @@ def main(
             "batch_per_rank": batch_per_rank,
             "global_batch": expected_world_size * batch_per_rank,
             "test_batch_per_rank": test_batch_per_rank,
+            "save_ckpt_interval_epoch": save_ckpt_interval_epoch,
+            "resume_insurance": resume_insurance,
             "iterations": 15000,
             "begin_mmr_iter": 1600,
             "data_val_source": val_source,
@@ -271,7 +285,18 @@ def main(
 
     seed_torch(2333)
     trainer = er.trainer.TRAINER[args.trainer](args)()
-    trainer.run(after_construct_launcher_callbacks=[register_evaluate_fn])
+    launcher_callbacks = [register_evaluate_fn]
+    if resume_insurance:
+        from metars_resume_insurance import register_resume_insurance
+
+        launcher_callbacks.append(
+            lambda launcher: register_resume_insurance(
+                launcher,
+                interval_epoch=save_ckpt_interval_epoch,
+                begin_mmr_iter=cfg.model.params.begin_mmr_iter,
+            )
+        )
+    trainer.run(after_construct_launcher_callbacks=launcher_callbacks)
 
 
 if __name__ == "__main__":

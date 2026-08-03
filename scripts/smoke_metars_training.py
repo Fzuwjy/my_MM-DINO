@@ -28,13 +28,18 @@ def main() -> None:
     parser.add_argument("--torch-home", type=Path, default=DEFAULT_TORCH_HOME)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--with-mmr", action="store_true")
+    parser.add_argument("--eval-batch-size", type=int)
     args = parser.parse_args()
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be positive")
     os.environ["EARTHMISS_ROOT"] = str(args.dataset_root.resolve())
     os.environ["TORCH_HOME"] = str(args.torch_home.resolve())
     os.environ["METARS_TRAIN_BATCH_PER_RANK"] = str(args.batch_size)
+    if args.eval_batch_size is not None:
+        os.environ["METARS_TEST_BATCH_PER_RANK"] = str(args.eval_batch_size)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29631")
     os.environ.setdefault("LOCAL_RANK", "0")
@@ -89,6 +94,7 @@ def main() -> None:
     total_loss.backward()
     optimizer.step()
     torch.cuda.synchronize(device)
+    training_peak_mib = round(torch.cuda.max_memory_allocated(device) / 2**20, 1)
     report = {
         "training_step": True,
         "with_mmr": args.with_mmr,
@@ -96,9 +102,38 @@ def main() -> None:
         "image_shape": list(image.shape),
         "loss_keys": sorted(key for key in losses if key.endswith("loss")),
         "total_loss": float(total_loss.detach().cpu()),
-        "peak_memory_mib": round(torch.cuda.max_memory_allocated(device) / 2**20, 1),
+        "peak_memory_mib": training_peak_mib,
         "device": torch.cuda.get_device_name(device),
     }
+
+    if args.eval_batch_size is not None:
+        optimizer.zero_grad()
+        test_loader = make_dataloader(cfg.data.test)
+        test_image, test_target = next(iter(test_loader))
+        test_image, test_target = to.to_device((test_image, test_target), device)
+        model.eval()
+        report["pre_eval_allocated_mib"] = round(
+            torch.cuda.memory_allocated(device) / 2**20, 1
+        )
+        report["pre_eval_reserved_mib"] = round(
+            torch.cuda.memory_reserved(device) / 2**20, 1
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+        with torch.no_grad():
+            prediction = model(test_image, test_target)
+        torch.cuda.synchronize(device)
+        report["evaluation"] = {
+            "batch_size": args.eval_batch_size,
+            "input_shape": list(test_image.shape),
+            "output_shape": list(prediction.shape),
+            "finite": bool(torch.isfinite(prediction).all().item()),
+            "peak_allocated_mib": round(
+                torch.cuda.max_memory_allocated(device) / 2**20, 1
+            ),
+            "peak_reserved_mib": round(
+                torch.cuda.max_memory_reserved(device) / 2**20, 1
+            ),
+        }
     print(json.dumps(report, indent=2))
     dist.destroy_process_group()
 

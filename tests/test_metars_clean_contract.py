@@ -61,4 +61,6 @@ def test_single_gpu_launchers_preserve_global_batch_eight() -> None:
         text = (ROOT / "scripts" / filename).read_text(encoding="utf-8")
         assert "expected_world_size=1" in text
         assert "batch_per_rank=8" in text
-        assert "test_batch_per_rank=1" in text
+        assert "test_batch_per_rank=4" in text
+        assert "save_ckpt_interval_epoch=5" in text
+        assert "resume_insurance=True" in text
