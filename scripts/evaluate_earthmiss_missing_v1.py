@@ -45,6 +45,9 @@ ENDPOINTS = (
 TEST_SELECTION_CLASS_IDS = list(range(8))
 RELEASED_SEGMENTATION_HEAD = "conv_bn_relu"
 RAW_SEGMENTATION_HEAD = "raw_conv1x1"
+BN_BANK_ENTRIES = ("original", "sar", "full")
+BN_BANK_SCHEMA = "earthmiss_v2_decoder_bn_calibration_v1"
+BN_BANK_CHECKPOINT_ROLE = "primary_weights_requires_bn_bank"
 
 
 def parse_args():
@@ -67,6 +70,20 @@ def parse_args():
         "--allow-non-primary-test-checkpoint",
         action="store_true",
         help="Allow Test diagnostics from a checkpoint not tagged primary_deployment.",
+    )
+    parser.add_argument(
+        "--bn-bank",
+        help=(
+            "Optional V2 Decoder BN bank bundle (.pt); the selected entry's "
+            "running statistics replace the checkpoint buffers before "
+            "evaluation. Requires the matching fixed V2 checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--bn-bank-entry",
+        choices=BN_BANK_ENTRIES,
+        default="original",
+        help="Which named bank entry to apply (default: original).",
     )
     return parser.parse_args()
 
@@ -165,16 +182,19 @@ def _default_output_path(checkpoint_path, split):
 def _validate_checkpoint(checkpoint, args):
     role = checkpoint.get("checkpoint_role", "unregistered")
     selection_state = checkpoint.get("selection_state")
-    if (
-        args.split == "test"
-        and (role != "primary_deployment" or selection_state != "sar")
-        and not args.allow_non_primary_test_checkpoint
-    ):
-        raise ValueError(
-            "External Test comparison requires a primary_deployment checkpoint "
-            "selected on SAR Val mIoU (best_sar.pth); use "
-            "--allow-non-primary-test-checkpoint only for explicit diagnostics"
-        )
+    if args.split == "test" and not args.allow_non_primary_test_checkpoint:
+        if args.bn_bank:
+            if role != BN_BANK_CHECKPOINT_ROLE:
+                raise ValueError(
+                    "BN-bank Test evaluation requires the fixed V2 checkpoint "
+                    f"tagged {BN_BANK_CHECKPOINT_ROLE}; got {role!r}"
+                )
+        elif role != "primary_deployment" or selection_state != "sar":
+            raise ValueError(
+                "External Test comparison requires a primary_deployment checkpoint "
+                "selected on SAR Val mIoU (best_sar.pth); use "
+                "--allow-non-primary-test-checkpoint only for explicit diagnostics"
+            )
     protocol = checkpoint.get("protocol", {})
     evaluation = protocol.get("evaluation", {})
     if evaluation.get("checkpoint_selection_support") != "pooled_gt_present":
@@ -194,6 +214,57 @@ def _checkpoint_uses_raw_logits(checkpoint):
             f"Unknown checkpoint segmentation head: {segmentation_head!r}"
         )
     return segmentation_head == RAW_SEGMENTATION_HEAD
+
+
+def _apply_bn_bank(args, checkpoint_path, model):
+    """Replace Decoder BN buffers with one named V2 bank entry.
+
+    The bank bundle is tied to its source checkpoint by file SHA-256 and to the
+    learned weights by parameter SHA-256; both are verified before any buffer
+    is modified.
+    """
+    from scripts.evaluate_earthmiss_v2_bn_calibration import (  # noqa: E402
+        EXPECTED_DECODER_BN_COUNT,
+        bn_buffer_bank_sha256,
+        file_sha256,
+        load_decoder_bn_buffers,
+    )
+
+    bank_path = Path(args.bn_bank)
+    if not bank_path.is_file():
+        raise FileNotFoundError(f"BN bank not found: {bank_path}")
+    bundle = torch.load(bank_path, map_location="cpu")
+    if bundle.get("schema") != BN_BANK_SCHEMA:
+        raise ValueError(
+            f"Unexpected BN bank schema: {bundle.get('schema')!r}"
+        )
+    checkpoint_sha256 = file_sha256(checkpoint_path)
+    if bundle.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(
+            "BN bank was built from a different checkpoint file: "
+            f"bank={bundle.get('checkpoint_sha256')}, "
+            f"loaded={checkpoint_sha256}"
+        )
+    banks = bundle.get("banks", {})
+    if args.bn_bank_entry not in banks:
+        raise ValueError(
+            f"BN bank lacks entry {args.bn_bank_entry!r}: {sorted(banks)}"
+        )
+    entry_buffers = banks[args.bn_bank_entry]
+    load_decoder_bn_buffers(
+        model,
+        entry_buffers,
+        expected_parameter_sha256=bundle.get("learned_parameter_sha256"),
+        expected_count=EXPECTED_DECODER_BN_COUNT,
+    )
+    return {
+        "path": str(bank_path),
+        "sha256": file_sha256(bank_path),
+        "entry": args.bn_bank_entry,
+        "entry_sha256": bn_buffer_bank_sha256(entry_buffers),
+        "learned_parameter_sha256": bundle.get("learned_parameter_sha256"),
+        "source_checkpoint_sha256": checkpoint_sha256,
+    }
 
 
 def main():
@@ -232,6 +303,10 @@ def main():
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
 
+    bn_bank_record = None
+    if args.bn_bank:
+        bn_bank_record = _apply_bn_bank(args, checkpoint_path, model)
+
     output_path = (
         Path(args.output)
         if args.output
@@ -257,6 +332,7 @@ def main():
                 else RELEASED_SEGMENTATION_HEAD
             ),
         },
+        "bn_bank": bn_bank_record,
         "fair_comparison_contract": {
             "same_checkpoint_for_all_endpoints": True,
             "internal_selection": "Val pooled_gt_present mIoU",
