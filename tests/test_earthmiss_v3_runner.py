@@ -15,8 +15,11 @@ from scripts.train_earthmiss_missing_v3 import (
     BATCH_SIZE,
     CHECKPOINT_STEPS,
     MAX_STEPS,
+    CACHE_SIZE,
+    PrivilegedMaskAccumulator,
     assert_batchnorm_buffers_equal,
     load_base_into_residual,
+    privileged_masks,
     reliable_privileged_loss,
     snapshot_batchnorm_buffers,
     validate_args,
@@ -44,6 +47,7 @@ class EarthMissV3RunnerTest(unittest.TestCase):
         self.assertEqual(BATCH_SIZE, 8)
         self.assertEqual(MAX_STEPS, 15_000)
         self.assertEqual(CHECKPOINT_STEPS, (6_620, 13_240, 15_000))
+        self.assertEqual(CACHE_SIZE, 64)
 
     def test_residual_arm_arguments_require_frozen_inputs(self):
         with self.assertRaisesRegex(ValueError, "base-checkpoint"):
@@ -119,6 +123,35 @@ class EarthMissV3RunnerTest(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(student.grad[:, :, :, 0].abs().sum()), 0.0)
         self.assertEqual(float(student.grad[:, :, :, 1:].abs().sum()), 0.0)
+
+    def test_privileged_mask_audit_matches_loss_and_round_trips(self):
+        target = torch.tensor([[[0, 1, 2, 8]]])
+        base = torch.zeros(1, 3, 1, 4)
+        teacher = torch.zeros_like(base)
+        base[0, 1, 0, 0] = 2.0
+        teacher[0, 0, 0, 0] = 2.0  # correction for class 0
+        base[0, 1, 0, 1] = 2.0
+        teacher[0, 2, 0, 1] = 2.0  # harmful for class 1
+        base[0, 2, 0, 2] = 2.0
+        teacher[0, 2, 0, 2] = 2.0
+
+        masks = privileged_masks(base, teacher, target)
+        accumulator = PrivilegedMaskAccumulator(num_classes=3)
+        accumulator.update(target, masks)
+        summary = accumulator.summary()
+
+        self.assertEqual(summary["valid_pixels"], 3)
+        self.assertEqual(summary["base_error_pixels"], 1)
+        self.assertEqual(summary["teacher_correct_base_wrong_pixels"], 1)
+        self.assertEqual(summary["teacher_wrong_base_correct_pixels"], 1)
+        self.assertEqual(summary["q_cov"], 1.0)
+        self.assertEqual(
+            summary["by_class"][0]["teacher_correct_base_wrong_pixels"], 1
+        )
+
+        restored = PrivilegedMaskAccumulator(num_classes=3)
+        restored.load_state_dict(accumulator.state_dict())
+        self.assertEqual(restored.summary(), summary)
 
     def test_empty_privileged_mask_preserves_a_differentiable_zero(self):
         logits = torch.randn(1, 3, 2, 2, requires_grad=True)

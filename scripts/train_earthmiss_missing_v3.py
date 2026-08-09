@@ -53,7 +53,18 @@ POLY_POWER = 0.9
 PRIVILEGED_WEIGHT = 1.0
 PRIVILEGED_TEMPERATURE = 1.0
 TEST_CLASS_IDS = list(range(8))
-PROTOCOL_REVISION = "earthmiss_missing_v3_metars_released_v1"
+CLASS_NAMES = (
+    "Background",
+    "Building",
+    "Road",
+    "Water",
+    "Barren",
+    "Forest",
+    "Agricultural",
+    "Playground",
+)
+CACHE_SIZE = 64
+PROTOCOL_REVISION = "earthmiss_missing_v3_metars_released_v2"
 ZERO_TRAINING_GATE_SCHEMA = "earthmiss_missing_v3_zero_training_gates_v2"
 DEFAULT_OUTPUT_ROOT = (
     "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v3-metars-released"
@@ -68,6 +79,12 @@ def parse_args(argv=None):
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=CACHE_SIZE,
+        help="Per-worker, per-modality EarthMiss LRU capacity.",
+    )
     parser.add_argument(
         "--base-checkpoint",
         help="Test-selected V3 Run A checkpoint; required by residual arms.",
@@ -93,6 +110,8 @@ def parse_args(argv=None):
 def validate_args(args):
     if args.num_workers < 0:
         raise ValueError("--num-workers must be non-negative")
+    if getattr(args, "cache_size", CACHE_SIZE) < 0:
+        raise ValueError("--cache-size must be non-negative")
     if args.arm in RESIDUAL_ARMS and not args.base_checkpoint:
         raise ValueError(f"{args.arm} requires --base-checkpoint")
     if args.arm == "r-priv" and not args.teacher_checkpoint:
@@ -143,6 +162,7 @@ def build_loaders(args):
         "model_name": "DINOv3",
         "modality": "multi",
         "backbone_type": "dinov3_vits16",
+        "cache_size": args.cache_size,
     }
     train_dataset = build_dataset("EarthMiss", "train", **dataset_kwargs)
     test_dataset = build_dataset("EarthMiss", "test", **dataset_kwargs)
@@ -230,6 +250,128 @@ def assert_batchnorm_buffers_equal(expected, model):
                 raise RuntimeError(f"Frozen BatchNorm buffer changed: {name}.{field}")
 
 
+def privileged_masks(base_logits, teacher_logits, target):
+    """Return the fixed teacher/base masks used by R-Priv and its audit."""
+
+    num_classes = base_logits.shape[1]
+    if teacher_logits.shape != base_logits.shape:
+        raise ValueError("teacher and frozen-base logits must have equal shapes")
+    if target.shape != base_logits.shape[:1] + base_logits.shape[2:]:
+        raise ValueError("target shape does not match privileged logits")
+    valid = (target >= 0) & (target < num_classes)
+    teacher_prediction = teacher_logits.argmax(dim=1)
+    base_prediction = base_logits.argmax(dim=1)
+    base_correct = valid & (base_prediction == target)
+    teacher_correct = valid & (teacher_prediction == target)
+    return {
+        "valid": valid,
+        "base_error": valid & ~base_correct,
+        "correction": teacher_correct & ~base_correct,
+        "harmful": base_correct & ~teacher_correct,
+    }
+
+
+class PrivilegedMaskAccumulator:
+    """Cumulative, resume-safe R-Priv mask statistics with no extra forward."""
+
+    def __init__(self, num_classes=8):
+        self.num_classes = num_classes
+        self.batches = 0
+        self.valid_by_class = torch.zeros(num_classes, dtype=torch.int64)
+        self.base_error_by_class = torch.zeros(num_classes, dtype=torch.int64)
+        self.correction_by_class = torch.zeros(num_classes, dtype=torch.int64)
+        self.harmful_by_class = torch.zeros(num_classes, dtype=torch.int64)
+
+    @staticmethod
+    def _counts(target, mask, num_classes):
+        return torch.bincount(
+            target[mask].detach().to("cpu", torch.int64),
+            minlength=num_classes,
+        )
+
+    def update(self, target, masks):
+        required = {"valid", "base_error", "correction", "harmful"}
+        if set(masks) != required:
+            raise ValueError("privileged mask bundle is incomplete")
+        self.batches += 1
+        self.valid_by_class += self._counts(
+            target, masks["valid"], self.num_classes
+        )
+        self.base_error_by_class += self._counts(
+            target, masks["base_error"], self.num_classes
+        )
+        self.correction_by_class += self._counts(
+            target, masks["correction"], self.num_classes
+        )
+        self.harmful_by_class += self._counts(
+            target, masks["harmful"], self.num_classes
+        )
+
+    def state_dict(self):
+        return {
+            "num_classes": self.num_classes,
+            "batches": self.batches,
+            "valid_by_class": self.valid_by_class.clone(),
+            "base_error_by_class": self.base_error_by_class.clone(),
+            "correction_by_class": self.correction_by_class.clone(),
+            "harmful_by_class": self.harmful_by_class.clone(),
+        }
+
+    def load_state_dict(self, state):
+        if state.get("num_classes") != self.num_classes:
+            raise ValueError("privileged-mask class count changed on resume")
+        self.batches = int(state["batches"])
+        for field in (
+            "valid_by_class",
+            "base_error_by_class",
+            "correction_by_class",
+            "harmful_by_class",
+        ):
+            value = torch.as_tensor(state[field], dtype=torch.int64).cpu()
+            if value.shape != (self.num_classes,):
+                raise ValueError(f"invalid privileged-mask state: {field}")
+            setattr(self, field, value.clone())
+
+    @staticmethod
+    def _ratio(numerator, denominator):
+        return float(numerator / denominator) if denominator else None
+
+    def summary(self):
+        valid = int(self.valid_by_class.sum())
+        base_error = int(self.base_error_by_class.sum())
+        correction = int(self.correction_by_class.sum())
+        harmful = int(self.harmful_by_class.sum())
+        by_class = []
+        for class_id in range(self.num_classes):
+            class_valid = int(self.valid_by_class[class_id])
+            class_error = int(self.base_error_by_class[class_id])
+            class_correction = int(self.correction_by_class[class_id])
+            class_harmful = int(self.harmful_by_class[class_id])
+            by_class.append(
+                {
+                    "class_id": class_id,
+                    "class_name": CLASS_NAMES[class_id],
+                    "valid_pixels": class_valid,
+                    "base_error_pixels": class_error,
+                    "teacher_correct_base_wrong_pixels": class_correction,
+                    "teacher_wrong_base_correct_pixels": class_harmful,
+                    "q_abs": self._ratio(class_correction, class_valid),
+                    "q_cov": self._ratio(class_correction, class_error),
+                }
+            )
+        return {
+            "batches": self.batches,
+            "valid_pixels": valid,
+            "base_error_pixels": base_error,
+            "teacher_correct_base_wrong_pixels": correction,
+            "teacher_wrong_base_correct_pixels": harmful,
+            "teacher_minus_base_net_correct_pixels": correction - harmful,
+            "q_abs": self._ratio(correction, valid),
+            "q_cov": self._ratio(correction, base_error),
+            "by_class": by_class,
+        }
+
+
 def reliable_privileged_loss(
     student_logits,
     base_logits,
@@ -237,19 +379,18 @@ def reliable_privileged_loss(
     target,
     *,
     temperature=PRIVILEGED_TEMPERATURE,
+    correction_mask=None,
 ):
     """KL only where frozen Full is correct and frozen SAR is wrong."""
 
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-    valid = (target >= 0) & (target < student_logits.shape[1])
-    teacher_prediction = teacher_logits.argmax(dim=1)
-    base_prediction = base_logits.argmax(dim=1)
-    correction_mask = (
-        valid
-        & (teacher_prediction == target)
-        & (base_prediction != target)
-    )
+    if correction_mask is None:
+        correction_mask = privileged_masks(
+            base_logits, teacher_logits, target
+        )["correction"]
+    if correction_mask.shape != target.shape or correction_mask.dtype != torch.bool:
+        raise ValueError("correction_mask must be a boolean target-shaped tensor")
     if not correction_mask.any():
         return student_logits.sum() * 0.0, 0
     teacher_probability = F.softmax(
@@ -342,6 +483,8 @@ def build_metadata(
             "scheduler": "PolynomialLR",
             "scheduler_power": POLY_POWER,
             "optimizer_steps": MAX_STEPS,
+            "data_loader_workers": args.num_workers,
+            "per_worker_per_modality_cache_size": args.cache_size,
             "base_mode_for_residual_arms": "eval_frozen",
             "trainable_scope": (
                 "sar_logit_residual_only"
@@ -353,6 +496,11 @@ def build_metadata(
             ),
             "privileged_mask": (
                 "full_teacher_correct_and_frozen_sar_wrong"
+                if args.arm == "r-priv"
+                else None
+            ),
+            "privileged_mask_audit": (
+                "cumulative_total_and_per_class_saved_at_candidates_and_resume"
                 if args.arm == "r-priv"
                 else None
             ),
@@ -369,7 +517,15 @@ def build_metadata(
     }
 
 
-def save_snapshot(path, model, step, score, metrics, metadata):
+def save_snapshot(
+    path,
+    model,
+    step,
+    score,
+    metrics,
+    metadata,
+    privileged_mask_summary=None,
+):
     torch.save(
         {
             "model": model.state_dict(),
@@ -382,6 +538,7 @@ def save_snapshot(path, model, step, score, metrics, metadata):
             "selection_metric": "official_ever_mIoU",
             "selection_score": score,
             "test_metrics": metrics,
+            "privileged_mask_summary": privileged_mask_summary,
         },
         path,
     )
@@ -412,6 +569,7 @@ def save_resume(
     completed_passes,
     train_generator,
     metadata,
+    privileged_mask_state,
 ):
     torch.save(
         {
@@ -423,6 +581,7 @@ def save_resume(
             "train_generator_state": train_generator.get_state(),
             "rng_state": rng_state(),
             "protocol": metadata,
+            "privileged_mask_state": privileged_mask_state,
         },
         path,
     )
@@ -447,6 +606,7 @@ def main():
                     "test_tiles": len(test_dataset),
                     "steps_per_pass": len(train_loader),
                     "fixed_checkpoint_steps": CHECKPOINT_STEPS,
+                    "cache_size": args.cache_size,
                 },
                 indent=2,
             )
@@ -526,6 +686,9 @@ def main():
     completed_steps = 0
     completed_passes = 0
     best_score = float("-inf")
+    privileged_mask_accumulator = (
+        PrivilegedMaskAccumulator() if args.arm == "r-priv" else None
+    )
     if args.resume:
         resume = torch.load(resume_path, map_location=device, weights_only=False)
         if resume.get("protocol") != metadata:
@@ -537,6 +700,13 @@ def main():
         completed_passes = int(resume["completed_train_passes"])
         train_generator.set_state(resume["train_generator_state"])
         restore_rng_state(resume["rng_state"])
+        saved_mask_state = resume.get("privileged_mask_state")
+        if privileged_mask_accumulator is not None:
+            if not isinstance(saved_mask_state, dict):
+                raise ValueError("R-Priv resume lacks privileged-mask state")
+            privileged_mask_accumulator.load_state_dict(saved_mask_state)
+        elif saved_mask_state is not None:
+            raise ValueError("non-R-Priv resume contains privileged-mask state")
         if best_path.is_file():
             best_score = json.loads(best_path.read_text(encoding="utf-8"))["score"]
 
@@ -572,6 +742,7 @@ def main():
             segmentation_loss = criterion(logits, label)
             privileged_loss = logits.sum() * 0.0
             correction_pixels = 0
+            mask_bundle = None
             if args.arm == "r-priv":
                 with torch.no_grad():
                     teacher_logits = teacher(
@@ -581,11 +752,18 @@ def main():
                             "full", batch_size=batch_size, device=device
                         ),
                     )
+                mask_bundle = privileged_masks(
+                    base_logits,
+                    teacher_logits,
+                    label,
+                )
+                privileged_mask_accumulator.update(label, mask_bundle)
                 privileged_loss, correction_pixels = reliable_privileged_loss(
                     logits,
                     base_logits,
                     teacher_logits,
                     label,
+                    correction_mask=mask_bundle["correction"],
                 )
             loss = segmentation_loss + PRIVILEGED_WEIGHT * privileged_loss
             loss.backward()
@@ -606,6 +784,11 @@ def main():
                     score,
                     metrics,
                     metadata,
+                    (
+                        privileged_mask_accumulator.summary()
+                        if privileged_mask_accumulator is not None
+                        else None
+                    ),
                 )
                 record = {
                     "completed_optimizer_steps": completed_steps,
@@ -618,6 +801,11 @@ def main():
                         "privileged_loss": float(privileged_loss.detach()),
                         "correction_pixels": correction_pixels,
                     },
+                    "privileged_mask_summary": (
+                        privileged_mask_accumulator.summary()
+                        if privileged_mask_accumulator is not None
+                        else None
+                    ),
                 }
                 with metrics_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record) + "\n")
@@ -654,6 +842,11 @@ def main():
             completed_passes,
             train_generator,
             metadata,
+            (
+                privileged_mask_accumulator.state_dict()
+                if privileged_mask_accumulator is not None
+                else None
+            ),
         )
 
     print(best_path.read_text(encoding="utf-8"))
