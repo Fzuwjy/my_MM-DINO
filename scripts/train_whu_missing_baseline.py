@@ -91,6 +91,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--smoke-only",
+        action="store_true",
+        help="Run one real batch through SAR and Full forward/backward paths.",
+    )
+    parser.add_argument(
         "--audit-only",
         action="store_true",
         help="Audit data/splits/input bands without loading the model.",
@@ -336,8 +341,44 @@ def save_checkpoint(
     )
 
 
+def smoke_training_paths(model, loader, criterion, device):
+    model.train()
+    optical, sar, label = next(iter(loader))
+    optical = optical.to(device, non_blocking=True)
+    sar = sar.to(device, non_blocking=True)
+    label = prepare_training_label(label, device)
+    result = {
+        "optical_shape": list(optical.shape),
+        "sar_shape": list(sar.shape),
+        "label_shape": list(label.shape),
+        "label_dtype": str(label.dtype),
+        "paths": {},
+    }
+    for state in ("sar", "full"):
+        model.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats(device)
+        availability = canonical_availability(
+            state, batch_size=optical.shape[0], device=device
+        )
+        logits = model(optical, sar, availability=availability)
+        loss = criterion(logits, label)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite {state} smoke loss")
+        loss.backward()
+        torch.cuda.synchronize(device)
+        result["paths"][state] = {
+            "logits_shape": list(logits.shape),
+            "loss": float(loss.detach()),
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 1024**3,
+        }
+    print(json.dumps(result, indent=2))
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.audit_only and args.smoke_only:
+        raise ValueError("--audit-only and --smoke-only are mutually exclusive")
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.window_size <= 0 or args.window_size % 16:
@@ -370,12 +411,6 @@ def main(argv=None):
     weights_path = Path(args.backbone_weights)
     if not weights_path.is_file():
         raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
-    output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
-    last_path = output_dir / "last.pth"
-    metrics_path = output_dir / "metrics.jsonl"
-    if not args.resume and (last_path.exists() or metrics_path.exists()):
-        raise FileExistsError(f"Refusing to overwrite existing run: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda")
     model = build_model(
@@ -403,6 +438,16 @@ def main(argv=None):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-7
     )
+    if args.smoke_only:
+        smoke_training_paths(model, train_loader, criterion, device)
+        return
+
+    output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
+    last_path = output_dir / "last.pth"
+    metrics_path = output_dir / "metrics.jsonl"
+    if not args.resume and (last_path.exists() or metrics_path.exists()):
+        raise FileExistsError(f"Refusing to overwrite existing run: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     metadata = build_metadata(args, train_dataset, test_dataset, train_loader)
     start_epoch = 1
 
