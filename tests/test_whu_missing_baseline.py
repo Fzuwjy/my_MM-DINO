@@ -17,6 +17,7 @@ sys.path.insert(0, str(SEGMENTATION_ROOT))
 from datasets.WHU_dataset import WHU_Dataset  # noqa: E402
 from losses import DiceLoss, JointLoss, SoftCrossEntropyLoss  # noqa: E402
 from scripts.train_whu_missing_baseline import (  # noqa: E402
+    parse_args,
     prepare_training_label,
     train_state,
 )
@@ -81,6 +82,12 @@ def test_whu_missing_baseline_states_are_explicit():
     assert train_state("B", random_stub(0.1)) == "full"
     assert train_state("C", random_stub(0.49)) == "sar"
     assert train_state("C", random_stub(0.50)) == "full"
+
+
+def test_whu_smoke_flag_is_explicit():
+    args = parse_args(["--run", "A", "--smoke-only"])
+    assert args.smoke_only
+    assert not args.audit_only
 
 
 class random_stub:
