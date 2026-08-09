@@ -183,7 +183,7 @@ def _validate_checkpoint(checkpoint, args):
     role = checkpoint.get("checkpoint_role", "unregistered")
     selection_state = checkpoint.get("selection_state")
     if args.split == "test" and not args.allow_non_primary_test_checkpoint:
-        if args.bn_bank:
+        if getattr(args, "bn_bank", None):
             if role != BN_BANK_CHECKPOINT_ROLE:
                 raise ValueError(
                     "BN-bank Test evaluation requires the fixed V2 checkpoint "
