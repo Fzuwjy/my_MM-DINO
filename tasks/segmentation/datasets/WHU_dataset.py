@@ -26,6 +26,10 @@ palette = {
 
 invert_palette = {v: k for k, v in palette.items()}
 IGNORE_INDEX = 7
+OPTICAL_BAND_POLICIES = {
+    "rgb": (0, 1, 2),
+    "nir-r-g": (3, 0, 1),
+}
 
 
 class LRUCache:
@@ -65,6 +69,7 @@ class WHU_Dataset(torch.utils.data.Dataset):
         sar_dir=None,
         cache_size=100,
         mask_padding_ignore=False,
+        optical_bands="rgb",
     ):
         super(WHU_Dataset, self).__init__()
 
@@ -72,6 +77,9 @@ class WHU_Dataset(torch.utils.data.Dataset):
         self.window_size = window_size
         self.cache_size = cache_size
         self.mask_padding_ignore = bool(mask_padding_ignore)
+        self.optical_band_policy, self.optical_band_indices = (
+            self._resolve_optical_bands(optical_bands)
+        )
 
         # List of files
         self.rgb_files = []
@@ -105,6 +113,42 @@ class WHU_Dataset(torch.utils.data.Dataset):
             self.imagenet_mean = None
             self.imagenet_std = None
 
+    @staticmethod
+    def _resolve_optical_bands(optical_bands):
+        if isinstance(optical_bands, str):
+            try:
+                indices = OPTICAL_BAND_POLICIES[optical_bands]
+            except KeyError as error:
+                choices = ", ".join(sorted(OPTICAL_BAND_POLICIES))
+                raise ValueError(
+                    f"Unknown WHU optical band policy {optical_bands!r}; "
+                    f"choose from {choices}"
+                ) from error
+            return optical_bands, indices
+
+        indices = tuple(int(index) for index in optical_bands)
+        if len(indices) != 3 or len(set(indices)) != 3 or min(indices) < 0:
+            raise ValueError(
+                "WHU optical band indices must contain three distinct "
+                "non-negative values"
+            )
+        return "custom", indices
+
+    def _read_optical(self, path):
+        data = imread(path)
+        if data.ndim != 3:
+            raise ValueError(
+                f"WHU optical image must be HxWxC, got {data.shape} for {path}"
+            )
+        required_channels = max(self.optical_band_indices) + 1
+        if data.shape[2] < required_channels:
+            raise ValueError(
+                f"WHU optical policy {self.optical_band_policy!r} requires "
+                f"at least {required_channels} bands, got {data.shape[2]} "
+                f"for {path}"
+            )
+        return data[:, :, self.optical_band_indices]
+
     def __len__(self):
         interval_num = (256**2 / self.window_size[0]**2) * 160  # 256尺寸时为*16
         data_len = len(self.rgb_files
@@ -121,9 +165,7 @@ class WHU_Dataset(torch.utils.data.Dataset):
             if cached_data is not None:
                 data = cached_data
             else:
-                data = imread(self.rgb_files[random_idx])
-                if len(data.shape) == 3 and data.shape[2] >= 3:
-                    data = data[:, :, :3]
+                data = self._read_optical(self.rgb_files[random_idx])
                 self.rgb_cache.put(random_idx, data)
 
             cached_label = self.label_cache.get(random_idx)
@@ -178,9 +220,7 @@ class WHU_Dataset(torch.utils.data.Dataset):
             # data = grayscale(data, p=0.2)
             # data = blur(data, p=0.5)
         else:
-            data = imread(self.rgb_files[idx])
-            if len(data.shape) == 3 and data.shape[2] >= 3:
-                data = data[:, :, :3]
+            data = self._read_optical(self.rgb_files[idx])
 
             label = imread(self.label_files[idx]).astype(np.int32)
             label = label / 10 - 1
