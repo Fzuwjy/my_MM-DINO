@@ -121,24 +121,22 @@ def build_dataset(dataset_name, data_type="test", **kwargs):
                                      "window_size", (224, 224)),
                                  normalize_type=normalize_type)
     elif dataset_name == "WHU":
-        root_dir = f"{MS_ROOT_DIR}/SS-datasets/whu-opt-sar/"
+        root_dir = kwargs.get(
+            "dataset_root", f"{MS_ROOT_DIR}/SS-datasets/whu-opt-sar/"
+        )
 
-        if data_type == "train":
-            train_txt_path = f"{root_dir}/train_list.txt"
-            with open(train_txt_path, 'r') as f:
-                filenames = [
-                    line.strip() for line in f.readlines() if line.strip()
-                ]
-        else:
-            test_txt_path = f"{root_dir}/test_list.txt"
-            with open(test_txt_path, 'r') as f:
-                filenames = [
-                    line.strip() for line in f.readlines() if line.strip()
-                ]
+        split_file = kwargs.get("split_file")
+        if split_file is None:
+            split_name = (
+                "train_list.txt" if data_type == "train" else "test_list.txt"
+            )
+            split_file = os.path.join(root_dir, split_name)
+        with open(split_file, 'r') as f:
+            filenames = [line.strip() for line in f.readlines() if line.strip()]
 
-        data_dir = root_dir + "optical/{}"
-        label_dir = root_dir + "lbl/{}"
-        sar_dir = root_dir + "sar/{}" if kwargs.get(
+        data_dir = os.path.join(root_dir, "optical", "{}")
+        label_dir = os.path.join(root_dir, "lbl", "{}")
+        sar_dir = os.path.join(root_dir, "sar", "{}") if kwargs.get(
             "modality") == "multi" else None
         return WHU_Dataset(filenames=filenames,
                            rgb_dir=data_dir,
@@ -147,5 +145,7 @@ def build_dataset(dataset_name, data_type="test", **kwargs):
                            data_type=data_type,
                            window_size=kwargs.get("window_size", (224, 224)),
                            normalize_type=normalize_type,
+                           cache_size=kwargs.get("cache_size", 100),
                            mask_padding_ignore=kwargs.get(
-                               "mask_padding_ignore", False))
+                               "mask_padding_ignore", False),
+                           optical_bands=kwargs.get("optical_bands", "rgb"))
