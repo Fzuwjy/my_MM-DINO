@@ -1,9 +1,9 @@
-"""Run the two zero-training gates before any EarthMiss V3 training.
+"""Run the two deployment-facing gates before EarthMiss V3 training.
 
-The diagnostic reads the preserved A/B/C checkpoints with their raw online BN
-buffers.  One deterministic full-tile pass over Train and Test measures paired
-Full-teacher corrections and accumulates sufficient statistics for a fixed
-single-class logit-bias sweep.  It never updates model state or writes logits.
+The diagnostic reads preserved A/B/C checkpoints with raw online BN buffers.
+One complete Test pass measures the internal and expert Full-teacher error
+complementarity and reuses C-SAR logits for a fixed single-class bias upper
+bound.  It never updates model state or writes logits.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from scripts.train_earthmiss_missing_v1 import (  # noqa: E402
 from scripts.train_earthmiss_missing_v3 import file_sha256  # noqa: E402
 
 
-SCHEMA = "earthmiss_missing_v3_zero_training_gates_v1"
+SCHEMA = "earthmiss_missing_v3_zero_training_gates_v2"
 CLASS_NAMES = (
     "Background",
     "Building",
@@ -431,6 +431,57 @@ def summarize_bias_sweep(train_accumulator, test_accumulator):
     }
 
 
+def summarize_test_bias_upper_bound(test_accumulator):
+    test_accumulator.assert_zero_matches_baseline()
+    grid = test_accumulator.bias_grid
+    baseline = fixed_eight_class_metrics(test_accumulator.baseline.confusion)
+    rows = []
+    for class_id, class_name in enumerate(CLASS_NAMES):
+        metrics = [
+            fixed_eight_class_metrics(
+                test_accumulator.confusion_for(class_id, index)
+            )
+            for index in range(len(grid))
+        ]
+        best_index = _best_index(
+            [item["mIoU_percent"] for item in metrics], grid
+        )
+        rows.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "test_oracle_bias": grid[best_index],
+                "test_at_test_oracle": metrics[best_index],
+                "test_oracle_gain_pp": (
+                    metrics[best_index]["mIoU_percent"]
+                    - baseline["mIoU_percent"]
+                ),
+                "test_oracle_boundary_hit": best_index in {0, len(grid) - 1},
+            }
+        )
+    best = max(
+        rows,
+        key=lambda row: (
+            row["test_at_test_oracle"]["mIoU_percent"],
+            -abs(row["test_oracle_bias"]),
+            -row["class_id"],
+        ),
+    )
+    return {
+        "scope": "one_class_bias_at_a_time_on_complete_test",
+        "selection_objective": "fixed_8_class_pooled_mIoU",
+        "bias_grid": list(grid),
+        "baseline_test": baseline,
+        "per_class": rows,
+        "best_test_oracle_single_class": best,
+        "interpretation": (
+            "test-developed calibration upper bound; it decides whether the "
+            "observed C-SAR trade-off is explainable by scalar calibration"
+        ),
+        "independent_test_claim_allowed": False,
+    }
+
+
 def build_loader(args, split):
     dataset = build_dataset(
         "EarthMiss",
@@ -524,6 +575,8 @@ def endpoint_logits(model, rgb, sar, endpoint, batch_size, device):
 
 @torch.inference_mode()
 def diagnose_split(args, split, models, device):
+    if split != "test":
+        raise ValueError("the formal V3 gate is defined on complete Test only")
     dataset, loader = build_loader(args, split)
     cities = tuple(EARTHMISS_CITIES[split])
     internal = TeacherPairAccumulator(cities)
@@ -593,9 +646,6 @@ def main():
             path, run, weights_path, device
         )
 
-    train_report, train_bias = diagnose_split(
-        args, "train", models, device
-    )
     test_report, test_bias = diagnose_split(args, "test", models, device)
     formal = args.smoke_tiles == 0
     report = {
@@ -604,25 +654,35 @@ def main():
         "training_was_performed": False,
         "protocol": {
             "model_state": "checkpoint_raw_online_bn_eval_frozen",
-            "train_transform": "deterministic_full_tile_no_crop_no_augmentation",
             "test_transform": "deterministic_full_tile",
             "inference": "fp32_sliding_512_stride341",
             "teacher_pairs": [
                 "C-Full_to_C-SAR_internal",
                 "B-Full_to_A-SAR_expert_upper_bound",
             ],
-            "bias_scan": "C-SAR_single_class_fixed_grid_-4_to_4_step_0.1",
+            "bias_scan": (
+                "complete_Test_C-SAR_single_class_fixed_grid_-4_to_4_step_0.1"
+            ),
             "test_usage": "test_developed_diagnostic_not_independent_test",
+            "decision_questions": [
+                "does_C_Full_correct_C_SAR_across_test_cities_and_classes",
+                "does_B_Full_correct_A_SAR_across_test_cities_and_classes",
+                "can_single_class_bias_explain_the_C_SAR_tradeoff",
+            ],
+            "train_census_omitted_reason": (
+                "training-set correction prevalence does not establish "
+                "learnability and does not decide among the three routes"
+            ),
         },
         "checkpoints": checkpoints,
-        "splits": {"train": train_report, "test": test_report},
-        "calibration": summarize_bias_sweep(train_bias, test_bias),
+        "splits": {"test": test_report},
+        "calibration": summarize_test_bias_upper_bound(test_bias),
         "training_gate": {
             "decision": "pending_manual_review" if formal else "smoke_only",
             "rule": (
-                "train only if teacher corrections are cross-city/cross-class "
-                "and the fixed single-class bias diagnostic does not explain "
-                "most of the deployable gap"
+                "train only if the exact planned expert teacher corrects "
+                "deployed A-SAR across Test cities/classes and scalar bias "
+                "does not explain the C-SAR failure mode"
             ),
         },
     }
@@ -630,7 +690,7 @@ def main():
     print(json.dumps({
         "output": str(output_path),
         "formal": formal,
-        "internal_train_q_cov": train_report[
+        "internal_test_q_cov": test_report[
             "internal_c_full_to_c_sar"
         ]["pooled"]["q_cov"],
         "internal_test_oracle_gain_pp": test_report[
@@ -639,9 +699,6 @@ def main():
         "expert_test_oracle_gain_pp": test_report[
             "expert_b_full_to_a_sar"
         ]["pooled"]["oracle_gain_over_student_pp"],
-        "bias_train_to_test_gain_pp": report["calibration"][
-            "best_train_fitted_single_class"
-        ]["test_gain_at_train_fitted_pp"],
         "bias_test_oracle_gain_pp": report["calibration"][
             "best_test_oracle_single_class"
         ]["test_oracle_gain_pp"],

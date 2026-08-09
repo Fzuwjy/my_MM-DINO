@@ -13,6 +13,7 @@ from scripts.diagnose_earthmiss_missing_v3 import (
     TeacherPairScope,
     fixed_eight_class_metrics,
     summarize_bias_sweep,
+    summarize_test_bias_upper_bound,
     validate_args,
 )
 from tasks.segmentation.utils.earthmiss_metrics import EarthMissMetrics
@@ -113,6 +114,14 @@ class EarthMissV3ZeroTrainingTest(unittest.TestCase):
         self.assertEqual(len(report["per_class"]), NUM_CLASSES)
         self.assertIn("best_train_fitted_single_class", report)
         self.assertIn("best_test_oracle_single_class", report)
+
+        test_only = summarize_test_bias_upper_bound(test)
+        self.assertEqual(
+            test_only["scope"],
+            "one_class_bias_at_a_time_on_complete_test",
+        )
+        self.assertFalse(test_only["independent_test_claim_allowed"])
+        self.assertNotIn("best_train_fitted_single_class", test_only)
 
     def test_fixed_metric_always_averages_all_eight_classes(self):
         confusion = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.int64)

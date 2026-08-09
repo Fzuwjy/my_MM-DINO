@@ -85,10 +85,10 @@ class EarthMissV3RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "diagnostic.json"
             report = {
-                "schema": "earthmiss_missing_v3_zero_training_gates_v1",
+                "schema": "earthmiss_missing_v3_zero_training_gates_v2",
                 "formal": True,
                 "training_was_performed": False,
-                "splits": {"train": {}, "test": {}},
+                "splits": {"test": {}},
             }
             path.write_text(json.dumps(report), encoding="utf-8")
             record = validate_zero_training_gate_report(path)

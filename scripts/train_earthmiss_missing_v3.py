@@ -54,7 +54,7 @@ PRIVILEGED_WEIGHT = 1.0
 PRIVILEGED_TEMPERATURE = 1.0
 TEST_CLASS_IDS = list(range(8))
 PROTOCOL_REVISION = "earthmiss_missing_v3_metars_released_v1"
-ZERO_TRAINING_GATE_SCHEMA = "earthmiss_missing_v3_zero_training_gates_v1"
+ZERO_TRAINING_GATE_SCHEMA = "earthmiss_missing_v3_zero_training_gates_v2"
 DEFAULT_OUTPUT_ROOT = (
     "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v3-metars-released"
 )
@@ -117,9 +117,9 @@ def validate_zero_training_gate_report(path):
         raise ValueError("a smoke diagnostic cannot unlock V3 training")
     if report.get("training_was_performed") is not False:
         raise ValueError("gate report is not a zero-training diagnostic")
-    expected_splits = {"train", "test"}
+    expected_splits = {"test"}
     if set(report.get("splits", {})) != expected_splits:
-        raise ValueError("gate report must contain complete Train and Test results")
+        raise ValueError("gate report must contain the complete Test diagnosis")
     return {
         "path": str(path),
         "sha256": file_sha256(path),
