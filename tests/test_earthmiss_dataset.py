@@ -222,6 +222,50 @@ class EarthMissDatasetTest(unittest.TestCase):
             self.assertEqual(tuple(label.shape), (3, 3))
             self.assertTrue(set(label.unique().tolist()).issubset(set(range(9))))
 
+    def test_train_manifest_can_use_deterministic_full_tile_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_tile(root, "City", "tile", 127, 63)
+            template = str(root / "{}")
+            dataset = EarthMiss_Dataset(
+                citys=["City"],
+                rgb_dir=template + "/images/RGB",
+                sar_dir=template + "/images/SAR",
+                label_dir=template + "/masks",
+                data_type="train",
+                window_size=(3, 3),
+                normalize_type=None,
+                cache_size=2,
+                apply_train_transform=False,
+            )
+
+            first = dataset[0]
+            second = dataset[0]
+
+            self.assertEqual(tuple(first[0].shape), (3, 4, 5))
+            self.assertEqual(tuple(first[1].shape), (1, 4, 5))
+            self.assertEqual(tuple(first[2].shape), (4, 5))
+            for left, right in zip(first, second, strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+    def test_non_train_split_rejects_train_augmentation_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_tile(root, "City", "tile", 127, 63)
+            template = str(root / "{}")
+            with self.assertRaisesRegex(ValueError, "only be enabled"):
+                EarthMiss_Dataset(
+                    citys=["City"],
+                    rgb_dir=template + "/images/RGB",
+                    sar_dir=template + "/images/SAR",
+                    label_dir=template + "/masks",
+                    data_type="val",
+                    window_size=(4, 5),
+                    normalize_type=None,
+                    cache_size=2,
+                    apply_train_transform=True,
+                )
+
     def test_formal_geometric_transforms_are_independent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

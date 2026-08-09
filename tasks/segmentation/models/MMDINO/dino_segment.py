@@ -57,14 +57,22 @@ class DINOSegmentModule(nn.Module):
         use_optical_stem: bool = False,
         optical_stem_seed: int = 0,
         raw_logits: bool = False,
+        use_sar_logit_residual: bool = False,
+        sar_logit_residual_seed: int = 0,
+        sar_logit_residual_channels: int = 64,
     ):
         super().__init__()
 
         self.num_modalities = num_modalities
         self.use_optical_stem = bool(use_optical_stem)
+        self.use_sar_logit_residual = bool(use_sar_logit_residual)
         if self.use_optical_stem and decoder_type != 'Decoder':
             raise ValueError(
                 "the optical spatial stem is only implemented for Decoder"
+            )
+        if self.use_sar_logit_residual and decoder_type != 'Decoder':
+            raise ValueError(
+                "the SAR logit residual is only implemented for Decoder"
             )
 
         dinov3_vits_dict = {
@@ -115,6 +123,15 @@ class DINOSegmentModule(nn.Module):
         elif decoder_type == 'Decoder':
             decoder_kwargs["use_optical_stem"] = self.use_optical_stem
             decoder_kwargs["optical_stem_seed"] = optical_stem_seed
+            decoder_kwargs["use_sar_logit_residual"] = (
+                self.use_sar_logit_residual
+            )
+            decoder_kwargs["sar_logit_residual_seed"] = (
+                sar_logit_residual_seed
+            )
+            decoder_kwargs["sar_logit_residual_channels"] = (
+                sar_logit_residual_channels
+            )
             self.decoder = Decoder(**decoder_kwargs)
         elif decoder_type == 'Decoder_FRM':
             self.decoder = Decoder_FRM(**decoder_kwargs)
@@ -230,6 +247,7 @@ class DINOSegmentModule(nn.Module):
         *,
         active_indices,
         canonical_slots,
+        return_base_logits=False,
     ):
         if len(outputs_modalities) != len(active_indices):
             raise ValueError("Active modalities and backbone outputs do not match")
@@ -275,16 +293,69 @@ class DINOSegmentModule(nn.Module):
                 *processed_outputs_modalities,
                 guidance=modalities[0],
             )
+        elif getattr(self, "use_sar_logit_residual", False):
+            residual_kwargs = {
+                "apply_sar_logit_residual": (
+                    canonical_slots and tuple(active_indices) == (1,)
+                )
+            }
+            if return_base_logits:
+                residual_kwargs["return_base_logits"] = True
+            logits = self.decoder(
+                *processed_outputs_modalities,
+                **residual_kwargs,
+            )
         else:
+            if return_base_logits:
+                raise RuntimeError(
+                    "base-logit export requires the SAR logit residual model"
+                )
             logits = self.decoder(*processed_outputs_modalities)
 
-        if logits.shape[-2:] != (height, width):
-            logits = F.interpolate(
-                logits,
-                size=(height, width),
-                mode="bilinear",
-            )
+        def resize(output):
+            if output.shape[-2:] != (height, width):
+                output = F.interpolate(
+                    output,
+                    size=(height, width),
+                    mode="bilinear",
+                )
+            return output
+
+        if return_base_logits:
+            base_logits, residual_logits = logits
+            return resize(base_logits), resize(residual_logits)
+        logits = resize(logits)
         return logits
+
+    def freeze_base_for_sar_logit_residual(self):
+        """Freeze the complete base model and expose only the V3 branch."""
+
+        residual = getattr(self.decoder, "sar_logit_residual", None)
+        if not self.use_sar_logit_residual or residual is None:
+            raise RuntimeError("SAR logit residual was not constructed")
+        self.requires_grad_(False)
+        residual.requires_grad_(True)
+        self.eval()
+        residual.train()
+        return tuple(residual.parameters())
+
+    def forward_sar_residual_components(self, rgb, sar):
+        """Return frozen SAR base logits and residual-corrected logits."""
+
+        if not self.use_sar_logit_residual:
+            raise RuntimeError("SAR logit residual was not constructed")
+        self._validate_modality_batch((rgb, sar), require_same_spatial=True)
+        if any(parameter.requires_grad for parameter in self.backbone.parameters()):
+            raise RuntimeError("V3 requires a fully frozen backbone")
+        with torch.no_grad():
+            sar_outputs = self._extract_backbone_output(sar)
+        return self._decode_active_backbone_outputs(
+            (rgb, sar),
+            (sar_outputs,),
+            active_indices=(1,),
+            canonical_slots=True,
+            return_base_logits=True,
+        )
 
     def forward_from_backbone_outputs(
         self,
@@ -418,6 +489,13 @@ class DINOSegmentModule(nn.Module):
             if self.use_optical_stem:
                 logits = self.decoder(*processed_outputs_modalities,
                                       guidance=modalities[0])
+            elif getattr(self, "use_sar_logit_residual", False):
+                logits = self.decoder(
+                    *processed_outputs_modalities,
+                    apply_sar_logit_residual=(
+                        canonical_slots and tuple(active_indices) == (1,)
+                    ),
+                )
             else:
                 logits = self.decoder(*processed_outputs_modalities)
 

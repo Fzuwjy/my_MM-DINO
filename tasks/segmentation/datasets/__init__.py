@@ -114,6 +114,9 @@ def build_dataset(dataset_name, data_type="test", **kwargs):
                                  sar_dir=sar_dir,
                                  label_dir=label_dir,
                                  data_type=data_type,
+                                 apply_train_transform=kwargs.get(
+                                     "apply_train_transform"),
+                                 cache_size=kwargs.get("cache_size", 500),
                                  window_size=kwargs.get(
                                      "window_size", (224, 224)),
                                  normalize_type=normalize_type)

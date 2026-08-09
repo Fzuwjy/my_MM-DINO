@@ -389,6 +389,43 @@ class OpticalSpatialStem(nn.Module):
         return self.projection(self.features(optical))
 
 
+class SARLogitResidualHead(nn.Module):
+    """BN-free residual logits from the frozen post-neck SAR feature."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_classes: int,
+        hidden_channels: int = 64,
+        num_groups: int = 8,
+    ):
+        super().__init__()
+        if hidden_channels <= 0:
+            raise ValueError("hidden_channels must be positive")
+        if hidden_channels % num_groups != 0:
+            raise ValueError("hidden_channels must be divisible by num_groups")
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups, hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups, hidden_channels),
+            nn.GELU(),
+        )
+        self.projection = nn.Conv2d(hidden_channels, n_classes, kernel_size=1)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.features(feature))
+
+
 class Decoder(nn.Module):
 
     def __init__(
@@ -400,6 +437,9 @@ class Decoder(nn.Module):
         use_optical_stem: bool = False,
         optical_stem_seed: int = 0,
         raw_logits: bool = False,
+        use_sar_logit_residual: bool = False,
+        sar_logit_residual_seed: int = 0,
+        sar_logit_residual_channels: int = 64,
     ):
         super().__init__()
 
@@ -429,6 +469,20 @@ class Decoder(nn.Module):
             out_channels, n_classes, raw_logits=raw_logits
         )
 
+        self.sar_logit_residual = None
+        if use_sar_logit_residual:
+            if not raw_logits:
+                raise ValueError("the SAR logit residual requires raw logits")
+            # Keep every released/base parameter and the caller RNG stream
+            # identical when the opt-in V3 branch is constructed.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(sar_logit_residual_seed)
+                self.sar_logit_residual = SARLogitResidualHead(
+                    out_channels,
+                    n_classes,
+                    hidden_channels=sar_logit_residual_channels,
+                )
+
         self.optical_stem = None
         if use_optical_stem:
             if num_modalities <= 1:
@@ -442,7 +496,13 @@ class Decoder(nn.Module):
                 torch.manual_seed(optical_stem_seed)
                 self.optical_stem = OpticalSpatialStem(out_channels)
 
-    def forward(self, *modalities, guidance=None):
+    def forward(
+        self,
+        *modalities,
+        guidance=None,
+        apply_sar_logit_residual: bool = False,
+        return_base_logits: bool = False,
+    ):
         if len(modalities) == 1:
             # 单模态情况：仅使用第一个模态
             x = modalities[0]
@@ -486,7 +546,15 @@ class Decoder(nn.Module):
                 f"Invalid number of modalities: {len(modalities)}, expected {self.num_modalities}"
             )
 
-        return self.out_conv(p2)
+        base_logits = self.out_conv(p2)
+        logits = base_logits
+        if apply_sar_logit_residual:
+            if self.sar_logit_residual is None:
+                raise RuntimeError("SAR logit residual was not constructed")
+            logits = logits + self.sar_logit_residual(p2)
+        if return_base_logits:
+            return base_logits, logits
+        return logits
 
 
 class Decoder_FRM(nn.Module):

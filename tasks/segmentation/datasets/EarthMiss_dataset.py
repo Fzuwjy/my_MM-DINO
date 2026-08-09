@@ -144,16 +144,26 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
         normalize_type=None,
         sar_dir=None,
         cache_size=500,
+        apply_train_transform=None,
     ):
         super().__init__()
         if data_type not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported EarthMiss split: {data_type!r}")
 
         self.data_type = data_type
+        self.apply_train_transform = (
+            data_type == "train"
+            if apply_train_transform is None
+            else bool(apply_train_transform)
+        )
+        if data_type != "train" and self.apply_train_transform:
+            raise ValueError(
+                "train transforms can only be enabled for the EarthMiss train split"
+            )
         self.window_size = tuple(window_size)
         if len(self.window_size) != 2 or any(size <= 0 for size in self.window_size):
             raise ValueError("EarthMiss window_size must contain two positive values")
-        if data_type == "train" and self.window_size[0] != self.window_size[1]:
+        if self.apply_train_transform and self.window_size[0] != self.window_size[1]:
             raise ValueError(
                 "EarthMiss training crop must be square because RandomRotate90 "
                 "can exchange height and width"
@@ -298,7 +308,7 @@ class EarthMiss_Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         rgb, sar, label = self._load_sample(idx)
-        if self.data_type == "train":
+        if self.apply_train_transform:
             rgb, sar, label = self._train_transform(rgb, sar, label)
 
         # Make the input scale explicit before normalization.
