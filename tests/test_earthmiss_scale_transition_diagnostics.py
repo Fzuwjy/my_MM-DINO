@@ -42,6 +42,7 @@ from scripts.earthmiss_scale_transition_common import (  # noqa: E402
     bootstrap_city_cluster_mean_ci,
     bootstrap_mean_ci,
     centered_linear_cka,
+    compact_by_tile_stage_summaries,
     downsample_semantic_regions,
     feature_pair_batch_statistics,
     native_semantic_region_area_weights,
@@ -432,13 +433,13 @@ class AggregationAndOutputTest(unittest.TestCase):
             resamples=100,
             seed=7,
         )
-        identity = amplification["adapter_identity_P4_control"]
+        identity = amplification["edges"]["adapter_identity_P4_control"]
         self.assertGreater(
             identity["metrics"]["valid_relative_rms_delta"]["mean"], 0
         )
         self.assertEqual(identity["analysis_role"], "negative_control")
         self.assertEqual(
-            amplification["prn_nearest_P5_to_P4"]["analysis_role"],
+            amplification["edges"]["prn_nearest_P5_to_P4"]["analysis_role"],
             "descriptive_control",
         )
         self.assertNotIn(
@@ -448,6 +449,27 @@ class AggregationAndOutputTest(unittest.TestCase):
         self.assertEqual(
             amplification["inference_policy"]["fam_primary_test"],
             "cross_scale_alignment.prn.cross_scale.P5_to_P4",
+        )
+        compact = compact_by_tile_stage_summaries(
+            first["by_tile"], left_label="full", right_label="sar"
+        )
+        stage_summary = compact["A/0"]["adapter.pre_resize.P4"]
+        self.assertEqual(
+            set(stage_summary),
+            {"channels", "spatial_shapes", "observations", "regions", "frequency"},
+        )
+        self.assertEqual(
+            set(stage_summary["regions"]["boundary"]),
+            {
+                "native_pixel_weight",
+                "cosine_distance",
+                "relative_rms_to_left",
+                "mean_per_window_subsampled_linear_cka",
+            },
+        )
+        self.assertNotIn(
+            "representation_grid_energy",
+            stage_summary["frequency"]["full"],
         )
         self.assertNotIn("NaN", strict_json_text({"summary": first}))
 
@@ -494,12 +516,12 @@ class AggregationAndOutputTest(unittest.TestCase):
             full["by_tile"], sar["by_tile"], resamples=50, seed=7
         )
         self.assertEqual(first, second)
-        self.assertEqual(first[stage]["analysis_role"], "primary")
+        self.assertEqual(first["stages"][stage]["analysis_role"], "primary")
         self.assertEqual(
-            first[stage]["pair_within_each_endpoint"],
+            first["stages"][stage]["pair_within_each_endpoint"],
             {"left": "resized_coarse", "right": "same_grid_lateral"},
         )
-        metrics = first[stage]["metrics"]
+        metrics = first["stages"][stage]["metrics"]
         self.assertGreater(
             metrics["valid_cosine_distance_sar_minus_full"]["mean"], 0
         )

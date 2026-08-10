@@ -41,6 +41,7 @@ from scripts.earthmiss_scale_transition_common import (  # noqa: E402
     NUM_CLASSES,
     STAGE_ORDER,
     ScaleTransitionAccumulator,
+    compact_by_tile_stage_summaries,
     feature_pair_batch_statistics,
     segmentation_region_statistics,
     summarize_amplification,
@@ -950,6 +951,18 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         resamples=args.bootstrap_resamples,
         seed=args.bootstrap_seed,
     )
+    for summary in (
+        feature_summary,
+        backbone_summary,
+        *cross_scale_summaries.values(),
+    ):
+        pair_labels = summary["pair_labels"]
+        summary["by_tile"] = compact_by_tile_stage_summaries(
+            summary["by_tile"],
+            left_label=pair_labels["left"],
+            right_label=pair_labels["right"],
+        )
+        summary["by_tile_format"] = "compact_scalar_evidence_v1"
     complete = processed_limit == expected_tiles and args.smoke_tiles == 0
     endpoint_metrics_summary = _metrics_summary(endpoint_metrics, city_metrics)
     if complete:
@@ -1011,6 +1024,10 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
                 "degradation estimand is SAR alignment minus Full alignment"
             ),
             "internal_feature_weighting": "crop_window_weighted_with_overlap",
+            "by_tile_feature_storage": (
+                "compact scalar evidence only; pooled/city scopes retain full "
+                "aggregate summaries; no activation or prototype vectors stored"
+            ),
             "whole_tile_logits": "released overlap-average reconstruction",
             "window_size": args.window_size,
             "stride": args.stride,

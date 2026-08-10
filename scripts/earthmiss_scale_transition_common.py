@@ -1217,9 +1217,6 @@ def summarize_amplification(
             "all_other_edges": "exploratory",
         },
         "edges": result,
-        # Direct aliases keep existing report readers usable while the schema
-        # migrates to the explicit ``edges`` namespace.
-        **result,
     }
 
 
@@ -1308,8 +1305,73 @@ def summarize_cross_scale_alignment_degradation(
             "cka_delta_direction": "negative means worse SAR alignment",
         },
         "stages": stage_results,
-        **stage_results,
     }
+
+
+def compact_by_tile_stage_summaries(
+    by_tile: Mapping[str, Mapping[str, Any]],
+    *,
+    left_label: str,
+    right_label: str,
+) -> dict[str, Any]:
+    """Retain bounded, re-analysable scalar evidence for every tile/stage.
+
+    Full stage summaries contain pooled energy tensors, channel manifests, and
+    several audit counters that are useful at pooled/city scope but needlessly
+    repeat for every tile.  This projection keeps the region gaps used by the
+    bootstrap/correlation analyses plus the two endpoint Haar fractions.  It
+    contains no raw activation, prototype vector, or logit.
+    """
+
+    if not left_label or not right_label or left_label == right_label:
+        raise ValueError("compact pair labels must be distinct non-empty strings")
+    region_fields = (
+        "native_pixel_weight",
+        "cosine_distance",
+        "relative_rms_to_left",
+        "mean_per_window_subsampled_linear_cka",
+    )
+    result: dict[str, Any] = {}
+    for tile_key, stages in sorted(by_tile.items()):
+        compact_stages = {}
+        for stage, summary in stages.items():
+            regions = summary.get("regions")
+            frequency = summary.get("frequency")
+            if not isinstance(regions, Mapping) or not isinstance(
+                frequency, Mapping
+            ):
+                raise ValueError(f"malformed tile stage summary: {tile_key}/{stage}")
+            compact_regions = {}
+            for region in PAIR_REGIONS:
+                values = regions.get(region)
+                if not isinstance(values, Mapping):
+                    raise ValueError(
+                        f"missing {region} region summary: {tile_key}/{stage}"
+                    )
+                compact_regions[region] = {
+                    field: values.get(field) for field in region_fields
+                }
+            compact_frequency = {}
+            for label in (left_label, right_label):
+                values = frequency.get(label)
+                if not isinstance(values, Mapping):
+                    raise ValueError(
+                        f"missing {label} frequency summary: {tile_key}/{stage}"
+                    )
+                compact_frequency[label] = {
+                    "representation_grid_high_frequency_fraction": values.get(
+                        "representation_grid_high_frequency_fraction"
+                    )
+                }
+            compact_stages[stage] = {
+                "channels": summary.get("channels"),
+                "spatial_shapes": summary.get("spatial_shapes"),
+                "observations": summary.get("observations"),
+                "regions": compact_regions,
+                "frequency": compact_frequency,
+            }
+        result[str(tile_key)] = compact_stages
+    return result
 
 
 def segmentation_region_statistics(
