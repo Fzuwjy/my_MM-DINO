@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .semantic_flow import ResidualFlowAlignment
+
 
 class ConvBNReLU(nn.Sequential):
 
@@ -260,6 +262,9 @@ class ProgressiveRefinementNeck(nn.Module):
         """
         super(ProgressiveRefinementNeck, self).__init__()
         self.num_stages = num_stages
+        # Opt-in experiments attach this module only after every released
+        # parameter has been constructed, preserving the Run C RNG stream.
+        self.p5_p4_fam = None
 
         # 初始特征融合卷积
         self.td_convs = nn.ModuleList([
@@ -299,6 +304,13 @@ class ProgressiveRefinementNeck(nn.Module):
                                      3,
                                      padding=1)
 
+    def attach_p5_p4_fam(self, module):
+        if not isinstance(module, ResidualFlowAlignment):
+            raise TypeError("P5-to-P4 FAM must be a ResidualFlowAlignment")
+        if self.p5_p4_fam is not None:
+            raise RuntimeError("P5-to-P4 FAM is already attached")
+        self.p5_p4_fam = module
+
     def resize(self, x, size):
         """分辨率匹配操作"""
         return F.interpolate(x, size=size, mode='nearest')
@@ -318,8 +330,15 @@ class ProgressiveRefinementNeck(nn.Module):
         # === 步骤1: 初始特征融合 (公式1) ===
         # 自上而下路径: P5 -> P4 -> P3 -> P2
         P5_td = P5_in
+        P5_to_P4 = self.resize(P5_td, P4_in.shape[-2:])
+        if self.p5_p4_fam is not None:
+            P5_to_P4 = self.p5_p4_fam(
+                P5_td,
+                P4_in,
+                baseline_high=P5_to_P4,
+            )
         P4_td = self.td_convs[2](torch.cat(
-            [self.resize(P5_td, P4_in.shape[-2:]), P4_in], dim=1))
+            [P5_to_P4, P4_in], dim=1))
         P3_td = self.td_convs[1](torch.cat(
             [self.resize(P4_td, P3_in.shape[-2:]), P3_in], dim=1))
         P2_td = self.td_convs[0](torch.cat(
@@ -440,12 +459,24 @@ class Decoder(nn.Module):
         use_sar_logit_residual: bool = False,
         sar_logit_residual_seed: int = 0,
         sar_logit_residual_channels: int = 64,
+        use_prn_p5_p4_fam: bool = False,
+        prn_p5_p4_fam_seed: int = 0,
+        prn_p5_p4_fam_flow_channels: int = 128,
     ):
         super().__init__()
 
         self.in_channels = in_channels  # 1024
         self.out_channels = out_channels  # 1024 // 8 = 128
         self.num_modalities = num_modalities  # 存储模态数量
+
+        self.use_prn_p5_p4_fam = bool(use_prn_p5_p4_fam)
+        if self.use_prn_p5_p4_fam and (
+            use_optical_stem or use_sar_logit_residual
+        ):
+            raise ValueError(
+                "the P5-to-P4 FAM experiment cannot be combined with other "
+                "opt-in decoder branches"
+            )
 
         # TODO: change the input channels
         self.frm = FeatureReinforcementModule([in_channels[0]] + in_channels,
@@ -495,6 +526,20 @@ class Decoder(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(optical_stem_seed)
                 self.optical_stem = OpticalSpatialStem(out_channels)
+
+        if self.use_prn_p5_p4_fam:
+            # Construct the experiment after every released/base parameter and
+            # on an isolated RNG stream. Run C initialization remains intact.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(prn_p5_p4_fam_seed)
+                self.neck.attach_p5_p4_fam(
+                    ResidualFlowAlignment(
+                        out_channels,
+                        flow_channels=prn_p5_p4_fam_flow_channels,
+                        kernel_size=3,
+                        padding_mode="border",
+                    )
+                )
 
     def forward(
         self,

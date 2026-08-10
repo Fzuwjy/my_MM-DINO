@@ -60,12 +60,16 @@ class DINOSegmentModule(nn.Module):
         use_sar_logit_residual: bool = False,
         sar_logit_residual_seed: int = 0,
         sar_logit_residual_channels: int = 64,
+        use_prn_p5_p4_fam: bool = False,
+        prn_p5_p4_fam_seed: int = 0,
+        prn_p5_p4_fam_flow_channels: int = 128,
     ):
         super().__init__()
 
         self.num_modalities = num_modalities
         self.use_optical_stem = bool(use_optical_stem)
         self.use_sar_logit_residual = bool(use_sar_logit_residual)
+        self.use_prn_p5_p4_fam = bool(use_prn_p5_p4_fam)
         if self.use_optical_stem and decoder_type != 'Decoder':
             raise ValueError(
                 "the optical spatial stem is only implemented for Decoder"
@@ -73,6 +77,17 @@ class DINOSegmentModule(nn.Module):
         if self.use_sar_logit_residual and decoder_type != 'Decoder':
             raise ValueError(
                 "the SAR logit residual is only implemented for Decoder"
+            )
+        if self.use_prn_p5_p4_fam and decoder_type != 'Decoder':
+            raise ValueError(
+                "the P5-to-P4 FAM is only implemented for Decoder"
+            )
+        if self.use_prn_p5_p4_fam and (
+            self.use_optical_stem or self.use_sar_logit_residual
+        ):
+            raise ValueError(
+                "the P5-to-P4 FAM cannot be combined with other opt-in "
+                "decoder branches"
             )
 
         dinov3_vits_dict = {
@@ -131,6 +146,11 @@ class DINOSegmentModule(nn.Module):
             )
             decoder_kwargs["sar_logit_residual_channels"] = (
                 sar_logit_residual_channels
+            )
+            decoder_kwargs["use_prn_p5_p4_fam"] = self.use_prn_p5_p4_fam
+            decoder_kwargs["prn_p5_p4_fam_seed"] = prn_p5_p4_fam_seed
+            decoder_kwargs["prn_p5_p4_fam_flow_channels"] = (
+                prn_p5_p4_fam_flow_channels
             )
             self.decoder = Decoder(**decoder_kwargs)
         elif decoder_type == 'Decoder_FRM':
