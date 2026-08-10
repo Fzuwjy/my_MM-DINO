@@ -496,6 +496,23 @@ class Decoder(nn.Module):
                 torch.manual_seed(optical_stem_seed)
                 self.optical_stem = OpticalSpatialStem(out_channels)
 
+    def extract_frm_p5(self, modality):
+        """Return one state-level post-FRM P5 tensor without decoding logits.
+
+        Canonical MM-DINO availability states are fused by ``SampleAdapter``
+        before they reach this decoder.  The adapter then duplicates the same
+        fused pyramid into the canonical decoder slots, so one slot is the
+        complete state representation and is sufficient here.
+
+        This method registers no parameter or buffer and leaves the released
+        ``forward`` path untouched.  It is intentionally limited to the base
+        four-scale Decoder used by the EarthMiss Run C experiments.
+        """
+
+        if not isinstance(modality, (list, tuple)) or len(modality) != 4:
+            raise ValueError("FRM-P5 extraction requires one four-scale pyramid")
+        return self.frm(*modality)[3]
+
     def forward(
         self,
         *modalities,

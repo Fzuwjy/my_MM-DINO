@@ -394,6 +394,68 @@ class DINOSegmentModule(nn.Module):
             canonical_slots=availability is not None,
         )
 
+    def extract_state_frm_p5_from_backbone_outputs(
+        self,
+        *modalities,
+        backbone_outputs,
+        availability,
+    ):
+        """Extract one canonical state's post-FRM P5 feature.
+
+        ``Full`` denotes the RGB+SAR fused adapter state, not an optical-only
+        feature.  Canonical SampleAdapter outputs are duplicate decoder slots;
+        only the first slot is evaluated so the shared FRM runs once.  The raw
+        DINO outputs must come from :meth:`extract_frozen_backbone_outputs`.
+
+        The helper deliberately stops before SEFusion/PRN and neither adds nor
+        mutates model state.  Callers control FRM BatchNorm train/eval semantics.
+        """
+
+        if availability is None:
+            raise ValueError("FRM-P5 extraction requires canonical availability")
+        if self.adapter is None:
+            raise RuntimeError("FRM-P5 extraction requires SampleAdapter")
+        if not hasattr(self.decoder, "extract_frm_p5"):
+            raise RuntimeError("FRM-P5 extraction requires the base Decoder")
+        if self.use_optical_stem or self.use_sar_logit_residual:
+            raise RuntimeError(
+                "FRM-P5 prototype extraction cannot be combined with other "
+                "experimental decoder branches"
+            )
+
+        batch_size = self._validate_modality_batch(
+            modalities,
+            require_same_spatial=True,
+        )
+        if len(modalities) != self.num_modalities:
+            raise ValueError(
+                "Cached canonical extraction requires one tensor for every "
+                "modality slot"
+            )
+        if len(backbone_outputs) != len(modalities):
+            raise ValueError(
+                "Cached backbone output count must match the modality slot count"
+            )
+
+        active_indices = active_modality_indices(
+            availability,
+            batch_size=batch_size,
+            num_modalities=self.num_modalities,
+        )
+        active_outputs = tuple(backbone_outputs[index] for index in active_indices)
+        height, width = modalities[active_indices[0]].shape[-2:]
+        patch_h, patch_w = height // 16, width // 16
+        processed_slots = self.adapter(
+            *active_outputs,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            guidance=modalities[0] if 0 in active_indices else None,
+            modality_indices=active_indices,
+        )
+        if len(processed_slots) != self.num_modalities:
+            raise RuntimeError("SampleAdapter did not return canonical decoder slots")
+        return self.decoder.extract_frm_p5(processed_slots[0])
+
     def forward(self, *modalities, availability=None):
         batch_size = self._validate_modality_batch(modalities)
         if availability is not None and len(modalities) != self.num_modalities:
