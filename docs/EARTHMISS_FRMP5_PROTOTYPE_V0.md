@@ -65,6 +65,9 @@ python scripts/train_earthmiss_frmp5_prototype_v0.py \
   --output-root /root/autodl-tmp/mm-dino/outputs/earthmiss-frmp5-prototype-v0-smoke
 ```
 
+The smoke JSON must show finite losses, at least one non-skipped prototype
+batch, and CUDA peak allocation below the physical device limit.
+
 Run matched P0 and P2 first.  P1 is conditional on P2 passing the frozen P0
 screen.
 

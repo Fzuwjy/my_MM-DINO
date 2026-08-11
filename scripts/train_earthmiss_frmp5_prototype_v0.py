@@ -785,6 +785,8 @@ def run_smoke(
     metadata,
 ):
     model.train()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     accumulator = PrototypeEpochAccumulator()
     records = []
     for batch_index, (rgb, sar, label) in enumerate(train_loader, start=1):
@@ -830,6 +832,14 @@ def run_smoke(
         "protocol": metadata,
         "batches": records,
         "prototype": accumulator.summary(),
+        "cuda_memory": (
+            {
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+            }
+            if device.type == "cuda"
+            else None
+        ),
     }
     (output_dir / "smoke.json").write_text(
         json.dumps(report, indent=2, allow_nan=False),
