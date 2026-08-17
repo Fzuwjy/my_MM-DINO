@@ -22,24 +22,22 @@
 - 不能作为通用三端点方法的充分 baseline；
 - Optical-only 结果必须明确标注为 unseen-state 描述值。
 
-## 3. WHU 没有官方 Val
+## 3. WHU 的开发与对外比较口径
 
-WHU 仓库只有 80 张官方 Train 与 20 张官方 Test。历史 A/C 用满 80 张 Train，
-E50 只在 Test 报一次。因此官方 Test 上的只读审计可以解释机制，但不得反复用来
-选择模块、尺度、loss 或超参数。
+WHU 仓库只有 80 张官方 Train 与 20 张官方 Test。为了保持与公开结果直接可比，
+后续 WHU 主实验继续使用这套官方 80/20 划分，不再从 80 张 Train 中另切 Val。
+训练、选点和结构迭代均允许查看官方 Test，但所有 WHU 新结果必须明确标注为
+`development-exposed`，不能把它描述成一次性 blind Test。
 
-若 WHU 成为主开发集，必须从官方 80 张 Train 中建立新的 group-disjoint
-development Train/Val，并在该新协议上重训最简单的三状态 baseline。官方 20 张
-Test 保留到方法冻结后一次性运行。历史 A/C 继续保留，但不与新 split 的数值做
-单变量比较。
+这一选择把防止过拟合的责任从单个 WHU split 转移到跨数据集验证：方法在 WHU
+确定后冻结结构、插入层、loss、状态采样和主要超参数，再原样迁移到 EarthMiss 及
+其他预注册数据集。允许变化的仅是事先规定的数据集适配项（类别数、训练总步数、
+输入尺寸等），不能在复现失败后逐数据集补模块或定向调参。
 
-建议 split 合同：
-
-- 以地图分幅前缀（例如 `NH49E006`）为 group；
-- 同一 group 不得跨 development Train/Val；
-- 目标约 64/16 scenes；
-- 只用 GT 类别像素直方图做确定性分层，不读取模型预测；
-- 输出场景清单、group 清单、全类支持及 SHA256，并永久冻结。
+历史 A/C 仍保留为公开 80/20 口径下的锚点；其中 Run C 没有训练 Optical-only，
+所以它的 Optical-only 结果只能是 unseen-state 描述值。若要评价真正的三部署
+方法，仍需在同一官方 80/20 上建立最简单的 `Full / Optical / SAR` 三状态 matched
+baseline。这是部署合同变化带来的必要对照，不是另建数据划分。
 
 ## 4. 已准备的历史 Run C 三端点审计
 
@@ -90,7 +88,7 @@ Adapter-P5 与 post-FRM P2 为输入，预测“该端点错误时，paired Full
 2. 两个 missing endpoint 都不能出现预注册的明显退化；
 3. Full endpoint 保持 guard；
 4. 报告 worst-endpoint mIoU，而不只报平均值；
-5. 在 development Val 冻结结构后，才运行官方 Test。
+5. 明确记录 WHU Test 已参与开发，并在跨数据集前冻结方法定义。
 
-在新 development split 与 matched baseline 完成前，不应根据历史 Test 审计直接
-写新模块。
+在 matched 三状态 baseline 完成前，不应根据历史审计直接写新模块。WHU 上得到的
+候选只有在 EarthMiss 和其他数据集的锁定复现实验中保持方向，才能支持通用性主张。

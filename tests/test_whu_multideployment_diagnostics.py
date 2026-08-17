@@ -3,8 +3,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 import tempfile
-import hashlib
-import json
 
 import pytest
 import torch
@@ -27,10 +25,6 @@ from scripts.diagnose_whu_multideployment_oracle import (  # noqa: E402
 )
 from scripts.diagnose_whu_multideployment_recoverability import (  # noqa: E402
     parse_args as parse_recoverability_args,
-)
-from scripts.prepare_whu_development_split import (  # noqa: E402
-    choose_validation_groups,
-    map_sheet_group,
 )
 from scripts.whu_multideployment_diagnostics_common import (  # noqa: E402
     ENDPOINTS,
@@ -162,56 +156,3 @@ def test_formal_defaults_are_frozen_for_gradient_and_recoverability():
     assert recoverability.crops_per_scene == 8
     assert recoverability.max_examples == 50_000
     assert recoverability.stages == ["adapter.P5", "frm.P2"]
-
-
-def test_whu_map_sheet_group_excludes_final_tile_id():
-    assert map_sheet_group("NH49E006014.tif") == "NH49E006"
-    assert map_sheet_group("NI49E024020.tif") == "NI49E024"
-    with pytest.raises(ValueError, match="unrecognized"):
-        map_sheet_group("tile.tif")
-
-
-def test_development_split_selection_is_exact_group_disjoint_and_deterministic():
-    groups = {
-        "NH49E001": 2,
-        "NH49E002": 2,
-        "NH50E001": 2,
-        "NH50E002": 2,
-        "NI49E001": 2,
-        "NI49E002": 2,
-    }
-    histograms = {
-        group: torch.tensor([10 + index, 20, 30, 40, 50, 60, 70]).numpy()
-        for index, group in enumerate(groups)
-    }
-    left, left_objective = choose_validation_groups(
-        histograms, groups, target_scenes=6, trials=500, seed=17,
-    )
-    right, right_objective = choose_validation_groups(
-        histograms, groups, target_scenes=6, trials=500, seed=17,
-    )
-    assert left == right
-    assert left_objective == right_objective
-    assert sum(groups[group] for group in left) == 6
-    assert {group[:4] for group in left} == {"NH49", "NH50", "NI49"}
-
-
-def test_frozen_development_split_partitions_official_train_without_group_leakage():
-    split_dir = REPO_ROOT / "splits" / "whu"
-    official = set(split_names(split_dir / "official_train.txt"))
-    train = split_names(split_dir / "development_train.txt")
-    val = split_names(split_dir / "development_val.txt")
-    manifest = json.loads(
-        (split_dir / "development_manifest.json").read_text(encoding="utf-8")
-    )
-    assert len(train) == 64 and len(val) == 16
-    assert set(train).isdisjoint(val)
-    assert set(train) | set(val) == official
-    assert {map_sheet_group(name) for name in train}.isdisjoint(
-        map_sheet_group(name) for name in val
-    )
-    assert manifest["official_test_was_accessed"] is False
-    assert manifest["group_overlap"] == []
-    for filename in ("development_train.txt", "development_val.txt"):
-        digest = hashlib.sha256((split_dir / filename).read_bytes()).hexdigest()
-        assert digest == manifest["files"][filename]
