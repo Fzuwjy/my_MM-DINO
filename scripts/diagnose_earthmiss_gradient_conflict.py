@@ -136,14 +136,48 @@ def _same_city_batches(dataset, batches_per_city: int, seed: int):
     schedule = []
     for city in expected_cities:
         indices = list(indices_by_city[city])
+        if len(indices) < BATCH_SIZE:
+            raise RuntimeError(
+                f"city {city} lacks {BATCH_SIZE} tiles required for one "
+                "within-batch-unique diagnostic batch"
+            )
         generator = random.Random(stable_seed(seed, city))
-        generator.shuffle(indices)
-        required = batches_per_city * BATCH_SIZE
-        if len(indices) < required:
-            raise RuntimeError(f"city {city} lacks {required} unique tiles")
-        for start in range(0, required, BATCH_SIZE):
-            schedule.append((city, tuple(indices[start : start + BATCH_SIZE])))
+        remaining: list[int] = []
+        for _ in range(batches_per_city):
+            batch: list[int] = []
+            while len(batch) < BATCH_SIZE:
+                if not remaining:
+                    remaining = list(indices)
+                    generator.shuffle(remaining)
+                for index in tuple(remaining):
+                    if index in batch:
+                        continue
+                    batch.append(index)
+                    remaining.remove(index)
+                    if len(batch) == BATCH_SIZE:
+                        break
+            if len(set(batch)) != BATCH_SIZE:
+                raise RuntimeError(f"city {city} diagnostic batch is not unique")
+            schedule.append((city, tuple(batch)))
     return tuple(schedule)
+
+
+def _schedule_audit(dataset, schedule) -> dict[str, dict[str, int]]:
+    available = defaultdict(int)
+    for sample in dataset.samples:
+        available[str(sample.city)] += 1
+    scheduled: dict[str, list[int]] = defaultdict(list)
+    for city, indices in schedule:
+        scheduled[city].extend(indices)
+    return {
+        city: {
+            "available_tiles": int(available[city]),
+            "scheduled_examples": len(scheduled[city]),
+            "scheduled_unique_tiles": len(set(scheduled[city])),
+            "cross_batch_reuses": len(scheduled[city]) - len(set(scheduled[city])),
+        }
+        for city in EARTHMISS_CITIES["train"]
+    }
 
 
 def _load_batch(dataset, indices: Sequence[int]):
@@ -256,6 +290,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     schedule = _same_city_batches(dataset, args.batches_per_city, args.seed)
+    schedule_audit = _schedule_audit(dataset, schedule)
     buffers_before = snapshot_batchnorm_buffers(model)
     records: dict[str, list[dict[str, Any]]] = {mode: [] for mode in args.bn_modes}
 
@@ -361,6 +396,12 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
             "seed": args.seed,
             "batch_size": BATCH_SIZE,
             "batches_per_city": args.batches_per_city,
+            "sampling": (
+                "deterministic shuffled without-replacement cycles; every batch "
+                "contains unique tiles; cross-batch reuse is allowed and audited "
+                "when a city has fewer tiles than requested sample positions"
+            ),
+            "schedule_audit": schedule_audit,
             "cities": list(EARTHMISS_CITIES["train"]),
             "bn_modes": list(args.bn_modes),
             "same_cached_backbone_per_endpoint": True,

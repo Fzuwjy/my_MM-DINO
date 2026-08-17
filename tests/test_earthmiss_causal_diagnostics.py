@@ -26,6 +26,12 @@ from scripts.diagnose_earthmiss_sar_recoverability import (  # noqa: E402
     _fit_probe,
     _within_class_shuffle,
 )
+from scripts.diagnose_earthmiss_gradient_conflict import (  # noqa: E402
+    BATCH_SIZE,
+    _same_city_batches,
+    _schedule_audit,
+)
+from datasets import EARTHMISS_CITIES  # noqa: E402
 from scripts.analyze_earthmiss_causal_diagnostics import causal_decision  # noqa: E402
 from scripts.earthmiss_causal_diagnostics_common import (  # noqa: E402
     ORACLE_STAGE_ORDER,
@@ -257,6 +263,48 @@ class GradientGeometryTest(unittest.TestCase):
         self.assertEqual(summary["g"]["negative_cosine_fraction"], 0.5)
         self.assertAlmostEqual(summary["g"]["cosine"]["mean"], -0.125)
         self.assertAlmostEqual(summary["g"]["cosine"]["median"], -0.125)
+
+
+class SameCityScheduleTest(unittest.TestCase):
+    @staticmethod
+    def _dataset(counts):
+        samples = []
+        for city in EARTHMISS_CITIES["train"]:
+            samples.extend(
+                SimpleNamespace(city=city) for _ in range(counts.get(city, BATCH_SIZE))
+            )
+        return SimpleNamespace(samples=samples)
+
+    def test_small_city_reuses_only_across_unique_batches(self):
+        small_city = EARTHMISS_CITIES["train"][-1]
+        counts = {
+            city: BATCH_SIZE * 2 for city in EARTHMISS_CITIES["train"]
+        }
+        counts[small_city] = BATCH_SIZE + 3
+        dataset = self._dataset(counts)
+
+        first = _same_city_batches(dataset, batches_per_city=2, seed=17)
+        second = _same_city_batches(dataset, batches_per_city=2, seed=17)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2 * len(EARTHMISS_CITIES["train"]))
+        for _, indices in first:
+            self.assertEqual(len(indices), BATCH_SIZE)
+            self.assertEqual(len(set(indices)), BATCH_SIZE)
+        audit = _schedule_audit(dataset, first)
+        self.assertEqual(audit[small_city]["available_tiles"], BATCH_SIZE + 3)
+        self.assertEqual(audit[small_city]["scheduled_examples"], BATCH_SIZE * 2)
+        self.assertEqual(audit[small_city]["scheduled_unique_tiles"], BATCH_SIZE + 3)
+        self.assertEqual(audit[small_city]["cross_batch_reuses"], BATCH_SIZE - 3)
+
+    def test_city_smaller_than_one_batch_is_rejected(self):
+        small_city = EARTHMISS_CITIES["train"][-1]
+        counts = {
+            city: BATCH_SIZE for city in EARTHMISS_CITIES["train"]
+        }
+        counts[small_city] = BATCH_SIZE - 1
+        with self.assertRaisesRegex(RuntimeError, "within-batch-unique"):
+            _same_city_batches(self._dataset(counts), batches_per_city=1, seed=17)
 
 
 class DecisionTreeTest(unittest.TestCase):

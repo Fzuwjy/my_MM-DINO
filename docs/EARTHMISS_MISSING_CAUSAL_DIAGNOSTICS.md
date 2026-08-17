@@ -75,6 +75,11 @@ teacher imitation as the next default move.
 each of the seven Train cities. For every batch it caches frozen RGB/SAR DINO
 outputs once, then measures the released segmentation-loss gradients for
 canonical Full and canonical SAR under both train-BN and eval-BN semantics.
+Each batch contains eight distinct tiles. Sampling follows deterministic shuffled
+without-replacement cycles; if a city has fewer than 64 tiles, reuse is allowed
+only across batches and the available, unique scheduled, and reused tile counts
+are written to `protocol.schedule_audit`. This preserves eight equally weighted
+batches per city without misreporting the samples as 64 independent tiles.
 
 Overlapping reports cover:
 
