@@ -123,6 +123,18 @@ def _git_head() -> str | None:
         return None
 
 
+def _assert_git_head_unchanged(start_head: str | None) -> str:
+    end_head = _git_head()
+    if start_head is None or end_head is None:
+        raise RuntimeError("oracle diagnostic requires a readable Git HEAD")
+    if end_head != start_head:
+        raise RuntimeError(
+            "repository HEAD changed during oracle diagnosis: "
+            f"{start_head} -> {end_head}; refusing to write a report"
+        )
+    return start_head
+
+
 def _build_loader(args: argparse.Namespace):
     dataset = build_dataset(
         "EarthMiss",
@@ -164,6 +176,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output)
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite oracle report: {output_path}")
+    git_head_start = _assert_git_head_unchanged(_git_head())
     if not torch.cuda.is_available():
         raise RuntimeError("oracle intervention requires CUDA")
     weights_path = Path(args.backbone_weights)
@@ -350,7 +363,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         "formal": formal,
         "training_was_performed": False,
         "split": "Val only; Test not accessed",
-        "git_head": _git_head(),
+        "git_head": git_head_start,
         "checkpoint": checkpoint,
         "protocol": {
             "window_size": WINDOW_SIZE,
@@ -383,6 +396,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
             "that the tensor is predictable from SAR or trainably transferable."
         ),
     }
+    _assert_git_head_unchanged(git_head_start)
     write_json_exclusive(output_path, report)
     return report
 

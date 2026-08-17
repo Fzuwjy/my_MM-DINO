@@ -40,6 +40,20 @@ Only after one single-scale stage passes may one response curve be run for that
 preselected stage with `alpha=0.25,0.5,0.75,1.0`. The response report is not a
 replacement for the complete primary screen.
 
+### Locked post-screen response curve (2026-08-17)
+
+The completed alpha=1 screen selected `frm.P2` before any response-curve result
+was observed: it had the largest actionable pooled gain (`+8.1679 pp`) and was
+positive in all three Val cities. The only authorized response curve uses
+`--stages frm.P2 --alphas 0.25 0.50 0.75 1.00`. A partial intervention is
+actionable under the unchanged screen rule (`>=+0.25 pp` pooled and at least two
+nonnegative cities). If neither alpha 0.25 nor 0.50 is actionable, exact Full-P2
+replacement is treated as insufficient evidence for a learnable small
+compensation. No other stage or alpha grid may be selected from these results.
+
+The oracle runner snapshots the repository HEAD at startup and refuses to write
+the report if another task switches the shared checkout before completion.
+
 ## Question 2: SAR recoverability
 
 `diagnose_earthmiss_sar_recoverability.py` freezes Run C and works on P5 cells

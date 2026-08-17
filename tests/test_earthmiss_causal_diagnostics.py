@@ -20,6 +20,7 @@ sys.path.insert(0, str(SEGMENTATION_ROOT))
 from models.MMDINO.Decoder import Decoder  # noqa: E402
 from models.MMDINO.sample_adapter import SampleAdapter  # noqa: E402
 from scripts.diagnose_earthmiss_oracle_intervention import (  # noqa: E402
+    _assert_git_head_unchanged as assert_oracle_git_head_unchanged,
     validate_args as validate_oracle_args,
 )
 from scripts.diagnose_earthmiss_sar_recoverability import (  # noqa: E402
@@ -81,6 +82,14 @@ def _features(value: float) -> tuple[torch.Tensor, ...]:
 
 
 class OracleInterventionTest(unittest.TestCase):
+    def test_git_head_guard_rejects_concurrent_branch_switch(self):
+        with patch(
+            "scripts.diagnose_earthmiss_oracle_intervention._git_head",
+            return_value="changed",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HEAD changed"):
+                assert_oracle_git_head_unchanged("fixed")
+
     def setUp(self):
         torch.manual_seed(3)
         self.model = TinyReleasedPath().eval()
