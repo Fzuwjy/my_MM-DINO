@@ -92,6 +92,9 @@ No optimizer is constructed. Endpoint RNG and all persistent BatchNorm buffers
 are restored after every forward. Shared conflict is supported when train-BN
 median cosine is negative and at least half of sampled batches have negative
 cosine in either aggregate Adapter or aggregate FRM.
+The gradient runner also snapshots the repository HEAD before loading the model
+and refuses to write a report if another task switches the shared checkout before
+the diagnostic finishes.
 
 ## Pre-registered route selection
 

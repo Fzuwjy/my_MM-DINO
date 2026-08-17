@@ -102,6 +102,18 @@ def _git_head() -> str | None:
         return None
 
 
+def _assert_git_head_unchanged(start_head: str | None) -> str:
+    end_head = _git_head()
+    if start_head is None or end_head is None:
+        raise RuntimeError("gradient diagnostic requires a readable Git HEAD")
+    if end_head != start_head:
+        raise RuntimeError(
+            "repository HEAD changed during gradient diagnosis: "
+            f"{start_head} -> {end_head}; refusing to write a formal report"
+        )
+    return start_head
+
+
 def _restore_buffers(snapshot: dict[str, torch.Tensor], model: torch.nn.Module) -> None:
     current = dict(model.named_buffers())
     if set(snapshot) != {
@@ -234,6 +246,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output)
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite gradient report: {output_path}")
+    git_head_start = _assert_git_head_unchanged(_git_head())
     if not torch.cuda.is_available():
         raise RuntimeError("gradient conflict diagnosis requires CUDA")
     weights_path = Path(args.backbone_weights)
@@ -390,7 +403,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         "training_was_performed": False,
         "optimizer_was_constructed": False,
         "split": "Train only; Val/Test not accessed",
-        "git_head": _git_head(),
+        "git_head": git_head_start,
         "checkpoint": checkpoint,
         "protocol": {
             "seed": args.seed,
@@ -421,6 +434,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
             "Non-negative cosine does not prove privileged information is SAR-predictable."
         ),
     }
+    _assert_git_head_unchanged(git_head_start)
     write_json_exclusive(output_path, report)
     return report
 

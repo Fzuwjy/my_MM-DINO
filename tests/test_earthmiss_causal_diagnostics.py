@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,7 @@ from scripts.diagnose_earthmiss_sar_recoverability import (  # noqa: E402
 )
 from scripts.diagnose_earthmiss_gradient_conflict import (  # noqa: E402
     BATCH_SIZE,
+    _assert_git_head_unchanged,
     _same_city_batches,
     _schedule_audit,
 )
@@ -305,6 +307,21 @@ class SameCityScheduleTest(unittest.TestCase):
         counts[small_city] = BATCH_SIZE - 1
         with self.assertRaisesRegex(RuntimeError, "within-batch-unique"):
             _same_city_batches(self._dataset(counts), batches_per_city=1, seed=17)
+
+    def test_git_head_guard_accepts_unchanged_repository(self):
+        with patch(
+            "scripts.diagnose_earthmiss_gradient_conflict._git_head",
+            return_value="fixed",
+        ):
+            self.assertEqual(_assert_git_head_unchanged("fixed"), "fixed")
+
+    def test_git_head_guard_rejects_concurrent_branch_switch(self):
+        with patch(
+            "scripts.diagnose_earthmiss_gradient_conflict._git_head",
+            return_value="changed",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HEAD changed"):
+                _assert_git_head_unchanged("fixed")
 
 
 class DecisionTreeTest(unittest.TestCase):
