@@ -59,8 +59,9 @@ WINDOW_SIZE = 512
 PURITY_THRESHOLD = 0.75
 DEFAULT_TRAIN_SCENES = 16
 DEFAULT_CROPS_PER_SCENE = 8
-DEFAULT_MAX_EXAMPLES = 100_000
+DEFAULT_MAX_EXAMPLES = 50_000
 SEED = 20260817
+RECOVERABILITY_STAGES = ("adapter.P5", "frm.P2")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -80,6 +81,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--crops-per-scene", type=int, default=DEFAULT_CROPS_PER_SCENE,
     )
     parser.add_argument("--max-examples", type=int, default=DEFAULT_MAX_EXAMPLES)
+    parser.add_argument(
+        "--stages", nargs="+", choices=RECOVERABILITY_STAGES,
+        default=list(RECOVERABILITY_STAGES),
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--skip-cached-equivalence-check", action="store_true")
@@ -95,6 +100,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--crops-per-scene must be positive")
     if args.max_examples < 100 or args.num_workers < 0:
         raise ValueError("invalid max-example/worker count")
+    if len(args.stages) != len(set(args.stages)):
+        raise ValueError("--stages must be unique")
 
 
 def _git_head() -> str | None:
@@ -107,49 +114,62 @@ def _git_head() -> str | None:
         return None
 
 
-class _FRMP5Capture:
+class _CausalStageCapture:
     def __init__(self, model) -> None:
         self.model = model
-        self.handle = None
+        self.handles = []
         self.active = False
         self.calls = 0
-        self.value = None
+        self.values = {}
 
     def __enter__(self):
-        self.handle = self.model.decoder.frm.register_forward_hook(self._hook)
+        self.handles = [
+            self.model.adapter.register_forward_hook(self._adapter_hook),
+            self.model.decoder.frm.register_forward_hook(self._frm_hook),
+        ]
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.active = False
-        if self.handle is not None:
-            self.handle.remove()
-            self.handle = None
+        for handle in getattr(self, "handles", []):
+            handle.remove()
+        self.handles = []
 
-    def _hook(self, module, inputs, output):
+    def _adapter_hook(self, module, inputs, output):
+        if not self.active:
+            return None
+        if not isinstance(output, (list, tuple)) or len(output) != 2:
+            raise RuntimeError("canonical adapter slot contract changed")
+        if not torch.equal(output[0][3], output[1][3]):
+            raise RuntimeError("duplicate canonical Adapter P5 slots differ")
+        self.values["adapter.P5"] = output[0][3].detach().clone()
+        return None
+
+    def _frm_hook(self, module, inputs, output):
         if not self.active:
             return None
         self.calls += 1
-        value = output[3].detach().clone()
+        value = output[0].detach().clone()
         if self.calls == 1:
-            self.value = value
+            self.values["frm.P2"] = value
         elif self.calls == 2:
-            if not torch.equal(self.value, value):
-                raise RuntimeError("duplicate canonical FRM P5 slots differ")
+            if not torch.equal(self.values["frm.P2"], value):
+                raise RuntimeError("duplicate canonical FRM P2 slots differ")
         else:
             raise RuntimeError("FRM called more than twice")
         return None
 
     def run(self, forward):
         self.calls = 0
-        self.value = None
+        self.values = {}
         self.active = True
         try:
             logits = forward()
         finally:
             self.active = False
-        if self.calls != 2 or self.value is None:
-            raise RuntimeError("FRM P5 capture contract changed")
-        return logits, self.value
+        if self.calls != 2 or set(self.values) != set(RECOVERABILITY_STAGES):
+            raise RuntimeError("causal-stage capture contract changed")
+        return logits, dict(self.values)
 
 
 def _scene_indices(count: int, selected: int, seed: int) -> tuple[int, ...]:
@@ -180,11 +200,21 @@ def _extract(
     equivalence,
 ):
     data = {
-        endpoint: {"features": [], "targets": [], "classes": [], "scenes": []}
+        endpoint: {
+            stage: {"features": [], "targets": [], "classes": [], "scenes": []}
+            for stage in args.stages
+        }
         for endpoint in MISSING_ENDPOINTS
     }
     counters = {
-        endpoint: {"pure_cells": 0, "endpoint_wrong_cells": 0}
+        endpoint: {
+            stage: {
+                "pure_cells": 0,
+                "endpoint_wrong_cells": 0,
+                "retained_after_per_crop_cap": 0,
+            }
+            for stage in args.stages
+        }
         for endpoint in MISSING_ENDPOINTS
     }
     scene_names = []
@@ -194,6 +224,8 @@ def _extract(
         endpoint: canonical_availability(endpoint, batch_size=1, device=device)
         for endpoint in MISSING_ENDPOINTS
     }
+    planned_crops = max(1, len(indices) * args.crops_per_scene)
+    per_crop_cap = max(16, (args.max_examples + planned_crops - 1) // planned_crops)
     for local_scene_id, index in enumerate(
         tqdm(indices, desc=f"whu-recoverability-{split_name}")
     ):
@@ -224,50 +256,74 @@ def _extract(
                 availability=full_availability,
             )
             for endpoint in MISSING_ENDPOINTS:
-                endpoint_logits, endpoint_p5 = capture.run(
+                endpoint_logits, stage_features = capture.run(
                     lambda endpoint=endpoint: model.forward_from_backbone_outputs(
                         optical_crop, sar_crop, backbone_outputs=backbone_outputs,
                         availability=endpoint_availability[endpoint],
                     )
                 )
-                examples = endpoint_recoverability_examples(
-                    endpoint_p5, full_logits, endpoint_logits, target_crop,
-                    purity_threshold=PURITY_THRESHOLD,
-                )
-                counters[endpoint]["pure_cells"] += examples.pure_cells
-                counters[endpoint]["endpoint_wrong_cells"] += examples.endpoint_wrong_cells
-                count = examples.features.shape[0]
-                if count:
-                    data[endpoint]["features"].append(
-                        examples.features.to("cpu", torch.float16)
+                for stage in args.stages:
+                    examples = endpoint_recoverability_examples(
+                        stage_features[stage], full_logits, endpoint_logits, target_crop,
+                        purity_threshold=PURITY_THRESHOLD,
                     )
-                    data[endpoint]["targets"].append(examples.targets.to("cpu", torch.int8))
-                    data[endpoint]["classes"].append(examples.class_ids.to("cpu", torch.int8))
-                    data[endpoint]["scenes"].append(
-                        torch.full((count,), local_scene_id, dtype=torch.int16)
-                    )
+                    stage_counter = counters[endpoint][stage]
+                    stage_counter["pure_cells"] += examples.pure_cells
+                    stage_counter["endpoint_wrong_cells"] += examples.endpoint_wrong_cells
+                    count = examples.features.shape[0]
+                    if count > per_crop_cap:
+                        generator = torch.Generator(device="cpu").manual_seed(
+                            stable_seed(
+                                args.seed,
+                                f"{split_name}:{endpoint}:{stage}:{crop_count}",
+                            )
+                        )
+                        selected = torch.randperm(count, generator=generator)[:per_crop_cap]
+                        feature = examples.features[selected]
+                        target_values = examples.targets[selected]
+                        class_values = examples.class_ids[selected]
+                    else:
+                        feature = examples.features
+                        target_values = examples.targets
+                        class_values = examples.class_ids
+                    retained = feature.shape[0]
+                    stage_counter["retained_after_per_crop_cap"] += retained
+                    if retained:
+                        values = data[endpoint][stage]
+                        values["features"].append(feature.to("cpu", torch.float16))
+                        values["targets"].append(target_values.to("cpu", torch.int8))
+                        values["classes"].append(class_values.to("cpu", torch.int8))
+                        values["scenes"].append(
+                            torch.full((retained,), local_scene_id, dtype=torch.int16)
+                        )
     joined = {}
-    for endpoint, values in data.items():
-        if not values["features"]:
-            raise RuntimeError(f"no {endpoint} recoverability examples in {split_name}")
-        tensors = (
-            torch.cat(values["features"]),
-            torch.cat(values["targets"]).long(),
-            torch.cat(values["classes"]).long(),
-            torch.cat(values["scenes"]).long(),
-        )
-        joined[endpoint] = _subsample(
-            tensors, args.max_examples,
-            stable_seed(args.seed, f"{split_name}:{endpoint}:subsample"),
-        )
-        counters[endpoint]["retained_examples"] = int(joined[endpoint][0].shape[0])
-        counters[endpoint]["recoverable_prevalence"] = float(
-            joined[endpoint][1].float().mean()
-        )
+    for endpoint, stage_values in data.items():
+        joined[endpoint] = {}
+        for stage, values in stage_values.items():
+            if not values["features"]:
+                raise RuntimeError(
+                    f"no {endpoint}/{stage} recoverability examples in {split_name}"
+                )
+            tensors = (
+                torch.cat(values["features"]),
+                torch.cat(values["targets"]).long(),
+                torch.cat(values["classes"]).long(),
+                torch.cat(values["scenes"]).long(),
+            )
+            joined[endpoint][stage] = _subsample(
+                tensors, args.max_examples,
+                stable_seed(args.seed, f"{split_name}:{endpoint}:{stage}:subsample"),
+            )
+            counter = counters[endpoint][stage]
+            counter["retained_examples"] = int(joined[endpoint][stage][0].shape[0])
+            counter["recoverable_prevalence"] = float(
+                joined[endpoint][stage][1].float().mean()
+            )
     return joined, {
         "scenes": len(indices),
         "scene_names": scene_names,
         "crops": crop_count,
+        "per_crop_example_cap": per_crop_cap,
         "endpoints": counters,
     }
 
@@ -375,7 +431,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     test_indices = tuple(range(test_count))
     buffers_before = snapshot_batchnorm_buffers(model)
     equivalence = [None]
-    with _FRMP5Capture(model) as capture:
+    with _CausalStageCapture(model) as capture:
         train_data, train_record = _extract(
             model, capture, train_dataset, train_indices, args, device,
             "train", equivalence,
@@ -387,66 +443,72 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
 
     endpoint_reports = {}
     for endpoint in MISSING_ENDPOINTS:
-        train_x, train_y, train_class, _ = train_data[endpoint]
-        test_x, test_y, test_class, test_scene = test_data[endpoint]
-        train_x = train_x.float().numpy()
-        test_x = test_x.float().numpy()
-        train_y = train_y.numpy()
-        test_y = test_y.numpy()
-        train_class = train_class.numpy()
-        test_class = test_class.numpy()
-        test_scene = test_scene.numpy()
-        probe = _fit_probe(train_x, train_y, stable_seed(args.seed, endpoint))
-        main_scores = probe.predict_proba(test_x)[:, 1]
-        shuffled_y = _within_class_shuffle(
-            train_y, train_class, stable_seed(args.seed, f"{endpoint}:shuffle"),
-        )
-        shuffled_probe = _fit_probe(
-            train_x, shuffled_y, stable_seed(args.seed, f"{endpoint}:shuffle-fit"),
-        )
-        shuffled_scores = shuffled_probe.predict_proba(test_x)[:, 1]
-        prior_scores, priors = _class_prior_scores(train_y, train_class, test_class)
-        scores = {
-            "endpoint_p5_linear": main_scores,
-            "within_class_shuffled_target": shuffled_scores,
-            "gt_class_conditional_prior": prior_scores,
-        }
-        evaluation = _evaluate(
-            test_y, scores, test_class, test_scene, test_record["scene_names"],
-        )
-        pooled = evaluation["pooled"]
-        main_ap = pooled["endpoint_p5_linear"]["average_precision"]
-        main_auc = pooled["endpoint_p5_linear"]["roc_auc"]
-        prior_ap = pooled["gt_class_conditional_prior"]["average_precision"]
-        shuffled_ap = pooled["within_class_shuffled_target"]["average_precision"]
-        scene_uplifts = {}
-        for scene, values in evaluation["by_scene"].items():
-            left = values["endpoint_p5_linear"]["average_precision"]
-            right = values["gt_class_conditional_prior"]["average_precision"]
-            scene_uplifts[scene] = (
-                left - right if left is not None and right is not None else None
+        endpoint_reports[endpoint] = {}
+        for stage in args.stages:
+            train_x, train_y, train_class, _ = train_data[endpoint][stage]
+            test_x, test_y, test_class, test_scene = test_data[endpoint][stage]
+            train_x = train_x.float().numpy()
+            test_x = test_x.float().numpy()
+            train_y = train_y.numpy()
+            test_y = test_y.numpy()
+            train_class = train_class.numpy()
+            test_class = test_class.numpy()
+            test_scene = test_scene.numpy()
+            key = f"{endpoint}:{stage}"
+            probe = _fit_probe(train_x, train_y, stable_seed(args.seed, key))
+            main_scores = probe.predict_proba(test_x)[:, 1]
+            shuffled_y = _within_class_shuffle(
+                train_y, train_class, stable_seed(args.seed, f"{key}:shuffle"),
             )
-        gates = {
-            "pooled_auroc_at_least_0_60": main_auc is not None and main_auc >= 0.60,
-            "ap_uplift_over_class_prior_at_least_0_05": (
-                main_ap is not None and prior_ap is not None and main_ap - prior_ap >= 0.05
-            ),
-            "ap_uplift_over_shuffle_at_least_0_05": (
-                main_ap is not None and shuffled_ap is not None
-                and main_ap - shuffled_ap >= 0.05
-            ),
-            "at_least_60pct_test_scenes_above_class_prior": (
-                sum(value is not None and value > 0.0 for value in scene_uplifts.values())
-                >= int(np.ceil(0.60 * len(scene_uplifts)))
-            ),
-        }
-        endpoint_reports[endpoint] = {
-            "class_conditional_train_priors": priors,
-            "evaluation": evaluation,
-            "scene_ap_uplift_over_class_prior": scene_uplifts,
-            "gates": gates,
-            "predictable_at_linear_p5_level": all(gates.values()),
-        }
+            shuffled_probe = _fit_probe(
+                train_x, shuffled_y, stable_seed(args.seed, f"{key}:shuffle-fit"),
+            )
+            shuffled_scores = shuffled_probe.predict_proba(test_x)[:, 1]
+            prior_scores, priors = _class_prior_scores(train_y, train_class, test_class)
+            scores = {
+                "endpoint_feature_linear": main_scores,
+                "within_class_shuffled_target": shuffled_scores,
+                "gt_class_conditional_prior": prior_scores,
+            }
+            evaluation = _evaluate(
+                test_y, scores, test_class, test_scene, test_record["scene_names"],
+            )
+            pooled = evaluation["pooled"]
+            main_ap = pooled["endpoint_feature_linear"]["average_precision"]
+            main_auc = pooled["endpoint_feature_linear"]["roc_auc"]
+            prior_ap = pooled["gt_class_conditional_prior"]["average_precision"]
+            shuffled_ap = pooled["within_class_shuffled_target"]["average_precision"]
+            scene_uplifts = {}
+            for scene, values in evaluation["by_scene"].items():
+                left = values["endpoint_feature_linear"]["average_precision"]
+                right = values["gt_class_conditional_prior"]["average_precision"]
+                scene_uplifts[scene] = (
+                    left - right if left is not None and right is not None else None
+                )
+            gates = {
+                "pooled_auroc_at_least_0_60": main_auc is not None and main_auc >= 0.60,
+                "ap_uplift_over_class_prior_at_least_0_05": (
+                    main_ap is not None and prior_ap is not None
+                    and main_ap - prior_ap >= 0.05
+                ),
+                "ap_uplift_over_shuffle_at_least_0_05": (
+                    main_ap is not None and shuffled_ap is not None
+                    and main_ap - shuffled_ap >= 0.05
+                ),
+                "at_least_60pct_test_scenes_above_class_prior": (
+                    sum(
+                        value is not None and value > 0.0
+                        for value in scene_uplifts.values()
+                    ) >= int(np.ceil(0.60 * len(scene_uplifts)))
+                ),
+            }
+            endpoint_reports[endpoint][stage] = {
+                "class_conditional_train_priors": priors,
+                "evaluation": evaluation,
+                "scene_ap_uplift_over_class_prior": scene_uplifts,
+                "gates": gates,
+                "predictable_at_linear_level": all(gates.values()),
+            }
 
     formal = (
         args.train_scenes == DEFAULT_TRAIN_SCENES
@@ -454,6 +516,7 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         and args.crops_per_scene == DEFAULT_CROPS_PER_SCENE
         and args.max_examples == DEFAULT_MAX_EXAMPLES
         and args.seed == SEED
+        and tuple(args.stages) == RECOVERABILITY_STAGES
     )
     report = {
         "schema": SCHEMA,
@@ -465,16 +528,18 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         "git_head": _git_head(),
         "checkpoint": checkpoint,
         "protocol": {
-            "features": {
-                endpoint: f"canonical {endpoint} post-FRM P5"
-                for endpoint in MISSING_ENDPOINTS
-            },
-            "cohort": "purity>=0.75 P5 cells where target endpoint is wrong",
+            "features": list(args.stages),
+            "endpoints": list(MISSING_ENDPOINTS),
+            "cohort": "purity>=0.75 stage-grid cells where target endpoint is wrong",
             "target": "paired canonical Full is correct",
             "crop_policy": "deterministic disjoint 512 crops; border excluded",
             "train_scenes": args.train_scenes,
             "test_scenes": args.test_scenes or 20,
             "crops_per_scene": args.crops_per_scene,
+            "maximum_examples_per_stage_split": args.max_examples,
+            "sampling": (
+                "deterministic per-crop cap before a final deterministic global cap"
+            ),
             "probe": "StandardScaler + class-balanced SGD logistic regression",
             "controls": [
                 "GT-class-conditional Train prevalence",
@@ -490,7 +555,8 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
         "endpoints": endpoint_reports,
         "interpretation": (
             "Success supports only linear predictability of paired Full correction "
-            "at post-FRM P5. Failure does not rule out nonlinear predictability. "
+            "at an already causally qualified stage. Failure does not rule out "
+            "nonlinear predictability. "
             "Official-Test results cannot select a future innovation."
         ),
     }
@@ -505,8 +571,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "output": args.output,
         "formal": report["formal"],
         "decisions": {
-            endpoint: values["predictable_at_linear_p5_level"]
-            for endpoint, values in report["endpoints"].items()
+            endpoint: {
+                stage: values["predictable_at_linear_level"]
+                for stage, values in stages.items()
+            }
+            for endpoint, stages in report["endpoints"].items()
         },
     })
 

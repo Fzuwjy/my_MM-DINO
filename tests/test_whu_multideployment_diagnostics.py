@@ -160,7 +160,8 @@ def test_formal_defaults_are_frozen_for_gradient_and_recoverability():
     assert recoverability.train_scenes == 16
     assert recoverability.test_scenes == 0
     assert recoverability.crops_per_scene == 8
-    assert recoverability.max_examples == 100_000
+    assert recoverability.max_examples == 50_000
+    assert recoverability.stages == ["adapter.P5", "frm.P2"]
 
 
 def test_whu_map_sheet_group_excludes_final_tile_id():

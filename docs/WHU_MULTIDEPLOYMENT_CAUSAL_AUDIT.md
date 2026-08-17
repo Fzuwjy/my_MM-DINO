@@ -72,7 +72,8 @@ norm ratio 与负梯度比例。脚本不构造 optimizer，逐端点恢复 RNG 
 ### 4.3 Endpoint recoverability
 
 `diagnose_whu_multideployment_recoverability.py` 分别以 Optical-only/SAR-only 的
-post-FRM P5 为输入，预测“该端点错误时，paired Full 是否正确”。线性 probe 使用
+Adapter-P5 与 post-FRM P2 为输入，预测“该端点错误时，paired Full 是否正确”。
+这两个位置来自先行 Oracle 的因果资格，而不是按表征 gap 大小选择。线性 probe 使用
 官方 Train 的固定 disjoint crops 拟合，在官方 Test 描述性评估；控制包括 GT 类先验
 和类内 shuffled target。它不会训练 MM-DINO，但因为评估读取 Test，仍不能用于方法
 选择。
