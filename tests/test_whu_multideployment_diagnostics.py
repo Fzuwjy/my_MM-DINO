@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 import tempfile
+import hashlib
+import json
 
 import pytest
 import torch
@@ -191,3 +193,24 @@ def test_development_split_selection_is_exact_group_disjoint_and_deterministic()
     assert left_objective == right_objective
     assert sum(groups[group] for group in left) == 6
     assert {group[:4] for group in left} == {"NH49", "NH50", "NI49"}
+
+
+def test_frozen_development_split_partitions_official_train_without_group_leakage():
+    split_dir = REPO_ROOT / "splits" / "whu"
+    official = set(split_names(split_dir / "official_train.txt"))
+    train = split_names(split_dir / "development_train.txt")
+    val = split_names(split_dir / "development_val.txt")
+    manifest = json.loads(
+        (split_dir / "development_manifest.json").read_text(encoding="utf-8")
+    )
+    assert len(train) == 64 and len(val) == 16
+    assert set(train).isdisjoint(val)
+    assert set(train) | set(val) == official
+    assert {map_sheet_group(name) for name in train}.isdisjoint(
+        map_sheet_group(name) for name in val
+    )
+    assert manifest["official_test_was_accessed"] is False
+    assert manifest["group_overlap"] == []
+    for filename in ("development_train.txt", "development_val.txt"):
+        digest = hashlib.sha256((split_dir / filename).read_bytes()).hexdigest()
+        assert digest == manifest["files"][filename]
