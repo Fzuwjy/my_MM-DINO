@@ -34,6 +34,18 @@ from scripts.diagnose_earthmiss_gradient_conflict import (  # noqa: E402
     _same_city_batches,
     _schedule_audit,
 )
+from scripts.diagnose_earthmiss_frmp2_correction_recoverability import (  # noqa: E402
+    CitySamples,
+    FRMP2AdditiveIntervention,
+    FRMP2Capture,
+    _performance_decision,
+    city_moments,
+    combine_moments,
+    correction_prediction_metrics,
+    fit_affine_ridge,
+    sample_pure_p2_cells,
+    within_class_permutation,
+)
 from datasets import EARTHMISS_CITIES  # noqa: E402
 from scripts.analyze_earthmiss_causal_diagnostics import causal_decision  # noqa: E402
 from scripts.earthmiss_causal_diagnostics_common import (  # noqa: E402
@@ -239,6 +251,123 @@ class RecoverabilityTest(unittest.TestCase):
         metrics = _binary_metrics(target, score)
         self.assertGreater(metrics["average_precision"], 0.98)
         self.assertGreater(metrics["roc_auc"], 0.98)
+
+
+class FRMP2CorrectionRecoverabilityTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(31)
+        self.model = TinyReleasedPath().eval()
+        self.sar = _features(-0.5)
+
+    def test_capture_and_zero_correction_preserve_released_path(self):
+        with (
+            torch.inference_mode(),
+            FRMP2Capture(self.model) as capture,
+            FRMP2AdditiveIntervention(self.model) as intervention,
+        ):
+            reference, p2 = capture.run(
+                lambda: self.model.decode(self.sar, active_indices=(1,))
+            )
+            zero = intervention.run(
+                lambda: self.model.decode(self.sar, active_indices=(1,)),
+                torch.zeros_like(p2),
+            )
+            changed = intervention.run(
+                lambda: self.model.decode(self.sar, active_indices=(1,)),
+                torch.ones_like(p2),
+            )
+        self.assertTrue(torch.equal(reference, zero))
+        self.assertFalse(torch.equal(reference, changed))
+
+    def test_pure_cell_sampler_excludes_ignore_and_preserves_delta(self):
+        sar = torch.arange(16, dtype=torch.float32).reshape(1, 4, 2, 2)
+        full = sar + 1.0
+        target = torch.tensor(
+            [[
+                [0, 0, 1, 1],
+                [0, 0, 1, 1],
+                [2, 2, 8, 8],
+                [2, 2, 8, 8],
+            ]]
+        )
+        samples = sample_pure_p2_cells(
+            sar,
+            full,
+            target,
+            purity_threshold=0.75,
+            maximum_per_class=1,
+            seed=7,
+        )
+        self.assertEqual(samples.class_ids.tolist(), [0, 1, 2])
+        self.assertEqual(tuple(samples.sar.shape), (3, 4))
+        self.assertTrue(torch.equal(samples.delta, torch.ones_like(samples.delta)))
+
+    def test_within_class_permutation_is_deterministic_and_class_safe(self):
+        classes = torch.tensor([0, 0, 0, 1, 1, 1, 2])
+        first = within_class_permutation(classes, 19)
+        second = within_class_permutation(classes, 19)
+        self.assertTrue(torch.equal(first, second))
+        self.assertTrue(torch.equal(classes[first], classes))
+        self.assertEqual(int(first[-1]), 6)
+
+    def test_affine_ridge_recovers_linear_correction_better_than_shuffle(self):
+        generator = torch.Generator().manual_seed(37)
+        x = torch.randn(768, 6, generator=generator)
+        weight = torch.randn(6, 6, generator=generator) * 0.25
+        bias = torch.randn(6, generator=generator) * 0.1
+        y = x @ weight + bias
+        classes = torch.arange(x.shape[0]) % 3
+        samples = CitySamples(x.half(), y.half(), classes)
+        moments = city_moments(samples, torch.device("cpu"), seed=41)
+        ridge = fit_affine_ridge(moments, 1e-4)
+        shuffled = fit_affine_ridge(moments, 1e-4, shuffled=True)
+        ridge_metrics = correction_prediction_metrics(ridge, samples)
+        shuffled_metrics = correction_prediction_metrics(shuffled, samples)
+        self.assertLess(ridge_metrics["relative_mse_to_zero"], 1e-4)
+        self.assertLess(
+            ridge_metrics["relative_mse_to_zero"],
+            shuffled_metrics["relative_mse_to_zero"],
+        )
+
+    def test_combine_moments_excludes_heldout_city(self):
+        def moments(value):
+            samples = CitySamples(
+                torch.full((4, 2), value),
+                torch.full((4, 2), value + 1),
+                torch.tensor([0, 0, 1, 1]),
+            )
+            return city_moments(samples, torch.device("cpu"), seed=3)
+
+        values = {"a": moments(1.0), "b": moments(2.0), "c": moments(3.0)}
+        combined = combine_moments(values, "b")
+        self.assertEqual(combined.n, 8)
+        self.assertTrue(torch.equal(combined.sum_x, values["a"].sum_x + values["c"].sum_x))
+
+    @staticmethod
+    def _metric_report(ridge_gain: float):
+        variants = {
+            "sar": {"mIoU": 0.50},
+            "full": {"mIoU": 0.60},
+            "oracle_alpha_0.25": {"mIoU": 0.51},
+            "ridge_alpha_0.25": {"mIoU": 0.50 + ridge_gain},
+            "shuffled_ridge_alpha_0.25": {"mIoU": 0.50},
+            "mean_alpha_0.25": {"mIoU": 0.50},
+        }
+        return {
+            "pooled": variants,
+            "by_city": {
+                f"city-{index}": {
+                    name: dict(metric) for name, metric in variants.items()
+                }
+                for index in range(7)
+            },
+        }
+
+    def test_decision_requires_pre_registered_effect_size(self):
+        passed = _performance_decision(self._metric_report(0.01))
+        failed = _performance_decision(self._metric_report(0.001))
+        self.assertTrue(passed["recoverability_supported"])
+        self.assertFalse(failed["recoverability_supported"])
 
 
 class GradientGeometryTest(unittest.TestCase):

@@ -56,6 +56,12 @@ the report if another task switches the shared checkout before completion.
 
 ## Question 2: SAR recoverability
 
+> **Superseded diagnostic.** This P5 probe belongs to the original v1 decision
+> tree. The completed oracle screen subsequently localized the useful causal
+> signal to post-FRM P2, while post-FRM P5 replacement was approximately null.
+> Therefore neither this P5 runner nor the old three-report analyzer is valid
+> for deciding the next intervention and must not be rerun for that purpose.
+
 `diagnose_earthmiss_sar_recoverability.py` freezes Run C and works on P5 cells
 with at least 75% native-pixel GT purity where canonical SAR is wrong. The
 target is whether the paired canonical Full state is correct. A fixed linear
@@ -110,11 +116,71 @@ The gradient runner also snapshots the repository HEAD before loading the model
 and refuses to write a report if another task switches the shared checkout before
 the diagnostic finishes.
 
-## Pre-registered route selection
+The completed formal audit found no released-path shared-gradient conflict under
+train-BN semantics: aggregate Adapter, aggregate FRM, and the FRM-P2 target
+subgraph all had positive median Full/SAR gradient cosine and zero sampled
+negative-cosine fraction. Eval-BN was more mixed, but the preserved V2 matched-BN
+recalibration had already reduced canonical SAR Val mIoU by `7.613 pp`; simple BN
+recalibration is therefore not reopened.
 
-`analyze_earthmiss_causal_diagnostics.py` accepts only the complete formal
+## Question 4: is the useful FRM-P2 correction SAR-predictable?
+
+`diagnose_earthmiss_frmp2_correction_recoverability.py` is the current decision
+experiment. It follows from two completed causal facts:
+
+- exact Full post-FRM P2 replacement improved canonical SAR Val by `8.1679 pp`;
+- partial replacement was monotonic, and `alpha=0.25` alone improved pooled Val
+  by `2.808 pp`, with all seven supported classes improving.
+
+Those interventions establish downstream utility, not deployability. The new
+diagnostic asks whether a correction in the useful direction can be predicted
+from SAR P2 alone.
+
+The Run C checkpoint and all MM-DINO parameters are frozen. On Train only, the
+runner selects 16 deterministic tiles from each of the seven cities, disables
+Train augmentation, and uses non-overlapping `512/512` crops. P2 cells with at
+least 75% native-pixel GT purity are sampled uniformly up to 64 cells per class
+per crop and capped at 2048 cells per class per city. GT is used only to define
+the sampling strata and shuffled control; it is not an input to the predictor.
+
+For every leave-one-city-out fold, a fixed affine `1x1` ridge map predicts
+`Full_P2 - SAR_P2` from canonical SAR post-FRM P2. Six cities fit the map and the
+seventh city is completely excluded from its moments. The predicted correction
+is multiplied by the already frozen `alpha=0.25`, added identically to the two
+equal canonical post-FRM P2 slots, and passed through the unchanged frozen
+SEFusion/PRN/head. Controls are:
+
+- zero correction (released canonical SAR);
+- the six-city global mean correction;
+- an equal-capacity ridge map whose targets are shuffled within each Train city
+  and GT class;
+- the exact paired Full-minus-SAR correction at `alpha=0.25`, which verifies that
+  the causal ceiling remains present on this held-out-Train subset.
+
+The ridge penalty (`1e-2`), sampling, correction alpha, and seed (`20260817`) are
+frozen by the CLI. A formal report requires 16 tiles per city and the cached/direct
+forward equivalence check. The runner constructs no optimizer, never populates
+parameter gradients, audits all BatchNorm buffers, and refuses to write if Git
+HEAD changes.
+
+Direct linear FRM-P2 correction is supported only when all gates pass:
+
+- exact oracle is at least `+0.25 pp` over SAR and nonnegative in at least 5/7
+  held-out cities;
+- ridge is at least `+0.25 pp` over SAR, shuffled ridge, and global mean;
+- ridge is nonnegative in at least 5/7 held-out cities against each comparator.
+
+Failure stops direct affine P2 correction; it does not authorize a nonlinear
+module. Success authorizes only a later bounded, capacity-controlled SAR-P2
+residual experiment. This probe is a diagnostic fit, not MM-DINO training, and
+its Train-subset mIoU is not an estimate of Val or Test performance.
+
+## Historical v1 route selection
+
+`analyze_earthmiss_causal_diagnostics.py` accepted only the complete formal
 oracle screen, formal recoverability report, and formal train/eval-BN gradient
-report from the same checkpoint.
+report from the same checkpoint. This table is retained as provenance but is
+superseded by Question 4 because its recoverability unit was P5.
 
 | Oracle useful | SAR recoverable | Shared conflict | Permitted interpretation |
 |---|---|---|---|
@@ -125,80 +191,38 @@ report from the same checkpoint.
 | yes | yes | yes | candidate protected SAR anchor + SAR-predictable compensation |
 | yes | yes | no | change transfer predictor/unit before rewriting shared path |
 
-## Server execution order
+## Current server execution order
 
-All commands are foreground commands. Smoke outputs and formal outputs use
-different paths and are never overwritten.
+Do not rerun the old P5 recoverability probe or old three-report analyzer. The
+current implementation requires only the Question 4 smoke and then its frozen
+formal Train-only run. Both commands are foreground commands and use distinct,
+non-overwritable outputs.
 
-### 0. Smoke all three paths
+### 0. Smoke the FRM-P2 path
 
 ```bash
 cd /root/my_MM-DINO
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate mm-dino
 
-python scripts/diagnose_earthmiss_oracle_intervention.py \
+python scripts/diagnose_earthmiss_frmp2_correction_recoverability.py \
   --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --smoke-tiles 2 \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/smoke-oracle.json
-
-python scripts/diagnose_earthmiss_gradient_conflict.py \
-  --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --batches-per-city 1 \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/smoke-gradients.json
-
-python scripts/diagnose_earthmiss_sar_recoverability.py \
-  --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --train-tiles-per-city 2 \
-  --val-tiles 6 \
-  --max-examples 5000 \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/smoke-recoverability.json
+  --tiles-per-city 1 \
+  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/smoke-frmp2-correction-recoverability.json
 ```
 
-### 1. Formal oracle screen
+The smoke report must have `formal=false`; it validates execution only and must
+not be interpreted scientifically.
+
+### 1. Formal leave-one-city-out diagnostic
 
 ```bash
 cd /root/my_MM-DINO
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate mm-dino
-python scripts/diagnose_earthmiss_oracle_intervention.py \
+python scripts/diagnose_earthmiss_frmp2_correction_recoverability.py \
   --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-val-oracle-screen.json
-```
-
-### 2. Formal shared-gradient audit
-
-```bash
-cd /root/my_MM-DINO
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate mm-dino
-python scripts/diagnose_earthmiss_gradient_conflict.py \
-  --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-train-gradient-conflict.json
-```
-
-### 3. Formal SAR recoverability probe
-
-```bash
-cd /root/my_MM-DINO
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate mm-dino
-python scripts/diagnose_earthmiss_sar_recoverability.py \
-  --checkpoint /root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe/run_c_seed42/best_sar.pth \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-sar-p5-recoverability.json
-```
-
-### 4. Apply the frozen decision tree
-
-```bash
-cd /root/my_MM-DINO
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate mm-dino
-python scripts/analyze_earthmiss_causal_diagnostics.py \
-  --oracle /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-val-oracle-screen.json \
-  --recoverability /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-sar-p5-recoverability.json \
-  --gradients /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-train-gradient-conflict.json \
-  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-causal-decision.json
+  --output /root/autodl-tmp/mm-dino/outputs/earthmiss-causal-diagnostics/run-c-e15-train-frmp2-correction-recoverability.json
 ```
 
 No command in this protocol reads EarthMiss Test or starts MM-DINO training.
