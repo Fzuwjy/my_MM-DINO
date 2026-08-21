@@ -1,15 +1,16 @@
-"""Train task-aligned WHU-OPT-SAR missing-modality MM-DINO baselines.
+"""Train the WHU-OPT-SAR normalization-by-state-ratio baseline matrix.
 
 The external task contract is optical+SAR available for training and SAR-only
 deployment.  Run A is a SAR-only lower bound, Run B is naive Full-to-SAR, and
-Run C uses homogeneous 50/50 Full/SAR batches.  All runs use the published
-80/20 WHU split and fixed-epoch Test reporting without Test-based checkpoint
-selection.
+Run C uses homogeneous stochastic Full/SAR batches at an explicit probability.
+Decoder normalization is released BN or opt-in GN.  All runs use the published
+80/20 WHU split and fixed-epoch Test reporting without Test-based selection.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -32,6 +33,12 @@ from losses import DiceLoss, JointLoss, SoftCrossEntropyLoss  # noqa: E402
 from models.MMDINO.availability import canonical_availability  # noqa: E402
 from models.MMDINO.dino_segment import build_model  # noqa: E402
 from utils.inference import slide_inference  # noqa: E402
+from scripts.missing_modality_factorial import (  # noqa: E402
+    DECODER_NORMALIZATION_CHOICES,
+    experiment_slug,
+    resolve_full_probability,
+    train_state as factorial_train_state,
+)
 from utils.pooled_segmentation_metrics import (  # noqa: E402
     PooledSegmentationMetrics,
 )
@@ -43,7 +50,7 @@ DEFAULT_WEIGHTS = (
     "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
 DEFAULT_OUTPUT_ROOT = (
-    "/root/autodl-tmp/mm-dino/outputs/whu-missing-baseline-nirrg"
+    "/root/autodl-tmp/mm-dino/outputs/whu-norm-ratio-v1"
 )
 CLASS_NAMES = (
     "Farmland",
@@ -56,7 +63,7 @@ CLASS_NAMES = (
 )
 NUM_CLASSES = len(CLASS_NAMES)
 IGNORE_INDEX = NUM_CLASSES
-PROTOCOL_REVISION = "whu_missing_baseline_nirrg_v1"
+PROTOCOL_REVISION = "whu_norm_ratio_factorial_v1"
 
 
 def parse_epoch_set(value):
@@ -83,6 +90,18 @@ def parse_args(argv=None):
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--decoder-normalization",
+        choices=DECODER_NORMALIZATION_CHOICES,
+        default="batchnorm",
+    )
+    parser.add_argument("--decoder-groupnorm-groups", type=int, default=32)
+    parser.add_argument(
+        "--full-probability",
+        type=float,
+        default=None,
+        help="Probability of a homogeneous Full batch; A=0, B=1, C in (0,1).",
+    )
     parser.add_argument(
         "--eval-epochs", type=parse_epoch_set, default=(50,)
     )
@@ -113,12 +132,8 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def train_state(run, state_rng):
-    if run == "A":
-        return "sar"
-    if run == "B":
-        return "full"
-    return "sar" if state_rng.random() < 0.5 else "full"
+def train_state(run, state_rng, full_probability=None):
+    return factorial_train_state(run, state_rng, full_probability)
 
 
 def prepare_training_label(label, device):
@@ -172,16 +187,18 @@ def build_loaders(args):
 
 
 def build_metadata(args, train_dataset, test_dataset, train_loader):
+    full_probability = resolve_full_probability(args.run, args.full_probability)
     return {
         "protocol_revision": PROTOCOL_REVISION,
         "run": args.run,
         "seed": args.seed,
         "task_contract": {"train": "S+O allowed", "deployment": "S only"},
         "train_policy": {
-            "A": "SAR-only lower bound",
-            "B": "Full-only training, SAR deployment",
-            "C": "batchwise 50/50 Full-SAR, SAR deployment",
-        }[args.run],
+            "sampling_unit": "homogeneous_batch",
+            "full_probability": full_probability,
+            "sar_probability": 1.0 - full_probability,
+            "fixed_total_optimizer_steps": True,
+        },
         "data": {
             "dataset": "WHU-OPT-SAR",
             "split": "published 80 train / 20 test original scenes",
@@ -199,6 +216,9 @@ def build_metadata(args, train_dataset, test_dataset, train_loader):
             "num_modalities": 2,
             "canonical_slots": ["optical", "sar"],
             "segmentation_head": "raw_conv1x1",
+            "decoder_normalization": args.decoder_normalization,
+            "decoder_groupnorm_groups": args.decoder_groupnorm_groups,
+            "normalization_scope": "trainable Decoder only; frozen DINO LayerNorm unchanged",
         },
         "normalization": {
             "optical": "ImageNet channel constants after NIR-R-G selection",
@@ -223,6 +243,7 @@ def build_metadata(args, train_dataset, test_dataset, train_loader):
             "persistent_train_workers": args.num_workers > 0,
             "steps_per_epoch": len(train_loader),
             "planned_optimizer_steps": len(train_loader) * args.epochs,
+            "normalization_ratio_arms_share_total_steps": True,
         },
         "evaluation": {
             "split": "published 20-scene Test",
@@ -387,6 +408,9 @@ def main(argv=None):
         raise ValueError("--cache-size must be positive and --num-workers non-negative")
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be positive")
+    if args.decoder_groupnorm_groups <= 0:
+        raise ValueError("--decoder-groupnorm-groups must be positive")
+    resolve_full_probability(args.run, args.full_probability)
     if max(args.eval_epochs + args.checkpoint_epochs) > args.epochs:
         raise ValueError("eval/checkpoint epochs cannot exceed --epochs")
     if args.epochs not in args.eval_epochs or args.epochs not in args.checkpoint_epochs:
@@ -423,6 +447,8 @@ def main(argv=None):
         r=3,
         num_modalities=2,
         raw_logits=True,
+        decoder_normalization=args.decoder_normalization,
+        decoder_groupnorm_groups=args.decoder_groupnorm_groups,
     ).to(device)
     criterion = JointLoss(
         SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=IGNORE_INDEX),
@@ -442,13 +468,21 @@ def main(argv=None):
         smoke_training_paths(model, train_loader, criterion, device)
         return
 
-    output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
+    output_dir = Path(args.output_root) / experiment_slug(
+        args.run,
+        args.decoder_normalization,
+        args.full_probability,
+        args.seed,
+    )
     last_path = output_dir / "last.pth"
     metrics_path = output_dir / "metrics.jsonl"
     if not args.resume and (last_path.exists() or metrics_path.exists()):
         raise FileExistsError(f"Refusing to overwrite existing run: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = build_metadata(args, train_dataset, test_dataset, train_loader)
+    metadata["model"]["decoder_normalization_manifest"] = (
+        model.decoder_normalization_manifest
+    )
     start_epoch = 1
 
     if args.resume:
@@ -471,11 +505,13 @@ def main(argv=None):
         loss_sum = 0.0
         batch_count = 0
         state_batches = {"sar": 0, "full": 0}
+        state_trace = []
         for optical, sar, label in tqdm(
             train_loader, desc=f"Epoch {epoch}/{args.epochs}"
         ):
-            state = train_state(args.run, state_rng)
+            state = train_state(args.run, state_rng, args.full_probability)
             state_batches[state] += 1
+            state_trace.append("S" if state == "sar" else "F")
             optical = optical.to(device, non_blocking=True)
             sar = sar.to(device, non_blocking=True)
             label = prepare_training_label(label, device)
@@ -498,6 +534,9 @@ def main(argv=None):
             "train_loss": loss_sum / batch_count,
             "learning_rate": optimizer.param_groups[0]["lr"],
             "state_batches": state_batches,
+            "state_trace_sha256": hashlib.sha256(
+                "".join(state_trace).encode("ascii")
+            ).hexdigest(),
         }
         if epoch in args.eval_epochs:
             record["sar_test"] = evaluate(

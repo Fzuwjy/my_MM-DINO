@@ -182,6 +182,12 @@ def _default_output_path(checkpoint_path, split):
 def _validate_checkpoint(checkpoint, args):
     role = checkpoint.get("checkpoint_role", "unregistered")
     selection_state = checkpoint.get("selection_state")
+    protocol = checkpoint.get("protocol", {})
+    fixed_factorial_primary = (
+        protocol.get("protocol_revision") == "earthmiss_norm_ratio_factorial_v1"
+        and role == "fixed_final_primary"
+        and int(checkpoint.get("epoch", -1)) == int(protocol.get("epochs", -2))
+    )
     if args.split == "test" and not args.allow_non_primary_test_checkpoint:
         if getattr(args, "bn_bank", None):
             if role != BN_BANK_CHECKPOINT_ROLE:
@@ -189,13 +195,15 @@ def _validate_checkpoint(checkpoint, args):
                     "BN-bank Test evaluation requires the fixed V2 checkpoint "
                     f"tagged {BN_BANK_CHECKPOINT_ROLE}; got {role!r}"
                 )
-        elif role != "primary_deployment" or selection_state != "sar":
+        elif not fixed_factorial_primary and (
+            role != "primary_deployment" or selection_state != "sar"
+        ):
             raise ValueError(
-                "External Test comparison requires a primary_deployment checkpoint "
-                "selected on SAR Val mIoU (best_sar.pth); use "
+                "External Test comparison requires a registered primary checkpoint "
+                "(historical primary_deployment SAR-Val selection or fixed-final "
+                "factorial); use "
                 "--allow-non-primary-test-checkpoint only for explicit diagnostics"
             )
-    protocol = checkpoint.get("protocol", {})
     evaluation = protocol.get("evaluation", {})
     if evaluation.get("checkpoint_selection_support") != "pooled_gt_present":
         raise ValueError("Checkpoint predates the fixed EarthMiss selection metric")
@@ -286,6 +294,7 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     _validate_checkpoint(checkpoint, args)
     raw_logits = _checkpoint_uses_raw_logits(checkpoint)
+    model_protocol = checkpoint.get("protocol", {}).get("model", {})
     dataset, loader = build_loader(args)
 
     device = torch.device("cuda")
@@ -299,6 +308,12 @@ def main():
         r=3,
         num_modalities=2,
         raw_logits=raw_logits,
+        decoder_normalization=model_protocol.get(
+            "decoder_normalization", "batchnorm"
+        ),
+        decoder_groupnorm_groups=model_protocol.get(
+            "decoder_groupnorm_groups", 32
+        ),
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
@@ -335,7 +350,9 @@ def main():
         "bn_bank": bn_bank_record,
         "fair_comparison_contract": {
             "same_checkpoint_for_all_endpoints": True,
-            "internal_selection": "Val pooled_gt_present mIoU",
+            "internal_selection": checkpoint.get("protocol", {})
+            .get("evaluation", {})
+            .get("checkpoint_selection_metric", "Val pooled_gt_present mIoU"),
             "external_comparison": "Test official_ever_mIoU fixed_all_8_classes",
             "rgb_normalization": {
                 "policy": dataset.rgb_normalization,

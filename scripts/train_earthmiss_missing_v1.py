@@ -1,13 +1,16 @@
-"""Train the three EarthMiss missing-modality V1 baselines.
+"""Train the EarthMiss normalization-by-state-ratio baseline matrix.
 
 Run A trains with SAR only, Run B trains with both modalities, and Run C uses
-homogeneous 50/50 Full/SAR batches. Validation is city-held-out EarthMiss Val.
-This launcher is intentionally single-GPU and foreground-only.
+homogeneous stochastic Full/SAR batches at an explicit probability.  Decoder
+normalization is released BN or opt-in GN.  Validation is retained as a
+trajectory diagnostic; fixed E50 is primary.  This launcher is single-GPU and
+foreground-only.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -30,6 +33,12 @@ from models.MMDINO.availability import canonical_availability  # noqa: E402
 from models.MMDINO.dino_segment import build_model  # noqa: E402
 from utils.earthmiss_metrics import EarthMissMetrics  # noqa: E402
 from utils.inference import slide_inference  # noqa: E402
+from scripts.missing_modality_factorial import (  # noqa: E402
+    DECODER_NORMALIZATION_CHOICES,
+    experiment_slug,
+    resolve_full_probability,
+    train_state as factorial_train_state,
+)
 
 
 DEFAULT_DATASET_ROOT = "/root/autodl-tmp/mm-dino/datasets/EarthMiss"
@@ -38,10 +47,10 @@ DEFAULT_WEIGHTS = (
     "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
 DEFAULT_OUTPUT_ROOT = (
-    "/root/autodl-tmp/mm-dino/outputs/earthmiss-missing-v1-cache-safe"
+    "/root/autodl-tmp/mm-dino/outputs/earthmiss-norm-ratio-v1"
 )
 VAL_SELECTION_CLASS_IDS = list(range(7))
-PROTOCOL_REVISION = "earthmiss_missing_v1_val_patience_v4"
+PROTOCOL_REVISION = "earthmiss_norm_ratio_factorial_v1"
 
 
 def parse_args():
@@ -56,6 +65,18 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--decoder-normalization",
+        choices=DECODER_NORMALIZATION_CHOICES,
+        default="batchnorm",
+    )
+    parser.add_argument("--decoder-groupnorm-groups", type=int, default=32)
+    parser.add_argument(
+        "--full-probability",
+        type=float,
+        default=None,
+        help="Probability of a homogeneous Full batch; A=0, B=1, C in (0,1).",
+    )
     parser.add_argument("--eval-interval", type=int, default=5)
     parser.add_argument(
         "--early-stop-patience-evals",
@@ -67,6 +88,11 @@ def parse_args():
         ),
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--smoke-only",
+        action="store_true",
+        help="Run one real batch through SAR and Full forward/backward paths.",
+    )
     parser.add_argument(
         "--audit-only",
         action="store_true",
@@ -116,12 +142,8 @@ def build_loaders(args):
     return train_dataset, val_dataset, train_loader, val_loader
 
 
-def train_state(run, state_rng):
-    if run == "A":
-        return "sar"
-    if run == "B":
-        return "full"
-    return "sar" if state_rng.random() < 0.5 else "full"
+def train_state(run, state_rng, full_probability=None):
+    return factorial_train_state(run, state_rng, full_probability)
 
 
 def validation_states(run):
@@ -139,8 +161,12 @@ def update_early_stopping_state(state, *, improved, epoch):
 
 
 def build_run_metadata(args, train_dataset, val_dataset, train_loader):
+    full_probability = resolve_full_probability(args.run, args.full_probability)
     steps_per_epoch = len(train_loader)
-    checkpoint_roles = {"best_sar.pth": "primary_deployment"}
+    checkpoint_roles = {
+        f"epoch_{args.epochs}.pth": "fixed_final_primary",
+        "best_sar.pth": "val_selection_diagnostic",
+    }
     if args.run != "A":
         checkpoint_roles["best_full.pth"] = "diagnostic_only"
     return {
@@ -152,12 +178,18 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
         "window_size": args.window_size,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
-        "train_policy": {"A": "sar", "B": "full", "C": "50/50 full-sar"}[
-            args.run
-        ],
+        "train_policy": {
+            "sampling_unit": "homogeneous_batch",
+            "full_probability": full_probability,
+            "sar_probability": 1.0 - full_probability,
+            "fixed_total_optimizer_steps": True,
+        },
         "model": {
             "segmentation_head": "raw_conv1x1",
             "released_segmentation_head": "conv_bn_relu",
+            "decoder_normalization": args.decoder_normalization,
+            "decoder_groupnorm_groups": args.decoder_groupnorm_groups,
+            "normalization_scope": "trainable Decoder only; frozen DINO LayerNorm unchanged",
         },
         "augmentation": {
             "random_crop": [args.window_size, args.window_size],
@@ -186,9 +218,10 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
             "steps_per_epoch": steps_per_epoch,
             "planned_optimizer_steps": steps_per_epoch * args.epochs,
             "checkpoint_unit": "epoch",
+            "normalization_ratio_arms_share_total_steps": True,
         },
         "evaluation": {
-            "checkpoint_selection_metric": "mIoU",
+            "checkpoint_selection_metric": "fixed_final_epoch",
             "checkpoint_selection_support": "pooled_gt_present",
             "selection_split": "val_city_holdout",
             "expected_val_selection_class_ids": VAL_SELECTION_CLASS_IDS,
@@ -197,6 +230,7 @@ def build_run_metadata(args, train_dataset, val_dataset, train_loader):
             "external_comparison_split": "test_city_holdout",
             "checkpoint_roles": checkpoint_roles,
             "paired_endpoint_rule": "same_checkpoint_and_epoch",
+            "val_best_is_diagnostic_only": True,
         },
         "early_stopping": {
             "selection_state": "sar",
@@ -308,14 +342,48 @@ def audit_datasets(train_dataset, val_dataset):
     print(json.dumps(summary, indent=2))
 
 
+def smoke_training_paths(model, loader, criterion, device):
+    model.train()
+    rgb, sar, label = next(iter(loader))
+    rgb = rgb.to(device, non_blocking=True)
+    sar = sar.to(device, non_blocking=True)
+    label = label.to(device, dtype=torch.long, non_blocking=True)
+    result = {"paths": {}}
+    for state in ("sar", "full"):
+        model.zero_grad(set_to_none=True)
+        availability = canonical_availability(
+            state, batch_size=rgb.shape[0], device=device
+        )
+        logits = model(rgb, sar, availability=availability)
+        loss = criterion(logits, label)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite {state} smoke loss")
+        loss.backward()
+        result["paths"][state] = {
+            "logits_shape": list(logits.shape),
+            "loss": float(loss.detach()),
+        }
+    result["decoder_normalization_manifest"] = (
+        model.decoder_normalization_manifest
+    )
+    print(json.dumps(result, indent=2))
+
+
 def main():
     args = parse_args()
+    if args.audit_only and args.smoke_only:
+        raise ValueError("--audit-only and --smoke-only are mutually exclusive")
     if args.window_size <= 0 or args.window_size % 16:
         raise ValueError("--window-size must be a positive multiple of 16")
     if args.epochs <= 0 or args.eval_interval <= 0:
         raise ValueError("--epochs and --eval-interval must be positive")
     if args.early_stop_patience_evals < 0:
         raise ValueError("--early-stop-patience-evals must be non-negative")
+    if args.early_stop_patience_evals != 0:
+        raise ValueError("the fixed-budget normalization-ratio protocol disables early stopping")
+    if args.decoder_groupnorm_groups <= 0:
+        raise ValueError("--decoder-groupnorm-groups must be positive")
+    resolve_full_probability(args.run, args.full_probability)
 
     seed_everything(args.seed)
     train_dataset, val_dataset, train_loader, val_loader = build_loaders(args)
@@ -328,12 +396,18 @@ def main():
     if not weights_path.is_file():
         raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
 
-    output_dir = Path(args.output_root) / f"run_{args.run.lower()}_seed{args.seed}"
+    output_dir = Path(args.output_root) / experiment_slug(
+        args.run,
+        args.decoder_normalization,
+        args.full_probability,
+        args.seed,
+    )
     existing_artifacts = (
         output_dir / "metrics.jsonl",
         output_dir / "last.pth",
         output_dir / "best_sar.pth",
         output_dir / "best_full.pth",
+        output_dir / f"epoch_{args.epochs}.pth",
     )
     if not args.resume and any(path.exists() for path in existing_artifacts):
         raise FileExistsError(
@@ -354,6 +428,8 @@ def main():
         r=3,
         num_modalities=2,
         raw_logits=True,
+        decoder_normalization=args.decoder_normalization,
+        decoder_groupnorm_groups=args.decoder_groupnorm_groups,
     ).to(device)
     criterion = JointLoss(
         SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=8),
@@ -369,10 +445,16 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-7
     )
+    if args.smoke_only:
+        smoke_training_paths(model, train_loader, criterion, device)
+        return
     start_epoch = 1
     best = {state: float("-inf") for state in validation_states(args.run)}
     early_stopping_state = {"bad_validation_count": 0, "best_epoch": None}
     metadata = build_run_metadata(args, train_dataset, val_dataset, train_loader)
+    metadata["model"]["decoder_normalization_manifest"] = (
+        model.decoder_normalization_manifest
+    )
 
     if args.resume:
         checkpoint = torch.load(last_checkpoint, map_location=device)
@@ -405,8 +487,12 @@ def main():
         state_rng = random.Random(args.seed * 100_000 + epoch)
         loss_sum = 0.0
         batch_count = 0
+        state_batches = {"sar": 0, "full": 0}
+        state_trace = []
         for rgb, sar, label in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"):
-            state = train_state(args.run, state_rng)
+            state = train_state(args.run, state_rng, args.full_probability)
+            state_batches[state] += 1
+            state_trace.append("S" if state == "sar" else "F")
             rgb = rgb.to(device, non_blocking=True)
             sar = sar.to(device, non_blocking=True)
             label = label.to(device, non_blocking=True)
@@ -426,6 +512,10 @@ def main():
             "epoch": epoch,
             "train_loss": loss_sum / batch_count,
             "learning_rate": optimizer.param_groups[0]["lr"],
+            "state_batches": state_batches,
+            "state_trace_sha256": hashlib.sha256(
+                "".join(state_trace).encode("ascii")
+            ).hexdigest(),
         }
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
             for state in validation_states(args.run):
@@ -456,7 +546,7 @@ def main():
                         best,
                         metadata,
                         checkpoint_role=(
-                            "primary_deployment"
+                            "val_selection_diagnostic"
                             if state == "sar"
                             else "diagnostic_only"
                         ),
@@ -487,6 +577,18 @@ def main():
             checkpoint_role="resume_only",
             early_stopping_state=early_stopping_state,
         )
+        if epoch == args.epochs:
+            save_checkpoint(
+                output_dir / f"epoch_{epoch}.pth",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best,
+                metadata,
+                checkpoint_role="fixed_final_primary",
+                early_stopping_state=early_stopping_state,
+            )
         print(json.dumps(record))
         if record.get("early_stopping", {}).get("stop", False):
             print(

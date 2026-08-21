@@ -6,7 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .linear_decoder import LinearHead
-from .Decoder import Decoder, Decoder_FRM, Decoder_PRN, Decoder_MMFF, Decoder_FRM_MMFF, Decoder_PRN_MMFF, Decoder_FRM_PRN
+from .Decoder import (
+    Decoder,
+    Decoder_FRM,
+    Decoder_PRN,
+    Decoder_MMFF,
+    Decoder_FRM_MMFF,
+    Decoder_PRN_MMFF,
+    Decoder_FRM_PRN,
+    configure_decoder_normalization,
+)
 from .sample_adapter import SampleAdapter
 from .availability import active_modality_indices
 from .lora import LoRA
@@ -60,6 +69,8 @@ class DINOSegmentModule(nn.Module):
         use_sar_logit_residual: bool = False,
         sar_logit_residual_seed: int = 0,
         sar_logit_residual_channels: int = 64,
+        decoder_normalization: str = "batchnorm",
+        decoder_groupnorm_groups: int = 32,
     ):
         super().__init__()
 
@@ -147,6 +158,12 @@ class DINOSegmentModule(nn.Module):
             self.decoder = Decoder_FRM_PRN(**decoder_kwargs)
         else:
             raise ValueError(f"Unknown decoder type: {decoder_type}")
+
+        self.decoder_normalization_manifest = configure_decoder_normalization(
+            self.decoder,
+            decoder_normalization,
+            decoder_groupnorm_groups,
+        )
 
         # Add LoRA layers to the encoder
         self.use_lora = use_lora

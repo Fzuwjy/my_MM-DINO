@@ -1,6 +1,91 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+DECODER_NORMALIZATIONS = ("batchnorm", "groupnorm")
+
+
+def configure_decoder_normalization(
+    decoder: nn.Module,
+    normalization: str = "batchnorm",
+    groupnorm_groups: int = 32,
+) -> dict:
+    """Configure Decoder normalization without changing the released default.
+
+    ``batchnorm`` is a strict no-op.  ``groupnorm`` replaces only standard
+    ``BatchNorm2d`` modules already present below the Decoder.  The largest
+    divisor shared by the requested group count and the channel count is used,
+    which is exactly 32 for every BN in the released raw-logit Decoder.
+    """
+
+    normalization = str(normalization).lower()
+    if normalization not in DECODER_NORMALIZATIONS:
+        raise ValueError(
+            f"decoder normalization must be one of {DECODER_NORMALIZATIONS}, "
+            f"got {normalization!r}"
+        )
+    if groupnorm_groups <= 0:
+        raise ValueError("groupnorm_groups must be positive")
+
+    batchnorm_modules = [
+        module for module in decoder.modules() if isinstance(module, nn.BatchNorm2d)
+    ]
+    manifest = {
+        "policy": normalization,
+        "source_batchnorm_count": len(batchnorm_modules),
+        "requested_groupnorm_groups": int(groupnorm_groups),
+        "group_counts": {},
+    }
+    if normalization == "batchnorm":
+        manifest["result_batchnorm_count"] = len(batchnorm_modules)
+        manifest["result_groupnorm_count"] = 0
+        decoder.decoder_normalization = normalization
+        decoder.decoder_normalization_manifest = manifest
+        return manifest
+
+    group_counts: dict[str, int] = {}
+
+    def replace(module: nn.Module, prefix: str = "") -> None:
+        for name, child in list(module.named_children()):
+            qualified_name = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, nn.BatchNorm2d):
+                groups = math.gcd(int(groupnorm_groups), int(child.num_features))
+                replacement = nn.GroupNorm(
+                    groups,
+                    child.num_features,
+                    eps=child.eps,
+                    affine=child.affine,
+                )
+                if child.affine:
+                    replacement = replacement.to(
+                        device=child.weight.device, dtype=child.weight.dtype
+                    )
+                    with torch.no_grad():
+                        replacement.weight.copy_(child.weight)
+                        replacement.bias.copy_(child.bias)
+                setattr(module, name, replacement)
+                group_counts[qualified_name] = groups
+            else:
+                replace(child, qualified_name)
+
+    replace(decoder)
+    manifest["group_counts"] = group_counts
+    manifest["result_batchnorm_count"] = sum(
+        isinstance(module, nn.BatchNorm2d) for module in decoder.modules()
+    )
+    manifest["result_groupnorm_count"] = sum(
+        isinstance(module, nn.GroupNorm) for module in decoder.modules()
+    )
+    if manifest["result_batchnorm_count"] != 0:
+        raise RuntimeError("GroupNorm conversion left Decoder BatchNorm modules")
+    if manifest["result_groupnorm_count"] != len(batchnorm_modules):
+        raise RuntimeError("GroupNorm conversion changed the normalization count")
+    decoder.decoder_normalization = normalization
+    decoder.decoder_normalization_manifest = manifest
+    return manifest
 
 
 class ConvBNReLU(nn.Sequential):

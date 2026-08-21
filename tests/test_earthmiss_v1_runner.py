@@ -49,6 +49,9 @@ class EarthMissV1RunnerTest(unittest.TestCase):
             epochs=50,
             eval_interval=5,
             early_stop_patience_evals=3,
+            full_probability=0.5,
+            decoder_normalization="batchnorm",
+            decoder_groupnorm_groups=32,
         )
         train_dataset = MagicMock()
         train_dataset.__len__.return_value = 2641
@@ -75,6 +78,9 @@ class EarthMissV1RunnerTest(unittest.TestCase):
             {
                 "segmentation_head": "raw_conv1x1",
                 "released_segmentation_head": "conv_bn_relu",
+                "decoder_normalization": "batchnorm",
+                "decoder_groupnorm_groups": 32,
+                "normalization_scope": "trainable Decoder only; frozen DINO LayerNorm unchanged",
             },
         )
         self.assertEqual(
@@ -84,6 +90,7 @@ class EarthMissV1RunnerTest(unittest.TestCase):
                 "steps_per_epoch": 331,
                 "planned_optimizer_steps": 16550,
                 "checkpoint_unit": "epoch",
+                "normalization_ratio_arms_share_total_steps": True,
             },
         )
         self.assertEqual(
@@ -96,7 +103,7 @@ class EarthMissV1RunnerTest(unittest.TestCase):
         self.assertEqual(
             metadata["evaluation"],
             {
-                "checkpoint_selection_metric": "mIoU",
+                "checkpoint_selection_metric": "fixed_final_epoch",
                 "checkpoint_selection_support": "pooled_gt_present",
                 "selection_split": "val_city_holdout",
                 "expected_val_selection_class_ids": list(range(7)),
@@ -104,10 +111,12 @@ class EarthMissV1RunnerTest(unittest.TestCase):
                 "external_comparison_support": "fixed_all_8_classes",
                 "external_comparison_split": "test_city_holdout",
                 "checkpoint_roles": {
-                    "best_sar.pth": "primary_deployment",
+                    "epoch_50.pth": "fixed_final_primary",
+                    "best_sar.pth": "val_selection_diagnostic",
                     "best_full.pth": "diagnostic_only",
                 },
                 "paired_endpoint_rule": "same_checkpoint_and_epoch",
+                "val_best_is_diagnostic_only": True,
             },
         )
         self.assertEqual(
@@ -178,6 +187,28 @@ class EarthMissV1RunnerTest(unittest.TestCase):
         checkpoint["checkpoint_role"] = "primary_deployment"
         checkpoint["selection_state"] = "sar"
         _validate_checkpoint(checkpoint, args)
+
+    def test_external_test_accepts_registered_fixed_final_factorial_checkpoint(self):
+        checkpoint = {
+            "checkpoint_role": "fixed_final_primary",
+            "epoch": 50,
+            "selection_state": None,
+            "protocol": {
+                "protocol_revision": "earthmiss_norm_ratio_factorial_v1",
+                "epochs": 50,
+                "evaluation": {
+                    "checkpoint_selection_support": "pooled_gt_present"
+                },
+            },
+        }
+        args = SimpleNamespace(
+            split="test", allow_non_primary_test_checkpoint=False
+        )
+        _validate_checkpoint(checkpoint, args)
+
+        checkpoint["epoch"] = 45
+        with self.assertRaisesRegex(ValueError, "registered primary"):
+            _validate_checkpoint(checkpoint, args)
 
     def test_ground_truth_support_audit_ignores_no_data(self):
         dataset = MagicMock()
