@@ -206,6 +206,18 @@ class FaithfulWhuContractTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cache_capacity_from_environment({CACHE_CAPACITY_ENV: invalid})
 
+    def test_table3_vitl_multi_launcher_locks_released_target(self):
+        launcher = (
+            REPO_ROOT / "scripts" / "run_whu_vitl_multi_table3.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("MM_DINO_WHU_CACHE_CAPACITY=32", launcher)
+        self.assertIn("--num-modalities 2", launcher)
+        self.assertIn("--backbone-type dinov3_vitl16", launcher)
+        self.assertIn("--master_addr=127.0.0.1", launcher)
+        self.assertIn("--preflight-only", launcher)
+        self.assertNotIn("--use-lora", launcher)
+        self.assertNotIn("--amp", launcher)
+
 
 if __name__ == "__main__":
     unittest.main()
