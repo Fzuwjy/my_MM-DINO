@@ -215,6 +215,12 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn("--backbone-type dinov3_vitl16", launcher)
         self.assertIn("--master_addr=127.0.0.1", launcher)
         self.assertIn("--preflight-only", launcher)
+        self.assertIn("--smoke-only", launcher)
+        self.assertIn("--phase train", launcher)
+        self.assertIn("--batch-size 8", launcher)
+        self.assertIn("--phase eval", launcher)
+        self.assertIn("--inference-batch-size 32", launcher)
+        self.assertIn("smoke=PASSED", launcher)
         self.assertNotIn("--use-lora", launcher)
         self.assertNotIn("--amp", launcher)
 

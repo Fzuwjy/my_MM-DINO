@@ -19,13 +19,14 @@ MASTER_PORT="${MASTER_PORT:-29551}"
 REQUIRED_BASE_COMMIT="a1a5c9985dae5e72741dab3d6676b7f5626278f6"
 
 usage() {
-    printf 'Usage: %s [--preflight-only]\n' "$0"
+    printf 'Usage: %s [--preflight-only|--smoke-only]\n' "$0"
 }
 
 mode="run"
 case "${1:-}" in
     "") ;;
     --preflight-only) mode="preflight" ;;
+    --smoke-only) mode="smoke" ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -66,6 +67,9 @@ ensure_link() {
 [[ -d "$DATA_ROOT" ]] || fail "WHU dataset is missing: $DATA_ROOT"
 [[ -s "$WEIGHTS_ROOT/$BACKBONE" ]] || fail "backbone is missing: $WEIGHTS_ROOT/$BACKBONE"
 [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]] || fail "Conda hook is missing"
+[[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || fail "MASTER_PORT must be an integer"
+(( MASTER_PORT > 1024 && MASTER_PORT < 65534 )) || \
+    fail "MASTER_PORT must be between 1025 and 65533"
 
 mkdir -p "$OUTPUT_ROOT/launcher-logs" "$RUNTIME_DEPS" "$WHEEL_ROOT"
 launch_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -139,6 +143,88 @@ printf 'torch_home=%s\n' "$TORCH_HOME"
 printf 'preflight=PASSED\n'
 
 if [[ "$mode" == "preflight" ]]; then
+    exit 0
+fi
+
+run_smoke_stage() {
+    local stage="$1"
+    local stage_log="$2"
+    shift 2
+    printf 'smoke_stage=%s\n' "$stage"
+    printf 'smoke_command='
+    printf ' %q' "$@"
+    printf '\n'
+    set +e
+    "$@" 2>&1 | tee "$stage_log"
+    local status="${PIPESTATUS[0]}"
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+        printf 'SMOKE_ERROR: stage=%s exit_code=%s log=%s\n' \
+            "$stage" "$status" "$stage_log" >&2
+        exit "$status"
+    fi
+}
+
+assert_peak_below() {
+    local name="$1"
+    local value="$2"
+    local limit="$3"
+    [[ -n "$value" ]] || fail "missing $name peak-memory measurement"
+    python -c \
+        'import sys; value=float(sys.argv[1]); limit=float(sys.argv[2]); assert value < limit, f"peak {value} GiB is not below {limit} GiB"' \
+        "$value" "$limit"
+}
+
+if [[ "$mode" == "smoke" ]]; then
+    smoke_root="$OUTPUT_ROOT/smoke-logs/${launch_stamp}_host-$(hostname)_pid-$$"
+    mkdir -p "$smoke_root"
+    train_log="$smoke_root/train_batch8.log"
+    eval_log="$smoke_root/eval_batch32.log"
+
+    train_command=(
+        torchrun
+        --nnodes=1
+        --node_rank=0
+        --nproc_per_node=1
+        --master_addr=127.0.0.1
+        --master_port="$MASTER_PORT"
+        scripts/probe_official_whu_memory.py
+        --phase train
+        --backbone-type dinov3_vitl16
+        --batch-size 8
+        --grad-accum-steps 1
+        --inference-batch-size 32
+    )
+    run_smoke_stage train_batch8 "$train_log" "${train_command[@]}"
+    grep -q '^train_effective_batch_size=8$' "$train_log" || \
+        fail "training smoke did not preserve effective batch 8"
+    train_peak="$(sed -n 's/^train_peak_reserved_gib=//p' "$train_log" | tail -n 1)"
+    assert_peak_below train_reserved "$train_peak" 21.0
+
+    eval_command=(
+        torchrun
+        --nnodes=1
+        --node_rank=0
+        --nproc_per_node=1
+        --master_addr=127.0.0.1
+        --master_port="$((MASTER_PORT + 1))"
+        scripts/probe_official_whu_memory.py
+        --phase eval
+        --backbone-type dinov3_vitl16
+        --batch-size 8
+        --grad-accum-steps 1
+        --inference-batch-size 32
+    )
+    run_smoke_stage eval_batch32 "$eval_log" "${eval_command[@]}"
+    grep -q '^eval_prediction_shape=(1, 7, 3704, 5556)$' "$eval_log" || \
+        fail "evaluation smoke returned an unexpected prediction shape"
+    eval_peak="$(sed -n 's/^eval_peak_reserved_gib=//p' "$eval_log" | tail -n 1)"
+    assert_peak_below eval_reserved "$eval_peak" 21.0
+
+    printf 'train_peak_reserved_gib=%s\n' "$train_peak"
+    printf 'eval_peak_reserved_gib=%s\n' "$eval_peak"
+    printf 'smoke_logs=%s\n' "$smoke_root"
+    printf 'smoke=PASSED\n'
     exit 0
 fi
 
