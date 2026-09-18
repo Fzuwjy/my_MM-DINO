@@ -11,10 +11,39 @@ filenames, random draws, crops, augmentations, tensors, or metric definitions.
 from __future__ import annotations
 
 from functools import wraps
+import os
+from typing import Mapping
 
 
-CACHE_CAPACITY = 64
+DEFAULT_CACHE_CAPACITY = 64
+CACHE_CAPACITY_ENV = "MM_DINO_WHU_CACHE_CAPACITY"
 PATCH_MARKER = "_mm_dino_whu_cache_compat"
+
+
+def cache_capacity_from_environment(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve an infrastructure-only cache bound without changing samples."""
+
+    values = os.environ if environ is None else environ
+    raw_capacity = values.get(CACHE_CAPACITY_ENV)
+    if raw_capacity is None:
+        return DEFAULT_CACHE_CAPACITY
+    try:
+        capacity = int(raw_capacity)
+    except ValueError as error:
+        raise ValueError(
+            f"{CACHE_CAPACITY_ENV} must be a non-negative integer, "
+            f"got {raw_capacity!r}"
+        ) from error
+    if capacity < 0:
+        raise ValueError(
+            f"{CACHE_CAPACITY_ENV} must be non-negative, got {capacity}"
+        )
+    return capacity
+
+
+CACHE_CAPACITY = cache_capacity_from_environment()
 
 
 def set_dataset_cache_capacity(dataset, capacity: int = CACHE_CAPACITY) -> None:

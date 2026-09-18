@@ -6,7 +6,13 @@ import unittest
 import numpy as np
 import torch
 
-from scripts.whu_cache_compat import CACHE_CAPACITY, set_dataset_cache_capacity
+from scripts.whu_cache_compat import (
+    CACHE_CAPACITY,
+    CACHE_CAPACITY_ENV,
+    DEFAULT_CACHE_CAPACITY,
+    cache_capacity_from_environment,
+    set_dataset_cache_capacity,
+)
 from scripts.whu_label_dtype_compat import label_to_int64
 from scripts.prepare_faithful_whu import BACKBONE_FILENAMES
 from scripts.evaluate_whu_vitl_lora import (
@@ -189,6 +195,16 @@ class FaithfulWhuContractTest(unittest.TestCase):
                 for cache in (dataset.rgb_cache, dataset.label_cache, dataset.sar_cache)
             ),
         )
+
+    def test_whu_cache_capacity_environment_override_is_validated(self):
+        self.assertEqual(cache_capacity_from_environment({}), DEFAULT_CACHE_CAPACITY)
+        self.assertEqual(
+            cache_capacity_from_environment({CACHE_CAPACITY_ENV: "32"}),
+            32,
+        )
+        for invalid in ("-1", "not-an-integer"):
+            with self.assertRaises(ValueError):
+                cache_capacity_from_environment({CACHE_CAPACITY_ENV: invalid})
 
 
 if __name__ == "__main__":
