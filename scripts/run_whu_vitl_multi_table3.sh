@@ -8,13 +8,14 @@ PROJECT_ROOT="${MM_DINO_PERSISTENT_ROOT:-/mnt/csip-113/wjy/MM-DINO}"
 REPO_ROOT="${MM_DINO_REPO_ROOT:-${PROJECT_ROOT}/repo}"
 DATA_ROOT="${PROJECT_ROOT}/datasets/whu-opt-sar"
 WEIGHTS_ROOT="${PROJECT_ROOT}/weights"
-OUTPUT_ROOT="${PROJECT_ROOT}/outputs/whu-vitl-multi-table3"
+OUTPUT_ROOT="${MM_DINO_OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/whu-vitl-multi-table3}"
 RUNTIME_ROOT="${PROJECT_ROOT}/runtime"
 RUNTIME_DEPS="${RUNTIME_ROOT}/python-packages"
 WHEEL_ROOT="${RUNTIME_ROOT}/wheels"
 TORCH_HOME_ROOT="${RUNTIME_ROOT}/torch-home"
 CONDA_ROOT="${MM_DINO_CONDA_ROOT:-/opt/conda}"
-BACKBONE="dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+BACKBONE="${MM_DINO_BACKBONE_FILENAME:-dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth}"
+BACKBONE_TYPE="${MM_DINO_BACKBONE_TYPE:-dinov3_vitl16}"
 MASTER_PORT="${MASTER_PORT:-29551}"
 REQUIRED_BASE_COMMIT="a1a5c9985dae5e72741dab3d6676b7f5626278f6"
 
@@ -190,7 +191,7 @@ if [[ "$mode" == "smoke" ]]; then
         --master_port="$MASTER_PORT"
         scripts/probe_official_whu_memory.py
         --phase train
-        --backbone-type dinov3_vitl16
+        --backbone-type "$BACKBONE_TYPE"
         --batch-size 8
         --grad-accum-steps 1
         --inference-batch-size 32
@@ -210,7 +211,7 @@ if [[ "$mode" == "smoke" ]]; then
         --master_port="$((MASTER_PORT + 1))"
         scripts/probe_official_whu_memory.py
         --phase eval
-        --backbone-type dinov3_vitl16
+        --backbone-type "$BACKBONE_TYPE"
         --batch-size 8
         --grad-accum-steps 1
         --inference-batch-size 32
@@ -239,7 +240,7 @@ command=(
     --model-name DINOv3
     --dataset-name WHU
     --num-modalities 2
-    --backbone-type dinov3_vitl16
+    --backbone-type "$BACKBONE_TYPE"
 )
 
 printf 'training_command='
