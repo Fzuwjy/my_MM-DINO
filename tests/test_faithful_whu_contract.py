@@ -22,7 +22,10 @@ from scripts.evaluate_whu_vitl_lora import (
 from scripts.run_whu_vitl_lora_accumulated import (
     GradientAccumulationController,
     GradientScaledLoss,
+    SINGLE_RANK_EVAL_ANCHOR,
+    SINGLE_RANK_EVAL_REPLACEMENT,
     scientific_configuration,
+    single_rank_eval_compatible_source,
     validate_effective_batch,
 )
 
@@ -105,6 +108,30 @@ class FaithfulWhuContractTest(unittest.TestCase):
             self.assertEqual(rgb_only[name], multimodal[name])
         with self.assertRaises(ValueError):
             scientific_configuration(0)
+
+    def test_single_rank_eval_compat_is_narrow_and_fail_closed(self):
+        trainer = (
+            REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+        ).read_text(encoding="utf-8")
+        compatible = single_rank_eval_compatible_source(trainer)
+
+        self.assertEqual(trainer.count(SINGLE_RANK_EVAL_ANCHOR), 1)
+        self.assertNotIn(SINGLE_RANK_EVAL_ANCHOR, compatible)
+        self.assertEqual(compatible.count(SINGLE_RANK_EVAL_REPLACEMENT), 1)
+        self.assertEqual(
+            compatible,
+            trainer.replace(
+                SINGLE_RANK_EVAL_ANCHOR,
+                SINGLE_RANK_EVAL_REPLACEMENT,
+                1,
+            ),
+        )
+        compile(compatible, "train_multi.py", "exec")
+
+        with self.assertRaises(RuntimeError):
+            single_rank_eval_compatible_source("unknown trainer")
+        with self.assertRaises(RuntimeError):
+            single_rank_eval_compatible_source(SINGLE_RANK_EVAL_ANCHOR * 2)
 
     def test_accumulation_gates_optimizer_calls(self):
         class Optimizer:
@@ -212,7 +239,11 @@ class FaithfulWhuContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("MM_DINO_WHU_CACHE_CAPACITY=32", launcher)
         self.assertIn("--num-modalities 2", launcher)
-        self.assertIn("--backbone-type dinov3_vitl16", launcher)
+        self.assertIn(
+            "BACKBONE_TYPE=\"${MM_DINO_BACKBONE_TYPE:-dinov3_vitl16}\"",
+            launcher,
+        )
+        self.assertIn('--backbone-type "$BACKBONE_TYPE"', launcher)
         self.assertIn("--master_addr=127.0.0.1", launcher)
         self.assertIn("--preflight-only", launcher)
         self.assertIn("--smoke-only", launcher)

@@ -21,7 +21,6 @@ import importlib
 import json
 import os
 import random
-import runpy
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +34,50 @@ RELEASED_BATCH_SIZE = 8
 RELEASED_INFERENCE_BATCH_SIZE = 32
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_TRAINER = REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+SINGLE_RANK_EVAL_ANCHOR = "is_distributed=distributed.is_enabled())"
+SINGLE_RANK_EVAL_REPLACEMENT = (
+    "is_distributed=(distributed.is_enabled() and "
+    "distributed.get_world_size() > 1))"
+)
+
+
+def single_rank_eval_compatible_source(source: str) -> str:
+    """Bypass the released GPU gather only when the DDP world has one rank.
+
+    The released trainer still runs through its distributed training path. Its
+    evaluation function already has an equivalent local NumPy metrics path;
+    selecting that path for world size one avoids making two redundant GPU
+    copies of the complete WHU prediction and label vectors.
+    """
+
+    matches = source.count(SINGLE_RANK_EVAL_ANCHOR)
+    if matches != 1:
+        raise RuntimeError(
+            "Expected exactly one released evaluation call anchor, found "
+            f"{matches}; refusing to patch an unknown trainer revision"
+        )
+    return source.replace(
+        SINGLE_RANK_EVAL_ANCHOR,
+        SINGLE_RANK_EVAL_REPLACEMENT,
+        1,
+    )
+
+
+def run_official_trainer_with_single_rank_eval_compat() -> None:
+    """Execute the released trainer with the guarded single-rank eval call."""
+
+    source = OFFICIAL_TRAINER.read_text(encoding="utf-8")
+    compatible_source = single_rank_eval_compatible_source(source)
+    trainer_globals = {
+        "__name__": "__main__",
+        "__file__": str(OFFICIAL_TRAINER),
+        "__package__": None,
+        "__cached__": None,
+    }
+    exec(
+        compile(compatible_source, str(OFFICIAL_TRAINER), "exec"),
+        trainer_globals,
+    )
 
 
 def scientific_configuration(num_modalities: int) -> dict[str, Any]:
@@ -263,6 +306,10 @@ def main() -> None:
                 "The released trainer source is unmodified.",
                 "BatchNorm statistics use microbatch 4.",
                 "The released loss is evaluated separately on each microbatch.",
+                (
+                    "Single-rank evaluation selects the trainer's local metrics "
+                    "path and skips its redundant full-result GPU all_gather."
+                ),
                 "Existing run cleanup is disabled to preserve reproduction artifacts.",
             ],
         }
@@ -286,6 +333,7 @@ def main() -> None:
     print(f"evaluation_inference_batch_size={RELEASED_INFERENCE_BATCH_SIZE}")
     print(f"num_modalities={args.num_modalities}")
     print(f"whu_cache_capacity={CACHE_CAPACITY}")
+    print("single_rank_eval_gpu_all_gather=BYPASSED")
 
     target = scientific_configuration(args.num_modalities)
     official_args = [
@@ -304,7 +352,7 @@ def main() -> None:
     ]
     sys.argv = [str(OFFICIAL_TRAINER), *official_args]
     try:
-        runpy.run_path(str(OFFICIAL_TRAINER), run_name="__main__")
+        run_official_trainer_with_single_rank_eval_compat()
     finally:
         configs_module.get_cfg = original_get_cfg
         torch.utils.data.DataLoader = original_data_loader
