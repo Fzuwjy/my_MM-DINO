@@ -5,6 +5,9 @@
 本地工作树 `D:\MM-DINO\work\my_MM-DINO-whu-vits-cola`；集群目录
 `/mnt/csip-113/wjy/MM-DINO/repo-vits-cola`。首轮先用 ViT-S；ViT-L 尚未纳入。
 
+4090实测结果与保留现场见 [ACCEPTANCE_20260921.md](ACCEPTANCE_20260921.md)：两组512训练/
+推理短测及固定裁剪诊断已通过，CoLA另完成一幅大图滑窗检查；正式训练尚未启动。
+
 ## 模型合同
 
 同一个冻结 DINOv3-S/16 LVD1689M，两个流（Optical、SAR）。SAR 重复成三个通道进入同一个
