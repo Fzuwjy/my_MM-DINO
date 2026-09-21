@@ -12,5 +12,6 @@ export MM_DINO_BACKBONE_FILENAME="dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 export MM_DINO_BACKBONE_TYPE="dinov3_vits16"
 export MM_DINO_USE_LORA=1
 export MM_DINO_LORA_RANK=3
+export MM_DINO_WHU_CACHE_CAPACITY=32
 
 exec bash "${script_dir}/run_whu_vitl_multi_table3.sh" "$@"

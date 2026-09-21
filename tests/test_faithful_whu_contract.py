@@ -247,6 +247,7 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn("dinov3_vits16", launcher)
         self.assertIn("MM_DINO_USE_LORA=1", launcher)
         self.assertIn("MM_DINO_LORA_RANK=3", launcher)
+        self.assertIn("MM_DINO_WHU_CACHE_CAPACITY=32", launcher)
 
         shared = (
             REPO_ROOT / "scripts" / "run_whu_vitl_multi_table3.sh"
