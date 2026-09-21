@@ -28,6 +28,7 @@ EarthMiss/
 
 # Ignore shell scripts
 *.sh
+!scripts/run_whu_vits_cola.sh
 
 # Ignore swap files
 *.swp
