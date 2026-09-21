@@ -25,6 +25,11 @@ from scripts.run_whu_vitl_lora_accumulated import (
     scientific_configuration,
     validate_effective_batch,
 )
+from scripts.run_seeded_official import (
+    SINGLE_RANK_EVAL_ANCHOR,
+    SINGLE_RANK_EVAL_REPLACEMENT,
+    single_rank_eval_compatible_source,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -251,6 +256,19 @@ class FaithfulWhuContractTest(unittest.TestCase):
             'MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"',
             shared,
         )
+        self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", shared)
+
+    def test_seeded_runner_single_rank_eval_patch_is_narrow(self):
+        trainer = (
+            REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+        ).read_text(encoding="utf-8")
+        compatible = single_rank_eval_compatible_source(trainer)
+        self.assertEqual(trainer.count(SINGLE_RANK_EVAL_ANCHOR), 1)
+        self.assertNotIn(SINGLE_RANK_EVAL_ANCHOR, compatible)
+        self.assertEqual(compatible.count(SINGLE_RANK_EVAL_REPLACEMENT), 1)
+        compile(compatible, "train_multi.py", "exec")
+        with self.assertRaises(RuntimeError):
+            single_rank_eval_compatible_source("unknown trainer")
 
 
 if __name__ == "__main__":

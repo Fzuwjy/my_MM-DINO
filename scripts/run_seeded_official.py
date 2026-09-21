@@ -9,7 +9,6 @@ All command-line arguments are passed through verbatim.
 from __future__ import annotations
 
 import random
-import runpy
 import sys
 from pathlib import Path
 
@@ -20,6 +19,27 @@ import torch
 SEED = 42
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_TRAINER = REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+SINGLE_RANK_EVAL_ANCHOR = "is_distributed=distributed.is_enabled())"
+SINGLE_RANK_EVAL_REPLACEMENT = (
+    "is_distributed=(distributed.is_enabled() and "
+    "distributed.get_world_size() > 1))"
+)
+
+
+def single_rank_eval_compatible_source(source: str) -> str:
+    """Select the released local metrics path when DDP has one rank."""
+
+    matches = source.count(SINGLE_RANK_EVAL_ANCHOR)
+    if matches != 1:
+        raise RuntimeError(
+            "Expected exactly one released evaluation call anchor, found "
+            f"{matches}; refusing to patch an unknown trainer revision"
+        )
+    return source.replace(
+        SINGLE_RANK_EVAL_ANCHOR,
+        SINGLE_RANK_EVAL_REPLACEMENT,
+        1,
+    )
 
 
 def seed_model_initialization() -> None:
@@ -55,7 +75,19 @@ def main() -> None:
         f"per-worker full-image cache capacity={CACHE_CAPACITY}"
     )
     sys.argv = [str(OFFICIAL_TRAINER), *sys.argv[1:]]
-    runpy.run_path(str(OFFICIAL_TRAINER), run_name="__main__")
+    source = OFFICIAL_TRAINER.read_text(encoding="utf-8")
+    compatible_source = single_rank_eval_compatible_source(source)
+    trainer_globals = {
+        "__name__": "__main__",
+        "__file__": str(OFFICIAL_TRAINER),
+        "__package__": None,
+        "__cached__": None,
+    }
+    print("single_rank_eval_gpu_all_gather=BYPASSED")
+    exec(
+        compile(compatible_source, str(OFFICIAL_TRAINER), "exec"),
+        trainer_globals,
+    )
 
 
 if __name__ == "__main__":
