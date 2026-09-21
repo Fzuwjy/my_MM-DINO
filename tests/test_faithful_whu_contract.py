@@ -280,6 +280,15 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertNotIn("--use-lora", launcher)
         self.assertNotIn("--amp", launcher)
 
+    def test_lora_launcher_allows_a_high_memory_cache_override(self):
+        launcher = (
+            REPO_ROOT / "scripts" / "run_whu_vitl_lora_multi_table6.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"',
+            launcher,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

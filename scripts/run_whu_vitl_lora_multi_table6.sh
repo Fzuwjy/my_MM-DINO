@@ -40,7 +40,7 @@ source "$conda_root/etc/profile.d/conda.sh"
 conda activate base
 export PYTHONPATH="${project_root}/runtime/python-packages${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="${project_root}/runtime/torch-home"
-export MM_DINO_WHU_CACHE_CAPACITY=32
+export MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
