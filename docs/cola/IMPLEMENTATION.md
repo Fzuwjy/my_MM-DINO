@@ -107,6 +107,11 @@ bash scripts/run_whu_vits_cola.sh --variant cola --mode smoke
 ```
 
 短测使用原数据增强，2次 batch8 更新（包含 Adam 状态），并核对 eval batch32 与 batch1。
+两步后另保存 train_smoke.json，后续检查即使失败也保留显存信息。固定32裁剪也在短测中
+真实运行，核对 BN buffer 不变。短测指标仅用于执行验收，不是拟合或泛化结果。
+批大小对比使用 rtol1e-3/atol1e-4，并要求 argmax 一致率至少99.9%，保存实际误差和一致率。
+依据：原 MM-DINO 后端在4090、原 cuDNN TF32 设置下 B1/B32 差7.0523e-5，RMS6.0683e-6，
+argmax一致99.9981%。不为此改变原数值配置。同 batch 零增量和完整后端验收仍要求逐位相同。
 检查 smoke.json 的 train/eval reserved、耗时，保留2–4 GiB余量。测试 OOM 则保留现场，先
 诊断再统一决定两组 microbatch；当前实现不会自动降 batch 或增加梯度累积。
 允许单独指定 `--eval-batch` 后重测；正式命令也应传入验收后的相同值。

@@ -189,6 +189,7 @@ def smoke(args, model, names, device, metadata):
     model.backbone.diagnostics(False)
     train_resources = resources(device)
     train_seconds = time.perf_counter() - start
+    write_json(args.output / 'train_smoke.json', {'resources': train_resources, 'two_steps_seconds': train_seconds})
     del loss, optimizer, batch, optical, sar, target
     model.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
@@ -198,13 +199,33 @@ def smoke(args, model, names, device, metadata):
     with evaluation(model):
         single = model(optical, sar)
         batched = model(optical.repeat(args.eval_batch, 1, 1, 1), sar.repeat(args.eval_batch, 1, 1, 1))
-        torch.testing.assert_close(batched, single.expand_as(batched), rtol=1e-4, atol=1e-5)
+        agreement = float((batched.argmax(1) == single.argmax(1)).float().mean())
+        batch_comparison = {'max_abs_error': float((batched - single).abs().max()),
+                            'rms_error': float((batched - single).square().mean().sqrt()),
+                            'argmax_agreement': agreement, 'rtol': 1e-3, 'atol': 1e-4,
+                            'minimum_argmax_agreement': 0.999}
+        write_json(args.output / 'eval_batch_comparison.json', batch_comparison)
+        # Original MM-DINO also differs by ~7e-5 between B=1 and B=32 under
+        # its unchanged cuDNN TF32 setting. Zero-delta same-batch tests stay exact.
+        torch.testing.assert_close(batched, single.expand_as(batched), rtol=1e-3, atol=1e-4)
+        if agreement < 0.999:
+            raise AssertionError('Batch-size argmax agreement below 99.9%')
     report = {'train': train_resources, 'train_two_steps_seconds': train_seconds,
               'eval': resources(device), 'eval_batch': args.eval_batch,
-              'eval_batch_max_abs_error': float((batched - single).abs().max()),
+              'eval_batch_comparison': batch_comparison,
               'frozen_base_unchanged': state_hash(model.backbone.base) == metadata['initial']['base_hash']}
     if not report['frozen_base_unchanged']:
         raise AssertionError('Frozen weights changed')
+    del sample, optical, sar, single, batched
+    manifest = crop_manifest(args.data, args.data / 'train_list.txt', args.data / 'test_list.txt')
+    save_manifest(args.output / 'fixed_crops.json', manifest)
+    crops = load_crops(args.data, manifest)
+    bn_buffer = lambda n: n.endswith(('running_mean', 'running_var', 'num_batches_tracked'))
+    before = state_hash(model, bn_buffer)
+    report['fixed_crop_diagnostic'] = evaluate_crops(model, crops, loss_fn, device, batch_size=2)
+    report['fixed_eval_bn_unchanged'] = before == state_hash(model, bn_buffer)
+    if not report['fixed_eval_bn_unchanged']:
+        raise AssertionError('Fixed eval changed BN buffers')
     write_json(args.output / 'smoke.json', report)
     print(json.dumps(report, indent=2), flush=True)
 
