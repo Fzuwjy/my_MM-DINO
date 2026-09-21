@@ -24,6 +24,8 @@ SINGLE_RANK_EVAL_REPLACEMENT = (
     "is_distributed=(distributed.is_enabled() and "
     "distributed.get_world_size() > 1))"
 )
+LAUNCHER_LORA_RANK_OPTION = "--lora-rank"
+OFFICIAL_LORA_RANK_OPTION = "--r"
 
 
 def single_rank_eval_compatible_source(source: str) -> str:
@@ -53,6 +55,31 @@ def seed_model_initialization() -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def translate_launcher_arguments(arguments: list[str]) -> list[str]:
+    """Translate launcher-only arguments after torchrun has parsed its CLI."""
+
+    translated: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == LAUNCHER_LORA_RANK_OPTION:
+            if index + 1 >= len(arguments):
+                raise ValueError(f"{LAUNCHER_LORA_RANK_OPTION} requires a value")
+            translated.extend((OFFICIAL_LORA_RANK_OPTION, arguments[index + 1]))
+            index += 2
+            continue
+        if argument.startswith(f"{LAUNCHER_LORA_RANK_OPTION}="):
+            _, value = argument.split("=", 1)
+            if not value:
+                raise ValueError(f"{LAUNCHER_LORA_RANK_OPTION} requires a value")
+            translated.extend((OFFICIAL_LORA_RANK_OPTION, value))
+            index += 1
+            continue
+        translated.append(argument)
+        index += 1
+    return translated
+
+
 def main() -> None:
     if not OFFICIAL_TRAINER.is_file():
         raise FileNotFoundError(f"Official trainer not found: {OFFICIAL_TRAINER}")
@@ -74,7 +101,10 @@ def main() -> None:
         "WHU compatibility: training labels=int64, "
         f"per-worker full-image cache capacity={CACHE_CAPACITY}"
     )
-    sys.argv = [str(OFFICIAL_TRAINER), *sys.argv[1:]]
+    sys.argv = [
+        str(OFFICIAL_TRAINER),
+        *translate_launcher_arguments(sys.argv[1:]),
+    ]
     source = OFFICIAL_TRAINER.read_text(encoding="utf-8")
     compatible_source = single_rank_eval_compatible_source(source)
     trainer_globals = {

@@ -82,7 +82,10 @@ probe_lora_args=()
 trainer_lora_args=()
 if [[ "$USE_LORA" == "1" ]]; then
     probe_lora_args=(--use-lora --lora-rank "$LORA_RANK")
-    trainer_lora_args=(--use-lora True --r "$LORA_RANK")
+    # torchrun treats the official trainer's short ``--r`` option as an
+    # ambiguous abbreviation of its own rendezvous/redirect options. Pass a
+    # launcher-only long name and translate it after torchrun starts Python.
+    trainer_lora_args=(--use-lora True --lora-rank "$LORA_RANK")
 fi
 
 mkdir -p "$OUTPUT_ROOT/launcher-logs" "$RUNTIME_DEPS" "$WHEEL_ROOT"

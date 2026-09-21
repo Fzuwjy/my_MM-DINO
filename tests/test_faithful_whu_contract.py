@@ -29,6 +29,7 @@ from scripts.run_seeded_official import (
     SINGLE_RANK_EVAL_ANCHOR,
     SINGLE_RANK_EVAL_REPLACEMENT,
     single_rank_eval_compatible_source,
+    translate_launcher_arguments,
 )
 
 
@@ -250,13 +251,43 @@ class FaithfulWhuContractTest(unittest.TestCase):
         shared = (
             REPO_ROOT / "scripts" / "run_whu_vitl_multi_table3.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn('trainer_lora_args=(--use-lora True --r "$LORA_RANK")', shared)
+        self.assertIn(
+            'trainer_lora_args=(--use-lora True --lora-rank "$LORA_RANK")',
+            shared,
+        )
         self.assertIn('probe_lora_args=(--use-lora --lora-rank "$LORA_RANK")', shared)
         self.assertIn(
             'MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"',
             shared,
         )
         self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", shared)
+
+    def test_seeded_runner_translates_lora_rank_after_torchrun(self):
+        arguments = [
+            "--model-name",
+            "DINOv3",
+            "--use-lora",
+            "True",
+            "--lora-rank",
+            "3",
+        ]
+        self.assertEqual(
+            translate_launcher_arguments(arguments),
+            [
+                "--model-name",
+                "DINOv3",
+                "--use-lora",
+                "True",
+                "--r",
+                "3",
+            ],
+        )
+        self.assertEqual(
+            translate_launcher_arguments(["--lora-rank=5"]),
+            ["--r", "5"],
+        )
+        with self.assertRaises(ValueError):
+            translate_launcher_arguments(["--lora-rank"])
 
     def test_seeded_runner_single_rank_eval_patch_is_narrow(self):
         trainer = (
