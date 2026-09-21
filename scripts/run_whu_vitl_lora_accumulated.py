@@ -6,8 +6,9 @@ minimum batching adaptation required by a 31.4 GiB RTX 5090:
 * the training DataLoader uses microbatch 4 instead of released batch 8;
 * every loss gradient is divided by 2;
 * ``zero_grad`` and ``optimizer.step`` run once per two microbatches;
-* the config still reports batch 8, so released sliding-window evaluation
-  continues to use inference microbatch ``8 * 4 == 32``.
+* the config still reports batch 8, while a guarded compatibility transform
+  raises only sliding-window inference from released batch 32 to tested batch
+  40 on a 24 GiB card.
 
 This is a compatibility reproduction, not an exact batch-8 reproduction.
 BatchNorm statistics and non-sample-separable losses can depend on microbatch
@@ -32,6 +33,7 @@ import torch
 SEED = 42
 RELEASED_BATCH_SIZE = 8
 RELEASED_INFERENCE_BATCH_SIZE = 32
+COMPATIBLE_INFERENCE_BATCH_SIZE = 40
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_TRAINER = REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
 SINGLE_RANK_EVAL_ANCHOR = "is_distributed=distributed.is_enabled())"
@@ -39,6 +41,8 @@ SINGLE_RANK_EVAL_REPLACEMENT = (
     "is_distributed=(distributed.is_enabled() and "
     "distributed.get_world_size() > 1))"
 )
+EVAL_BATCH_ANCHOR = 'batch_size=cfg.get("batch_size", 4) * 4'
+EVAL_BATCH_REPLACEMENT = f"batch_size={COMPATIBLE_INFERENCE_BATCH_SIZE}"
 
 
 def single_rank_eval_compatible_source(source: str) -> str:
@@ -63,11 +67,24 @@ def single_rank_eval_compatible_source(source: str) -> str:
     )
 
 
+def eval_batch_compatible_source(source: str) -> str:
+    """Raise only the released sliding-window inference microbatch."""
+
+    matches = source.count(EVAL_BATCH_ANCHOR)
+    if matches != 2:
+        raise RuntimeError(
+            "Expected exactly two released inference-batch anchors, found "
+            f"{matches}; refusing to patch an unknown trainer revision"
+        )
+    return source.replace(EVAL_BATCH_ANCHOR, EVAL_BATCH_REPLACEMENT)
+
+
 def run_official_trainer_with_single_rank_eval_compat() -> None:
     """Execute the released trainer with the guarded single-rank eval call."""
 
     source = OFFICIAL_TRAINER.read_text(encoding="utf-8")
     compatible_source = single_rank_eval_compatible_source(source)
+    compatible_source = eval_batch_compatible_source(compatible_source)
     trainer_globals = {
         "__name__": "__main__",
         "__file__": str(OFFICIAL_TRAINER),
@@ -295,7 +312,10 @@ def main() -> None:
             "training_micro_batch_size": args.micro_batch_size,
             "gradient_accumulation_steps": args.grad_accum_steps,
             "effective_batch_size": args.micro_batch_size * args.grad_accum_steps,
-            "evaluation_inference_batch_size": RELEASED_INFERENCE_BATCH_SIZE,
+            "released_evaluation_inference_batch_size": (
+                RELEASED_INFERENCE_BATCH_SIZE
+            ),
+            "evaluation_inference_batch_size": COMPATIBLE_INFERENCE_BATCH_SIZE,
             "backbone_type": "dinov3_vitl16",
             "use_lora": True,
             "lora_rank": 3,
@@ -309,6 +329,10 @@ def main() -> None:
                 (
                     "Single-rank evaluation selects the trainer's local metrics "
                     "path and skips its redundant full-result GPU all_gather."
+                ),
+                (
+                    "Sliding-window inference batch 40 passed a five-image "
+                    "24 GiB stability probe with 19.238 GiB peak reserved."
                 ),
                 "Existing run cleanup is disabled to preserve reproduction artifacts.",
             ],
@@ -330,7 +354,14 @@ def main() -> None:
     print(f"training_micro_batch_size={args.micro_batch_size}")
     print(f"gradient_accumulation_steps={args.grad_accum_steps}")
     print(f"effective_batch_size={RELEASED_BATCH_SIZE}")
-    print(f"evaluation_inference_batch_size={RELEASED_INFERENCE_BATCH_SIZE}")
+    print(
+        "released_evaluation_inference_batch_size="
+        f"{RELEASED_INFERENCE_BATCH_SIZE}"
+    )
+    print(
+        "evaluation_inference_batch_size="
+        f"{COMPATIBLE_INFERENCE_BATCH_SIZE}"
+    )
     print(f"num_modalities={args.num_modalities}")
     print(f"whu_cache_capacity={CACHE_CAPACITY}")
     print("single_rank_eval_gpu_all_gather=BYPASSED")

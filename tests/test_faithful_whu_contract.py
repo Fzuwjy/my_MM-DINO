@@ -20,10 +20,14 @@ from scripts.evaluate_whu_vitl_lora import (
     RELEASED_INFERENCE_BATCH_SIZE,
 )
 from scripts.run_whu_vitl_lora_accumulated import (
+    COMPATIBLE_INFERENCE_BATCH_SIZE,
+    EVAL_BATCH_ANCHOR,
+    EVAL_BATCH_REPLACEMENT,
     GradientAccumulationController,
     GradientScaledLoss,
     SINGLE_RANK_EVAL_ANCHOR,
     SINGLE_RANK_EVAL_REPLACEMENT,
+    eval_batch_compatible_source,
     scientific_configuration,
     single_rank_eval_compatible_source,
     validate_effective_batch,
@@ -132,6 +136,27 @@ class FaithfulWhuContractTest(unittest.TestCase):
             single_rank_eval_compatible_source("unknown trainer")
         with self.assertRaises(RuntimeError):
             single_rank_eval_compatible_source(SINGLE_RANK_EVAL_ANCHOR * 2)
+
+    def test_eval_batch_compat_is_narrow_and_fail_closed(self):
+        trainer = (
+            REPO_ROOT / "tasks" / "segmentation" / "train_multi.py"
+        ).read_text(encoding="utf-8")
+        compatible = eval_batch_compatible_source(trainer)
+
+        self.assertEqual(COMPATIBLE_INFERENCE_BATCH_SIZE, 40)
+        self.assertEqual(trainer.count(EVAL_BATCH_ANCHOR), 2)
+        self.assertNotIn(EVAL_BATCH_ANCHOR, compatible)
+        self.assertEqual(compatible.count(EVAL_BATCH_REPLACEMENT), 2)
+        self.assertEqual(
+            compatible,
+            trainer.replace(EVAL_BATCH_ANCHOR, EVAL_BATCH_REPLACEMENT),
+        )
+        compile(compatible, "train_multi.py", "exec")
+
+        with self.assertRaises(RuntimeError):
+            eval_batch_compatible_source("unknown trainer")
+        with self.assertRaises(RuntimeError):
+            eval_batch_compatible_source(EVAL_BATCH_ANCHOR * 3)
 
     def test_accumulation_gates_optimizer_calls(self):
         class Optimizer:
