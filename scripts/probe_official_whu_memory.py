@@ -185,23 +185,38 @@ def probe_eval(cfg, device, args: argparse.Namespace) -> None:
     )
     model = wrap_model(cfg, device)
     model.eval()
-    image, sar, _ = next(iter(loader))
-    image, sar = image.to(device), sar.to(device)
     stride = int(cfg["window_size"][0] * 2 / 3)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    prediction = slide_inference(
-        image,
-        model,
-        dsm=sar,
-        n_output_channels=len(cfg["labels"]),
-        crop_size=cfg["window_size"],
-        stride=(stride, stride),
-        batch_size=args.inference_batch_size,
-    )
-    print(f"eval_image_shape={tuple(image.shape)}")
-    print(f"eval_prediction_shape={tuple(prediction.shape)}")
+    evaluated = 0
+    for image, sar, _ in loader:
+        image, sar = image.to(device), sar.to(device)
+        prediction = slide_inference(
+            image,
+            model,
+            dsm=sar,
+            n_output_channels=len(cfg["labels"]),
+            crop_size=cfg["window_size"],
+            stride=(stride, stride),
+            batch_size=args.inference_batch_size,
+        )
+        evaluated += 1
+        if evaluated == 1:
+            print(f"eval_image_shape={tuple(image.shape)}")
+            print(f"eval_prediction_shape={tuple(prediction.shape)}")
+        print(f"eval_image_{evaluated}_shape={tuple(image.shape)}")
+        print(f"eval_prediction_{evaluated}_shape={tuple(prediction.shape)}")
+        report_memory(f"eval_image_{evaluated}", device)
+        del image, sar, prediction
+        if evaluated >= args.eval_images:
+            break
+
+    if evaluated != args.eval_images:
+        raise RuntimeError(
+            f"Requested {args.eval_images} evaluation images, observed {evaluated}"
+        )
+    print(f"eval_images={evaluated}")
     print(f"eval_inference_batch_size={args.inference_batch_size}")
     report_memory("eval", device)
 
@@ -219,11 +234,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--inference-batch-size", type=int, default=32)
+    parser.add_argument("--eval-images", type=int, default=1)
     args = parser.parse_args()
     for name in (
         "batch_size",
         "grad_accum_steps",
         "inference_batch_size",
+        "eval_images",
         "lora_rank",
     ):
         if getattr(args, name) <= 0:
