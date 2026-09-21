@@ -16,6 +16,8 @@ TORCH_HOME_ROOT="${RUNTIME_ROOT}/torch-home"
 CONDA_ROOT="${MM_DINO_CONDA_ROOT:-/opt/conda}"
 BACKBONE="${MM_DINO_BACKBONE_FILENAME:-dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth}"
 BACKBONE_TYPE="${MM_DINO_BACKBONE_TYPE:-dinov3_vitl16}"
+USE_LORA="${MM_DINO_USE_LORA:-0}"
+LORA_RANK="${MM_DINO_LORA_RANK:-3}"
 MASTER_PORT="${MASTER_PORT:-29551}"
 REQUIRED_BASE_COMMIT="a1a5c9985dae5e72741dab3d6676b7f5626278f6"
 
@@ -71,6 +73,17 @@ ensure_link() {
 [[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || fail "MASTER_PORT must be an integer"
 (( MASTER_PORT > 1024 && MASTER_PORT < 65534 )) || \
     fail "MASTER_PORT must be between 1025 and 65533"
+[[ "$USE_LORA" == "0" || "$USE_LORA" == "1" ]] || \
+    fail "MM_DINO_USE_LORA must be 0 or 1"
+[[ "$LORA_RANK" =~ ^[1-9][0-9]*$ ]] || \
+    fail "MM_DINO_LORA_RANK must be a positive integer"
+
+probe_lora_args=()
+trainer_lora_args=()
+if [[ "$USE_LORA" == "1" ]]; then
+    probe_lora_args=(--use-lora --lora-rank "$LORA_RANK")
+    trainer_lora_args=(--use-lora True --r "$LORA_RANK")
+fi
 
 mkdir -p "$OUTPUT_ROOT/launcher-logs" "$RUNTIME_DEPS" "$WHEEL_ROOT"
 launch_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -100,7 +113,7 @@ conda activate base
 
 export PYTHONPATH="$RUNTIME_DEPS${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="$TORCH_HOME_ROOT"
-export MM_DINO_WHU_CACHE_CAPACITY=32
+export MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export NCCL_TIMEOUT=1200
@@ -139,6 +152,8 @@ nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,driver_version 
 free -h
 
 printf 'repo_commit=%s\n' "$actual_commit"
+printf 'use_lora=%s\n' "$USE_LORA"
+printf 'lora_rank=%s\n' "$LORA_RANK"
 printf 'whu_cache_capacity=%s\n' "$MM_DINO_WHU_CACHE_CAPACITY"
 printf 'torch_home=%s\n' "$TORCH_HOME"
 printf 'preflight=PASSED\n'
@@ -195,6 +210,7 @@ if [[ "$mode" == "smoke" ]]; then
         --batch-size 8
         --grad-accum-steps 1
         --inference-batch-size 32
+        "${probe_lora_args[@]}"
     )
     run_smoke_stage train_batch8 "$train_log" "${train_command[@]}"
     grep -q '^train_effective_batch_size=8$' "$train_log" || \
@@ -215,6 +231,7 @@ if [[ "$mode" == "smoke" ]]; then
         --batch-size 8
         --grad-accum-steps 1
         --inference-batch-size 32
+        "${probe_lora_args[@]}"
     )
     run_smoke_stage eval_batch32 "$eval_log" "${eval_command[@]}"
     grep -q '^eval_prediction_shape=(1, 7, 3704, 5556)$' "$eval_log" || \
@@ -241,6 +258,7 @@ command=(
     --dataset-name WHU
     --num-modalities 2
     --backbone-type "$BACKBONE_TYPE"
+    "${trainer_lora_args[@]}"
 )
 
 printf 'training_command='

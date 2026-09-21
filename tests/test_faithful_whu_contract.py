@@ -210,9 +210,16 @@ class FaithfulWhuContractTest(unittest.TestCase):
         launcher = (
             REPO_ROOT / "scripts" / "run_whu_vitl_multi_table3.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("MM_DINO_WHU_CACHE_CAPACITY=32", launcher)
+        self.assertIn(
+            'MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"',
+            launcher,
+        )
         self.assertIn("--num-modalities 2", launcher)
-        self.assertIn("--backbone-type dinov3_vitl16", launcher)
+        self.assertIn(
+            "BACKBONE_TYPE=\"${MM_DINO_BACKBONE_TYPE:-dinov3_vitl16}\"",
+            launcher,
+        )
+        self.assertIn('--backbone-type "$BACKBONE_TYPE"', launcher)
         self.assertIn("--master_addr=127.0.0.1", launcher)
         self.assertIn("--preflight-only", launcher)
         self.assertIn("--smoke-only", launcher)
@@ -221,8 +228,29 @@ class FaithfulWhuContractTest(unittest.TestCase):
         self.assertIn("--phase eval", launcher)
         self.assertIn("--inference-batch-size 32", launcher)
         self.assertIn("smoke=PASSED", launcher)
-        self.assertNotIn("--use-lora", launcher)
+        self.assertIn('USE_LORA="${MM_DINO_USE_LORA:-0}"', launcher)
+        self.assertIn('if [[ "$USE_LORA" == "1" ]]', launcher)
         self.assertNotIn("--amp", launcher)
+
+    def test_vits_lora_control_is_isolated_and_rank_three(self):
+        launcher = (
+            REPO_ROOT / "scripts" / "run_whu_vits_lora_multi_control.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("repo-vits-lora-control", launcher)
+        self.assertIn("outputs/whu-vits-lora-multi-control", launcher)
+        self.assertIn("dinov3_vits16", launcher)
+        self.assertIn("MM_DINO_USE_LORA=1", launcher)
+        self.assertIn("MM_DINO_LORA_RANK=3", launcher)
+
+        shared = (
+            REPO_ROOT / "scripts" / "run_whu_vitl_multi_table3.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('trainer_lora_args=(--use-lora True --r "$LORA_RANK")', shared)
+        self.assertIn('probe_lora_args=(--use-lora --lora-rank "$LORA_RANK")', shared)
+        self.assertIn(
+            'MM_DINO_WHU_CACHE_CAPACITY="${MM_DINO_WHU_CACHE_CAPACITY:-32}"',
+            shared,
+        )
 
 
 if __name__ == "__main__":
